@@ -125,6 +125,10 @@ ul.list li, ol.list li { margin: 6px 0; line-height: 1.5; }
 .seg .spk { font-weight: 700; margin-right: 6px; font-size: 14px; }
 .transcript-box { background: var(--card); padding: 14px 16px; border-radius: 12px; }
 .progress { text-align: center; color: var(--muted); padding: 20px 8px; line-height: 1.6; font-size: 15px; }
+.prog-bar { height: 12px; background: var(--btn2); border-radius: 8px; overflow: hidden; margin: 6px 0 12px; }
+.prog-fill { height: 100%; width: 0%; border-radius: 8px; background: linear-gradient(90deg, #0a84ff, #5e5ce6); transition: width 0.5s ease; }
+.prog-label { color: var(--ink); font-size: 15px; font-weight: 600; }
+.prog-time { color: var(--muted); font-size: 13px; margin-top: 4px; }
 .spinner { display: inline-block; width: 22px; height: 22px; border: 3px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 10px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .empty { text-align: center; color: var(--muted); padding: 56px 16px; line-height: 1.8; }

@@ -75,8 +75,13 @@ const SCHEMA = {
   required: ['segments', 'actionItems', 'mainPoints', 'qa'],
 };
 
+// 進度回報統一格式：{ phase, pct, message }。pct 為 null 代表該階段無精確百分比。
+function report(onProgress, phase, pct, message) {
+  if (onProgress) onProgress({ phase, pct, message });
+}
+
 async function uploadFile(file, apiKey, onProgress) {
-  onProgress && onProgress('上傳音檔中…');
+  report(onProgress, 'upload', 5, '準備上傳…');
   const mime = file.type || 'audio/mpeg';
   const start = await fetch(`${BASE}/upload/v1beta/files?key=${apiKey}`, {
     method: 'POST',
@@ -93,17 +98,33 @@ async function uploadFile(file, apiKey, onProgress) {
   const uploadUrl = start.headers.get('X-Goog-Upload-URL');
   if (!uploadUrl) throw new Error('未取得上傳網址');
 
-  const up = await fetch(uploadUrl, {
-    method: 'POST',
-    headers: {
-      'X-Goog-Upload-Command': 'upload, finalize',
-      'X-Goog-Upload-Offset': '0',
-    },
-    body: file,
+  // 用 XHR 上傳位元組，才能取得真實上傳進度
+  const info = await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', uploadUrl);
+    xhr.setRequestHeader('X-Goog-Upload-Command', 'upload, finalize');
+    xhr.setRequestHeader('X-Goog-Upload-Offset', '0');
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) {
+        const frac = e.loaded / e.total;
+        report(onProgress, 'upload', 5 + frac * 30, `上傳音檔中… ${Math.round(frac * 100)}%`);
+      }
+    };
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText).file);
+        } catch (err) {
+          reject(new Error('上傳回應解析失敗'));
+        }
+      } else {
+        reject(new Error(`上傳失敗 (${xhr.status})`));
+      }
+    };
+    xhr.onerror = () => reject(new Error('上傳失敗（網路中斷）'));
+    xhr.send(file);
   });
-  if (!up.ok) throw new Error(`上傳失敗 (${up.status})`);
-  const info = await up.json();
-  return info.file; // { uri, name, state, mimeType }
+  return info; // { uri, name, state, mimeType }
 }
 
 async function waitActive(fileInfo, apiKey, onProgress) {
@@ -112,7 +133,7 @@ async function waitActive(fileInfo, apiKey, onProgress) {
   let name = fileInfo.name;
   let mimeType = fileInfo.mimeType;
   while (state === 'PROCESSING') {
-    onProgress && onProgress('雲端處理音檔中…');
+    report(onProgress, 'processing', 40, '雲端處理音檔中…');
     await new Promise((r) => setTimeout(r, 2500));
     const res = await fetch(`${BASE}/v1beta/${name}?key=${apiKey}`);
     if (!res.ok) throw new Error(`檔案狀態查詢失敗 (${res.status})`);
@@ -134,7 +155,7 @@ export function isTransientStatus(status) {
 // 帶自動重試的 POST（處理暫時性錯誤：網路中斷、5xx、429）
 async function postJsonWithRetry(url, body, onProgress, label) {
   for (let attempt = 0; ; attempt++) {
-    if (onProgress) onProgress(attempt ? `連線不穩，重試中…（第 ${attempt} 次）` : label);
+    report(onProgress, 'transcribe', null, attempt ? `連線不穩，重試中…（第 ${attempt} 次）` : label);
     let res;
     try {
       res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
@@ -200,7 +221,7 @@ async function generate(fileUri, mimeType, apiKey, model, onProgress) {
 export async function transcribeAndSummarize(file, apiKey, opts = {}) {
   const onProgress = opts.onProgress;
   if (!apiKey) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
-  onProgress && onProgress('選擇辨識型號中…');
+  report(onProgress, 'model', 3, '選擇辨識型號中…');
   const model = await resolveModel(apiKey);
   const fileInfo = await uploadFile(file, apiKey, onProgress);
   const active = await waitActive(fileInfo, apiKey, onProgress);
@@ -235,7 +256,7 @@ const SUMMARY_PROMPT =
 export async function regenerateSummary(segments, apiKey, opts = {}) {
   const onProgress = opts.onProgress;
   if (!apiKey) throw new Error('尚未設定 API 金鑰');
-  onProgress && onProgress('選擇型號中…');
+  report(onProgress, 'model', 3, '選擇型號中…');
   const model = await resolveModel(apiKey);
   const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
   const res = await postJsonWithRetry(

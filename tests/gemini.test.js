@@ -67,6 +67,25 @@ function jsonResponse(obj, headers = {}) {
   };
 }
 
+// 上傳位元組改用 XHR，測試時以假 XHR 模擬（立即回傳 ACTIVE 檔案）
+function stubXHR(fileObj) {
+  const file = fileObj || { uri: 'https://files/abc', name: 'files/abc', state: 'ACTIVE', mimeType: 'audio/mp4' };
+  class MockXHR {
+    constructor() {
+      this.upload = {};
+      this.status = 200;
+      this.responseText = JSON.stringify({ file });
+    }
+    open() {}
+    setRequestHeader() {}
+    send() {
+      if (this.upload.onprogress) this.upload.onprogress({ lengthComputable: true, loaded: 3, total: 3 });
+      if (this.onload) this.onload();
+    }
+  }
+  vi.stubGlobal('XMLHttpRequest', MockXHR);
+}
+
 describe('gemini', () => {
   it('沒有金鑰時丟錯', async () => {
     await expect(transcribeAndSummarize(new Blob(['x']), '')).rejects.toThrow('金鑰');
@@ -101,13 +120,10 @@ describe('gemini', () => {
       .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
       // 1) start resumable → 回傳 upload url header
       .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' }))
-      // 2) upload bytes finalize → 回傳 file ACTIVE
-      .mockResolvedValueOnce(
-        jsonResponse({ file: { uri: 'https://files/abc', name: 'files/abc', state: 'ACTIVE', mimeType: 'audio/mp4' } })
-      )
-      // 3) generateContent → 回傳結構化 JSON
+      // 2) generateContent → 回傳結構化 JSON（上傳位元組走 XHR）
       .mockResolvedValueOnce(jsonResponse(modelJson));
     vi.stubGlobal('fetch', fetchMock);
+    stubXHR();
 
     const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
     file.name = 'meeting.m4a';
@@ -119,10 +135,9 @@ describe('gemini', () => {
     expect(result.summary.actionItems).toEqual(['處理上線 [DRI: 待指派]']);
     expect(result.summary.mainPoints).toEqual(['重點A']);
     expect(result.summary.qa).toEqual(['問：何時上線 答：下週三']);
-    // ListModels + 上傳(start+finalize) + generate = 4 次
-    expect(fetchMock).toHaveBeenCalledTimes(4);
-    // generateContent 使用挑到的型號
-    expect(fetchMock.mock.calls[3][0]).toContain('models/gemini-3.5-flash:generateContent');
+    // ListModels + start + generate = 3 次 fetch（上傳位元組走 XHR 不計）
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    expect(fetchMock.mock.calls[2][0]).toContain('models/gemini-3.5-flash:generateContent');
   });
 
   it('逐字稿被截斷（MAX_TOKENS）時給出可理解的錯誤', async () => {
@@ -133,11 +148,9 @@ describe('gemini', () => {
       .fn()
       .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
       .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' }))
-      .mockResolvedValueOnce(
-        jsonResponse({ file: { uri: 'https://files/abc', name: 'files/abc', state: 'ACTIVE', mimeType: 'audio/mp4' } })
-      )
       .mockResolvedValueOnce(jsonResponse(truncated));
     vi.stubGlobal('fetch', fetchMock);
+    stubXHR();
 
     const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
     file.name = 'long.m4a';

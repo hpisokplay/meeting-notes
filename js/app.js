@@ -7,7 +7,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v11';
+const APP_VERSION = 'v13';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -194,13 +194,62 @@ function renderNew() {
     goBtn.disabled = true;
     transcribing = true;
     prog.hidden = false;
-    const show = (msg, isErr) => {
-      prog.innerHTML = isErr
-        ? `<div class="err">❌ ${esc(msg)}</div><button class="big secondary" id="retry">再試一次</button>`
-        : `<div class="spinner"></div><div>${esc(msg)}</div>`;
-      if (isErr) document.getElementById('retry').onclick = () => renderNew();
+
+    // 依音檔長度估算「辨識」階段所需秒數（僅用於進度條配速，不影響結果）
+    const durSec = await getAudioDuration(f);
+    const estTranscribe = Math.max(25, Math.round((durSec || 0) * 0.35) + 20);
+
+    const startAt = Date.now();
+    let barPct = 0;
+    let easeTimer = null;
+    let timeTimer = null;
+    const fmtElapsed = () => {
+      const s = Math.floor((Date.now() - startAt) / 1000);
+      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
     };
-    show('準備中…');
+    prog.innerHTML = `
+      <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
+      <div class="prog-label" id="pl">準備中…</div>
+      <div class="prog-time" id="pt">已等待 0:00</div>`;
+    const setBar = (p) => {
+      barPct = Math.max(barPct, Math.min(100, p));
+      const pf = document.getElementById('pf');
+      if (pf) pf.style.width = barPct + '%';
+    };
+    const setLabel = (t) => {
+      const pl = document.getElementById('pl');
+      if (pl) pl.textContent = t;
+    };
+    timeTimer = setInterval(() => {
+      const pt = document.getElementById('pt');
+      if (pt) pt.textContent = '已等待 ' + fmtElapsed();
+    }, 1000);
+    const stopTimers = () => {
+      if (easeTimer) clearInterval(easeTimer);
+      if (timeTimer) clearInterval(timeTimer);
+      easeTimer = timeTimer = null;
+    };
+    const startEase = () => {
+      if (easeTimer) return;
+      const easeStart = Date.now();
+      easeTimer = setInterval(() => {
+        const el = (Date.now() - easeStart) / 1000;
+        setBar(45 + 50 * Math.min(1, el / estTranscribe));
+      }, 500);
+    };
+    const onProgress = (info) => {
+      if (!info) return;
+      if (info.phase === 'transcribe') {
+        startEase();
+      } else if (info.pct != null) {
+        if (easeTimer) {
+          clearInterval(easeTimer);
+          easeTimer = null;
+        }
+        setBar(info.pct);
+      }
+      if (info.message) setLabel(info.message);
+    };
 
     // 長錄音防止螢幕鎖住中斷
     let wakeLock = null;
@@ -209,16 +258,19 @@ function renderNew() {
     } catch (_) {}
 
     try {
-      const { transcript, summary } = await transcribeAndSummarize(f, getApiKey(), {
-        onProgress: (msg) => show(msg),
-      });
+      const { transcript, summary } = await transcribeAndSummarize(f, getApiKey(), { onProgress });
+      stopTimers();
+      setBar(100);
+      setLabel('完成！');
       const ts = Date.now();
       const meeting = { id: uid(), title: defaultTitle(f.name, ts), createdAt: ts, updatedAt: ts, transcript, summary };
       await save(meeting);
       location.hash = '#/m/' + meeting.id;
       syncNow();
     } catch (e) {
-      show(e && e.message ? e.message : '發生未知錯誤', true);
+      stopTimers();
+      prog.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div><button class="big secondary" id="retry">再試一次</button>`;
+      document.getElementById('retry').onclick = () => renderNew();
       goBtn.disabled = false;
     } finally {
       transcribing = false;
@@ -229,6 +281,30 @@ function renderNew() {
       }
     }
   };
+}
+
+// 讀取音檔長度（秒），用於估算辨識時間；失敗回傳 0
+function getAudioDuration(file) {
+  return new Promise((resolve) => {
+    try {
+      const a = document.createElement('audio');
+      a.preload = 'metadata';
+      const url = URL.createObjectURL(file);
+      let settled = false;
+      const done = (d) => {
+        if (settled) return;
+        settled = true;
+        URL.revokeObjectURL(url);
+        resolve(d);
+      };
+      a.onloadedmetadata = () => done(isFinite(a.duration) ? a.duration : 0);
+      a.onerror = () => done(0);
+      a.src = url;
+      setTimeout(() => done(0), 4000);
+    } catch (_) {
+      resolve(0);
+    }
+  });
 }
 
 async function renderDetail(id) {
@@ -324,7 +400,7 @@ async function renderDetail(id) {
     const old = btn.textContent;
     try {
       const summary = await regenerateSummary(m.transcript, getApiKey(), {
-        onProgress: (msg) => (btn.textContent = '⏳ ' + msg),
+        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
       });
       m.summary = summary;
       m.updatedAt = Date.now();
