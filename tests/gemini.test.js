@@ -1,8 +1,27 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
+});
+
+const MODELS_RESPONSE = {
+  models: [
+    { name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] },
+    { name: 'models/gemini-2.5-flash', supportedGenerationMethods: ['generateContent'] },
+    { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] },
+    { name: 'models/gemini-3.1-pro', supportedGenerationMethods: ['generateContent'] },
+    { name: 'models/gemini-3.5-flash-image', supportedGenerationMethods: ['generateContent'] },
+  ],
+};
+
+describe('pickModel', () => {
+  it('挑最新的 flash（非 lite、非 image）', () => {
+    expect(pickModel(MODELS_RESPONSE.models)).toBe('gemini-3.5-flash');
+  });
+  it('沒有可用型號時回傳 null', () => {
+    expect(pickModel([{ name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] }])).toBeNull();
+  });
 });
 
 function jsonResponse(obj, headers = {}) {
@@ -45,6 +64,8 @@ describe('gemini', () => {
     };
     const fetchMock = vi
       .fn()
+      // 0) ListModels → 挑到 gemini-3.5-flash
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
       // 1) start resumable → 回傳 upload url header
       .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' }))
       // 2) upload bytes finalize → 回傳 file ACTIVE
@@ -65,7 +86,10 @@ describe('gemini', () => {
     expect(result.summary.keyPoints).toEqual(['重點A']);
     expect(result.summary.actionItems).toEqual(['待辦B']);
     expect(result.summary.decisions).toEqual(['決議C']);
-    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // ListModels + 上傳(start+finalize) + generate = 4 次
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+    // generateContent 使用挑到的型號
+    expect(fetchMock.mock.calls[3][0]).toContain('models/gemini-3.5-flash:generateContent');
   });
 
   it('逐字稿被截斷（MAX_TOKENS）時給出可理解的錯誤', async () => {
@@ -74,6 +98,7 @@ describe('gemini', () => {
     };
     const fetchMock = vi
       .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
       .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' }))
       .mockResolvedValueOnce(
         jsonResponse({ file: { uri: 'https://files/abc', name: 'files/abc', state: 'ACTIVE', mimeType: 'audio/mp4' } })

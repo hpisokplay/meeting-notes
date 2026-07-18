@@ -7,7 +7,38 @@
 // - responseSchema 強制結構化輸出，segments 陣列做語者辨識。
 
 const BASE = 'https://generativelanguage.googleapis.com';
-const MODEL = 'gemini-2.5-flash'; // 音訊能力 + 免費層可用；若官方更名於此處調整
+
+// 動態挑選型號：向 API 詢問目前可用的模型，挑最適合做「長音檔 + 語者辨識」的 flash 型號。
+// 這樣 Google 汰換型號名稱（如 2.5-flash → 3.5-flash）時 App 不會壞。
+export function pickModel(models) {
+  const bad = /embedding|aqa|imagen|image|veo|tts|audio-native|gemma|learnlm|robotics|computer-use|live/i;
+  const scored = (models || [])
+    .map((m) => {
+      const name = String(m.name || '').replace(/^models\//, '');
+      const methods = m.supportedGenerationMethods || m.supported_generation_methods || [];
+      if (!methods.includes('generateContent')) return null;
+      if (bad.test(name)) return null;
+      const ver = (name.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1];
+      let score = (ver ? parseFloat(ver) : 0) * 100;
+      if (/flash/.test(name) && !/flash-lite/.test(name)) score += 40; // flash：快、免費額度高
+      else if (/pro/.test(name)) score += 25;
+      else if (/flash-lite/.test(name)) score += 15;
+      if (/preview|exp|thinking|latest/.test(name)) score -= 12; // 偏好穩定版
+      return { name, score };
+    })
+    .filter(Boolean)
+    .sort((a, b) => b.score - a.score);
+  return scored.length ? scored[0].name : null;
+}
+
+async function resolveModel(apiKey) {
+  const res = await fetch(`${BASE}/v1beta/models?key=${apiKey}`);
+  if (!res.ok) throw new Error(`取得可用型號失敗 (${res.status})：${(await res.text()).slice(0, 200)}`);
+  const data = await res.json();
+  const name = pickModel(data.models || []);
+  if (!name) throw new Error('這組金鑰找不到可用的辨識型號，請確認金鑰是否正確、或是否已啟用 Gemini API。');
+  return name;
+}
 
 const PROMPT = `你是專業的會議記錄助理。輸入是一段會議錄音，可能長達數小時，內容以台灣中文為主，偶爾夾雜英文。請完成兩件事：
 
@@ -95,9 +126,9 @@ async function waitActive(fileInfo, apiKey, onProgress) {
   return { uri, mimeType };
 }
 
-async function generate(fileUri, mimeType, apiKey, onProgress) {
+async function generate(fileUri, mimeType, apiKey, model, onProgress) {
   onProgress && onProgress('辨識語者與摘要中…（長會議可能需數分鐘）');
-  const res = await fetch(`${BASE}/v1beta/models/${MODEL}:generateContent?key=${apiKey}`, {
+  const res = await fetch(`${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -144,10 +175,12 @@ async function generate(fileUri, mimeType, apiKey, onProgress) {
 export async function transcribeAndSummarize(file, apiKey, opts = {}) {
   const onProgress = opts.onProgress;
   if (!apiKey) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
+  onProgress && onProgress('選擇辨識型號中…');
+  const model = await resolveModel(apiKey);
   const fileInfo = await uploadFile(file, apiKey, onProgress);
   const active = await waitActive(fileInfo, apiKey, onProgress);
   const mime = active.mimeType || file.type || 'audio/mpeg';
-  const result = await generate(active.uri, mime, apiKey, onProgress);
+  const result = await generate(active.uri, mime, apiKey, model, onProgress);
   return {
     transcript: result.segments || [],
     summary: {
