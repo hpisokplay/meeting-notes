@@ -117,33 +117,48 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 export function isTransientStatus(status) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
+// 從 429 回應解析 Google 建議的等待秒數（retryDelay），回傳毫秒；沒有則回 0
+export function parseRetryDelayMs(bodyText) {
+  const m = bodyText && bodyText.match(/"retryDelay":\s*"(\d+(?:\.\d+)?)s"/);
+  return m ? Math.min(65000, Math.ceil(parseFloat(m[1]) + 1) * 1000) : 0;
+}
 
-// 帶自動重試的 POST（處理暫時性錯誤：網路中斷、5xx、429）
+// 帶自動重試的 POST：429（額度/速率）會依 Google 建議秒數等待後再試；5xx/網路用指數退避
 async function postJsonWithRetry(url, body, onProgress, label) {
+  const MAX = 5;
   for (let attempt = 0; ; attempt++) {
-    report(onProgress, 'transcribe', null, attempt ? `連線不穩，重試中…（第 ${attempt} 次）` : label);
+    report(onProgress, 'transcribe', null, attempt ? `重試中…（第 ${attempt} 次）` : label);
     let res;
     try {
       res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
     } catch (e) {
-      if (attempt < 2) {
-        await sleep(1500 * (attempt + 1));
+      if (attempt < MAX) {
+        await sleep(2000 * (attempt + 1));
         continue;
       }
       throw new Error('網路連線中斷，請確認網路後再試一次。');
     }
     if (res.ok) return res;
-    if (isTransientStatus(res.status) && attempt < 2) {
-      await sleep(1500 * (attempt + 1));
+    const t = await res.text();
+    if (res.status === 429 && attempt < MAX) {
+      const wait = parseRetryDelayMs(t) || Math.min(60000, 8000 * (attempt + 1));
+      report(onProgress, 'transcribe', null, `已達 Gemini 每分鐘用量上限，等待 ${Math.round(wait / 1000)} 秒後自動重試…`);
+      await sleep(wait);
       continue;
     }
-    const t = await res.text();
+    if (isTransientStatus(res.status) && attempt < MAX) {
+      await sleep(2000 * (attempt + 1));
+      continue;
+    }
+    if (res.status === 429) {
+      throw new Error('已達 Gemini 用量上限：可能是「每分鐘」限制（稍等 1–2 分鐘再按「繼續」即可），或「今日免費額度」用罄（隔日恢復），也可到 AI Studio 開通付費額度。進度已保存，可隨時接續。');
+    }
     throw new Error(`辨識失敗 (${res.status})：${t.slice(0, 300)}`);
   }
 }
 
 // ---- 逐字稿（可依時間分段，長錄音自動切割）----
-const WINDOW_SEC = 20 * 60; // 每段最長 20 分鐘，避免單次輸出超過上限
+const WINDOW_SEC = 40 * 60; // 每段最長 40 分鐘（減少呼叫次數與 token 用量，仍遠低於輸出上限）
 const SEG_SCHEMA = {
   type: 'object',
   properties: {

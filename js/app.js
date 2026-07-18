@@ -7,7 +7,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v15';
+const APP_VERSION = 'v16';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -196,7 +196,7 @@ function renderNew() {
 }
 
 // ===== 可續傳的辨識任務 =====
-const WINDOW_SEC = 20 * 60;
+const WINDOW_SEC = 40 * 60; // 每段最長 40 分鐘（減少呼叫次數與 token 用量）
 let jobRunning = false;
 
 function mmssApp(sec) {

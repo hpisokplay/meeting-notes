@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -21,6 +21,16 @@ describe('isTransientStatus', () => {
     expect(isTransientStatus(429)).toBe(true);
     expect(isTransientStatus(400)).toBe(false);
     expect(isTransientStatus(404)).toBe(false);
+  });
+});
+
+describe('parseRetryDelayMs', () => {
+  it('解析 429 的 retryDelay（秒→毫秒，+1 秒緩衝）', () => {
+    const body = '{"error":{"code":429,"details":[{"@type":"...RetryInfo","retryDelay":"27s"}]}}';
+    expect(parseRetryDelayMs(body)).toBe(28000);
+  });
+  it('沒有 retryDelay 回 0', () => {
+    expect(parseRetryDelayMs('{"error":{"code":429}}')).toBe(0);
   });
 });
 
@@ -117,7 +127,7 @@ describe('gemini', () => {
     expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
-  it('長錄音自動分段：40 分鐘 → 切成 2 段逐字稿再合併', async () => {
+  it('長錄音自動分段：80 分鐘 → 切成 2 段逐字稿再合併', async () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
@@ -130,7 +140,7 @@ describe('gemini', () => {
 
     const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
     file.name = 'long.m4a';
-    const result = await transcribeAndSummarize(file, 'KEY', { durationSec: 40 * 60 }); // 40 分鐘 → 2 段
+    const result = await transcribeAndSummarize(file, 'KEY', { durationSec: 80 * 60 }); // 80 分鐘 → 40 分鐘一段 → 2 段
     expect(result.transcript.map((s) => s.text)).toEqual(['第一段', '第二段']);
     expect(result.summary.mainPoints).toEqual(['整體重點']);
     // ListModels + start + 2 段逐字稿 + 摘要 = 5 次 fetch
