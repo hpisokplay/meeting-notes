@@ -12,11 +12,12 @@
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; }
-html { background: #0a84ff; } /* App 啟動前的底色，消除白屏閃爍 */
+html { background: var(--bg); min-height: 100%; } /* 跟隨主題色，避免底部露出色塊 */
 body {
   font-family: -apple-system, "PingFang TC", "Helvetica Neue", "Microsoft JhengHei", sans-serif;
   background: var(--bg);
   color: var(--ink);
+  min-height: 100vh;
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
   -webkit-text-size-adjust: 100%;
   /* 原生手感：禁止長按選單、禁止整頁彈跳 */
