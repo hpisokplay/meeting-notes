@@ -126,12 +126,39 @@ async function waitActive(fileInfo, apiKey, onProgress) {
   return { uri, mimeType };
 }
 
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+export function isTransientStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
+}
+
+// 帶自動重試的 POST（處理暫時性錯誤：網路中斷、5xx、429）
+async function postJsonWithRetry(url, body, onProgress, label) {
+  for (let attempt = 0; ; attempt++) {
+    if (onProgress) onProgress(attempt ? `連線不穩，重試中…（第 ${attempt} 次）` : label);
+    let res;
+    try {
+      res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+    } catch (e) {
+      if (attempt < 2) {
+        await sleep(1500 * (attempt + 1));
+        continue;
+      }
+      throw new Error('網路連線中斷，請確認網路後再試一次。');
+    }
+    if (res.ok) return res;
+    if (isTransientStatus(res.status) && attempt < 2) {
+      await sleep(1500 * (attempt + 1));
+      continue;
+    }
+    const t = await res.text();
+    throw new Error(`辨識失敗 (${res.status})：${t.slice(0, 300)}`);
+  }
+}
+
 async function generate(fileUri, mimeType, apiKey, model, onProgress) {
-  onProgress && onProgress('辨識語者與摘要中…（長會議可能需數分鐘）');
-  const res = await fetch(`${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
+  const res = await postJsonWithRetry(
+    `${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    JSON.stringify({
       contents: [
         {
           parts: [
@@ -147,11 +174,9 @@ async function generate(fileUri, mimeType, apiKey, model, onProgress) {
         thinkingConfig: { thinkingBudget: 0 },
       },
     }),
-  });
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`辨識失敗 (${res.status})：${t.slice(0, 300)}`);
-  }
+    onProgress,
+    '辨識語者與摘要中…（長會議可能需數分鐘）'
+  );
   const data = await res.json();
   const cand = data && data.candidates && data.candidates[0];
   const text =
@@ -189,4 +214,49 @@ export async function transcribeAndSummarize(file, apiKey, opts = {}) {
       qa: result.qa || [],
     },
   };
+}
+
+// 只根據既有逐字稿重新整理摘要（不需重傳音檔，快又省額度）
+const SUMMARY_SCHEMA = {
+  type: 'object',
+  properties: {
+    actionItems: { type: 'array', items: { type: 'string' } },
+    mainPoints: { type: 'array', items: { type: 'string' } },
+    qa: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['actionItems', 'mainPoints', 'qa'],
+};
+const SUMMARY_PROMPT =
+  `以下是一段會議逐字稿。請依內容整理成三類（全部使用繁體中文）：\n` +
+  `- actionItems（待辦事項）：逐條列出，每項結尾標註「[DRI: 負責人]」，判斷不出負責人就寫「[DRI: 待指派]」。\n` +
+  `- mainPoints（會議重點）：逐條列出。\n` +
+  `- qa（提問／Q&A）：格式「問：… 答：…」，若沒有問答就回傳空陣列。\n\n逐字稿：\n`;
+
+export async function regenerateSummary(segments, apiKey, opts = {}) {
+  const onProgress = opts.onProgress;
+  if (!apiKey) throw new Error('尚未設定 API 金鑰');
+  onProgress && onProgress('選擇型號中…');
+  const model = await resolveModel(apiKey);
+  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  const res = await postJsonWithRetry(
+    `${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    JSON.stringify({
+      contents: [{ parts: [{ text: SUMMARY_PROMPT + text }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: SUMMARY_SCHEMA,
+        maxOutputTokens: 65535,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    }),
+    onProgress,
+    '重新整理摘要中…'
+  );
+  const data = await res.json();
+  const out =
+    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error('未取得摘要結果，請重試。');
+  const r = JSON.parse(out);
+  return { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] };
 }

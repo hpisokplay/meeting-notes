@@ -89,6 +89,16 @@ button.big { width: 100%; padding: 15px; font-size: 16px; font-weight: 600; bord
 button.big.secondary { background: var(--bg); color: var(--ink); }
 button.big.danger { background: var(--danger); color: #fff; }
 button.copy { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; font-size: 13px; }
+.search {
+  width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
+  font-size: 16px; background: var(--card); color: var(--ink); margin-bottom: 12px;
+  -webkit-appearance: none; appearance: none;
+}
+.spk-rename { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 10px; }
+.spk-chip { background: transparent; border: 1.5px solid var(--brand); border-radius: 16px; padding: 6px 12px; font-size: 13px; font-weight: 600; }
+.spk-chip:active { transform: scale(0.96); }
+.btn-regen { width: 100%; margin-top: 14px; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--btn2); color: var(--ink); font-size: 14px; font-weight: 600; }
+.btn-regen:active { transform: scale(0.99); }
 .export-row { display: flex; gap: 8px; margin-top: 12px; }
 .btn-export { flex: 1; padding: 11px 8px; border: 1px solid var(--brand); border-radius: 10px; background: transparent; color: var(--brand); font-size: 14px; font-weight: 600; }
 .btn-export:active { background: var(--brand); color: #fff; }

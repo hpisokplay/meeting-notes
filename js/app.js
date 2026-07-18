@@ -1,7 +1,8 @@
 import { getApiKey, setApiKey, hasApiKey } from './settings.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged } from './store.js';
-import { transcribeAndSummarize } from './gemini.js';
+import { transcribeAndSummarize, regenerateSummary } from './gemini.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
+import { matchMeeting } from './search.js';
 import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
@@ -59,6 +60,16 @@ function toast(msg) {
   t._h = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
+// 辨識中防止誤關頁面
+let transcribing = false;
+window.addEventListener('beforeunload', (e) => {
+  if (transcribing) {
+    e.preventDefault();
+    e.returnValue = '辨識還在進行中，離開會中斷，確定要離開嗎？';
+    return e.returnValue;
+  }
+});
+
 let syncing = false;
 async function syncNow(silent) {
   if (!sync.isEnabled() || syncing) return;
@@ -95,20 +106,30 @@ async function renderList() {
     view.innerHTML = `<div class="empty">還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔</div>`;
     return;
   }
-  view.innerHTML = meetings
-    .map((m) => {
-      const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
-      const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
-      return `<div class="card tap" data-id="${m.id}">
-          <h3>${esc(m.title)}</h3>
-          <div class="meta">${formatDate(m.createdAt)}</div>
-          <div class="snippet">${esc(snip)}</div>
-        </div>`;
-    })
-    .join('');
-  view.querySelectorAll('.card').forEach((c) => {
-    c.onclick = () => (location.hash = '#/m/' + c.dataset.id);
-  });
+  const cardHtml = (m) => {
+    const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
+    const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
+    return `<div class="card tap" data-id="${m.id}">
+        <h3>${esc(m.title)}</h3>
+        <div class="meta">${formatDate(m.createdAt)}</div>
+        <div class="snippet">${esc(snip)}</div>
+      </div>`;
+  };
+  view.innerHTML = `<input type="search" id="search" class="search" placeholder="🔍 搜尋標題或內容" autocomplete="off" />
+    <div id="listBody"></div>`;
+  const body = document.getElementById('listBody');
+  const draw = (q) => {
+    const filtered = meetings.filter((m) => matchMeeting(m, q));
+    body.innerHTML = filtered.length
+      ? filtered.map(cardHtml).join('')
+      : '<div class="empty">找不到符合的會議</div>';
+    body.querySelectorAll('.card').forEach((c) => {
+      c.onclick = () => (location.hash = '#/m/' + c.dataset.id);
+    });
+  };
+  draw('');
+  const si = document.getElementById('search');
+  si.oninput = () => draw(si.value);
 }
 
 async function onExport() {
@@ -169,6 +190,7 @@ function renderNew() {
       return;
     }
     goBtn.disabled = true;
+    transcribing = true;
     prog.hidden = false;
     const show = (msg, isErr) => {
       prog.innerHTML = isErr
@@ -197,6 +219,7 @@ function renderNew() {
       show(e && e.message ? e.message : '發生未知錯誤', true);
       goBtn.disabled = false;
     } finally {
+      transcribing = false;
       if (wakeLock) {
         try {
           await wakeLock.release();
@@ -228,10 +251,18 @@ async function renderDetail(id) {
     .map((s) => `<div class="seg"><span class="spk" style="color:${colors[s.speaker] || 'var(--ink)'}">${esc(s.speaker)}</span>${esc(s.text)}</div>`)
     .join('');
 
+  const speakers = Object.keys(colors);
+  const chipsHtml = speakers.length
+    ? `<div class="spk-rename">${speakers
+        .map((sp) => `<button class="spk-chip" data-spk="${esc(sp)}" style="color:${colors[sp]};border-color:${colors[sp]}">✎ ${esc(sp)}</button>`)
+        .join('')}</div>`
+    : '';
+
   view.innerHTML = `
     <div class="card">
       <input type="text" id="titleInput" value="${esc(m.title)}" />
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
+      <button class="big" id="shareBtn" style="margin-top:12px">📤 分享待辦與重點</button>
       <div class="export-row">
         <button class="btn-export" id="pdfBtn">📄 匯出 PDF</button>
         <button class="btn-export" id="wordBtn">📝 匯出 Word (docx)</button>
@@ -244,13 +275,85 @@ async function renderDetail(id) {
       ${olHtml(mainPoints)}
       <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
       ${qa && qa.length ? olHtml(qa) : '<div class="meta" style="padding-left:4px">無</div>'}
+      <button class="btn-regen" id="regenBtn">🔄 重新整理摘要（用逐字稿重跑，不需重傳音檔）</button>
     </div>
     <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
+    ${chipsHtml ? `<div class="hint" style="margin:0 4px 6px">點下方語者可改名（例如「說話者1」→「陳經理」）</div>${chipsHtml}` : ''}
     <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
   document.getElementById('pdfBtn').onclick = () => exportPdf(m);
   document.getElementById('wordBtn').onclick = () => exportWord(m);
+
+  // 分享（待辦 + 重點）
+  document.getElementById('shareBtn').onclick = async () => {
+    const num = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
+    const text =
+      `【${m.title}】\n${formatDate(m.createdAt)}\n\n` +
+      `■ 待辦事項\n${num(actionItems) || '（無）'}\n\n` +
+      `■ 會議重點\n${num(mainPoints) || '（無）'}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: m.title, text });
+      } catch (_) {}
+    } else {
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('已複製到剪貼簿，可貼給同事');
+      } catch (_) {
+        alert(text);
+      }
+    }
+  };
+
+  // 重新整理摘要（用既有逐字稿）
+  document.getElementById('regenBtn').onclick = async () => {
+    if (!hasApiKey()) {
+      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
+      return;
+    }
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法重整摘要');
+      return;
+    }
+    if (!confirm('用現有逐字稿重新整理摘要？會覆蓋目前的待辦／重點／Q&A。')) return;
+    const btn = document.getElementById('regenBtn');
+    btn.disabled = true;
+    const old = btn.textContent;
+    try {
+      const summary = await regenerateSummary(m.transcript, getApiKey(), {
+        onProgress: (msg) => (btn.textContent = '⏳ ' + msg),
+      });
+      m.summary = summary;
+      m.updatedAt = Date.now();
+      await save(m);
+      syncNow();
+      renderDetail(id);
+      toast('摘要已更新 ✓');
+    } catch (e) {
+      alert('重整失敗：' + (e && e.message ? e.message : e));
+      btn.disabled = false;
+      btn.textContent = old;
+    }
+  };
+
+  // 語者改名
+  view.querySelectorAll('.spk-chip').forEach((chip) => {
+    chip.onclick = async () => {
+      const cur = chip.dataset.spk;
+      const nn = prompt(`把「${cur}」改成：`, cur);
+      if (nn && nn.trim() && nn.trim() !== cur) {
+        const name = nn.trim();
+        m.transcript.forEach((seg) => {
+          if (seg.speaker === cur) seg.speaker = name;
+        });
+        m.updatedAt = Date.now();
+        await save(m);
+        syncNow();
+        renderDetail(id);
+      }
+    };
+  });
 
   document.getElementById('titleInput').onchange = async (e) => {
     m.title = e.target.value.trim() || m.title;

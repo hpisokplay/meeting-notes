@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -14,6 +14,39 @@ const MODELS_RESPONSE = {
     { name: 'models/gemini-3.5-flash-image', supportedGenerationMethods: ['generateContent'] },
   ],
 };
+
+describe('isTransientStatus', () => {
+  it('5xx / 429 視為暫時性可重試', () => {
+    expect(isTransientStatus(503)).toBe(true);
+    expect(isTransientStatus(429)).toBe(true);
+    expect(isTransientStatus(400)).toBe(false);
+    expect(isTransientStatus(404)).toBe(false);
+  });
+});
+
+describe('regenerateSummary', () => {
+  it('只打文字（ListModels + generate 共 2 次），回傳三類', async () => {
+    const modelJson = {
+      candidates: [
+        {
+          content: {
+            parts: [{ text: JSON.stringify({ actionItems: ['x [DRI: 待指派]'], mainPoints: ['重點'], qa: [] }) }],
+          },
+        },
+      ],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(jsonResponse(modelJson));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await regenerateSummary([{ speaker: '說話者1', text: '哈囉' }], 'KEY');
+    expect(r.actionItems).toEqual(['x [DRI: 待指派]']);
+    expect(r.mainPoints).toEqual(['重點']);
+    expect(r.qa).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
 
 describe('pickModel', () => {
   it('挑最新的 flash（非 lite、非 image）', () => {

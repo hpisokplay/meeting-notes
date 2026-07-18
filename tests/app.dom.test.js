@@ -70,5 +70,9 @@ describe('app（整合）', () => {
     // 匯出按鈕
     expect(html).toContain('匯出 PDF');
     expect(html).toContain('匯出 Word');
+    // 新功能：分享、重新整理摘要、語者改名 chip
+    expect(html).toContain('分享待辦與重點');
+    expect(html).toContain('重新整理摘要');
+    expect(html).toContain('spk-chip');
   });
 });
