@@ -7,6 +7,8 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
+const APP_VERSION = 'v11';
+
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
 const backBtn = document.getElementById('backBtn');
@@ -418,6 +420,12 @@ function renderSettings() {
         Repository access 選「Only select repositories → <b>meeting-notes-data</b>」→ Permissions 的
         <b>Contents</b> 設為 <b>Read and write</b> → 產生後貼到上面。權杖只存這台裝置。
       </div>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>ℹ️ 關於／更新</b></p>
+      <div class="meta" style="margin-bottom:10px">目前版本：${APP_VERSION}</div>
+      <button class="big secondary" id="forceUpdateBtn">🔄 檢查並載入最新版</button>
+      <div class="hint">若畫面沒更新到最新，按這顆會清除快取並重新載入最新版。</div>
     </div>`;
   document.getElementById('saveKey').onclick = () => {
     setApiKey(document.getElementById('key').value);
@@ -440,6 +448,10 @@ function renderSettings() {
     sync.clearSyncConfig();
     toast('已關閉雲端同步');
     router();
+  };
+  document.getElementById('forceUpdateBtn').onclick = () => {
+    toast('更新中…');
+    forceUpdate();
   };
 }
 
@@ -488,7 +500,40 @@ function maybeShowInstallHint() {
 }
 maybeShowInstallHint();
 
-// 註冊 Service Worker（PWA / 離線）
+// 註冊 Service Worker（PWA / 離線）+ 自動更新
+let refreshing = false;
 if ('serviceWorker' in navigator) {
-  window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
+  // 有新版 SW 接手時自動重新載入（僅在已安裝過的情況，避免首次安裝就重整）
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.addEventListener('controllerchange', () => {
+      if (refreshing) return;
+      refreshing = true;
+      window.location.reload();
+    });
+  }
+  window.addEventListener('load', () => {
+    // updateViaCache:'none' → 不用瀏覽器快取的 sw.js，每次都抓最新版檢查更新
+    navigator.serviceWorker
+      .register('./sw.js', { updateViaCache: 'none' })
+      .then((reg) => {
+        reg.update();
+        setInterval(() => reg.update(), 60 * 60 * 1000);
+      })
+      .catch(() => {});
+  });
+}
+
+// 強制載入最新版：清掉 SW 與所有快取後重整（設定頁按鈕使用）
+async function forceUpdate() {
+  try {
+    if ('serviceWorker' in navigator) {
+      const regs = await navigator.serviceWorker.getRegistrations();
+      await Promise.all(regs.map((r) => r.unregister()));
+    }
+    if (window.caches) {
+      const keys = await caches.keys();
+      await Promise.all(keys.map((k) => caches.delete(k)));
+    }
+  } catch (_) {}
+  location.reload();
 }
