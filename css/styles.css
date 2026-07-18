@@ -6,9 +6,10 @@
   --brand: #0a84ff;
   --danger: #ff3b30;
   --line: #e5e5ea;
+  --btn2: #e3e3e8;
 }
 @media (prefers-color-scheme: dark) {
-  :root { --bg:#000; --card:#1c1c1e; --ink:#f2f2f7; --muted:#8e8e93; --line:#38383a; }
+  :root { --bg:#000; --card:#1c1c1e; --ink:#f2f2f7; --muted:#8e8e93; --line:#38383a; --btn2:#2c2c2e; }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; }
@@ -70,7 +71,7 @@ main { padding: 8px 16px 100px; max-width: 720px; margin: 0 auto; }
   box-shadow: 0 1px 3px rgba(0,0,0,.06);
   animation: fadeIn 0.22s ease both;
 }
-.card h3 { margin: 0 0 4px; font-size: 16px; }
+.card h3 { margin: 0 0 6px; font-size: 19px; font-weight: 700; letter-spacing: 0.3px; }
 .card .meta { color: var(--muted); font-size: 13px; }
 .card .snippet {
   color: var(--muted); font-size: 14px; margin-top: 6px; line-height: 1.5;
@@ -82,7 +83,7 @@ main { padding: 8px 16px 100px; max-width: 720px; margin: 0 auto; }
   display: flex; gap: 10px; padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
   background: var(--card); border-top: 1px solid var(--line);
 }
-.tabbar button { flex: 1; padding: 13px; border: none; border-radius: 12px; font-size: 15px; font-weight: 500; background: var(--bg); color: var(--ink); }
+.tabbar button { flex: 1; padding: 14px; border: none; border-radius: 12px; font-size: 15px; font-weight: 600; background: var(--btn2); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
 .tabbar .primary { background: var(--brand); color: #fff; }
 button.big { width: 100%; padding: 15px; font-size: 16px; font-weight: 600; border: none; border-radius: 12px; background: var(--brand); color: #fff; margin-top: 10px; }
 button.big.secondary { background: var(--bg); color: var(--ink); }
@@ -96,6 +97,17 @@ input[type=text], input[type=password] {
   font-size: 16px; background: var(--card); color: var(--ink);
 }
 input[type=file] { width: 100%; font-size: 15px; margin: 10px 0; color: var(--ink); }
+.file-pick {
+  display: flex; flex-direction: column; align-items: center; gap: 4px; cursor: pointer;
+  border: 2px dashed var(--brand); border-radius: 14px; padding: 22px 16px; margin: 12px 0;
+  text-align: center; background: color-mix(in srgb, var(--brand) 8%, transparent);
+}
+.file-pick .fp-icon { font-size: 30px; line-height: 1; }
+.file-pick .fp-main { font-size: 16px; font-weight: 700; color: var(--brand); }
+.file-pick .fp-name { font-size: 13px; color: var(--muted); word-break: break-all; }
+.file-pick:active { transform: scale(0.99); }
+.file-pick.picked { border-style: solid; background: color-mix(in srgb, var(--brand) 14%, transparent); }
+.file-pick.picked .fp-name { color: var(--ink); font-weight: 600; }
 .section-title { font-weight: 600; margin: 18px 4px 8px; display: flex; justify-content: space-between; align-items: center; font-size: 15px; }
 ul.list, ol.list { margin: 0; padding-left: 22px; }
 ul.list li, ol.list li { margin: 6px 0; line-height: 1.5; }

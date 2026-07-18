@@ -9,11 +9,13 @@ import { mergeState } from './sync.js';
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
 const backBtn = document.getElementById('backBtn');
+const backupBtn = document.getElementById('backupBtn');
 
 document.getElementById('homeTab').onclick = () => (location.hash = '#/');
 document.getElementById('newTab').onclick = () => (location.hash = '#/new');
 document.getElementById('settingsBtn').onclick = () => (location.hash = '#/settings');
 backBtn.onclick = () => (location.hash = '#/');
+backupBtn.onclick = () => onExport();
 
 const SPEAKER_PALETTE = ['#0a84ff', '#34c759', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
 
@@ -23,9 +25,10 @@ function esc(s) {
 function uid() {
   return crypto.randomUUID ? crypto.randomUUID() : 'm' + Date.now() + Math.round(performance.now());
 }
-function setHeader(text, showBack) {
+function setHeader(text, showBack, showBackup) {
   titleEl.textContent = text;
   backBtn.hidden = !showBack;
+  backupBtn.hidden = !showBackup;
 }
 function speakerColors(segments) {
   const map = {};
@@ -86,28 +89,26 @@ async function syncNow(silent) {
 }
 
 async function renderList() {
-  setHeader('會議記錄', false);
   const meetings = await list();
+  setHeader('會議記錄', false, meetings.length > 0);
   if (!meetings.length) {
     view.innerHTML = `<div class="empty">還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔</div>`;
     return;
   }
-  view.innerHTML =
-    meetings
-      .map((m) => {
-        const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
-        const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
-        return `<div class="card tap" data-id="${m.id}">
+  view.innerHTML = meetings
+    .map((m) => {
+      const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
+      const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
+      return `<div class="card tap" data-id="${m.id}">
           <h3>${esc(m.title)}</h3>
           <div class="meta">${formatDate(m.createdAt)}</div>
           <div class="snippet">${esc(snip)}</div>
         </div>`;
-      })
-      .join('') + `<button class="big secondary" id="exportBtn">⬇︎ 匯出備份</button>`;
+    })
+    .join('');
   view.querySelectorAll('.card').forEach((c) => {
     c.onclick = () => (location.hash = '#/m/' + c.dataset.id);
   });
-  document.getElementById('exportBtn').onclick = onExport;
 }
 
 async function onExport() {
@@ -133,7 +134,12 @@ function renderNew() {
   view.innerHTML = `
     <div class="card">
       <p style="margin-top:0">選擇會議錄音檔（mp3 / m4a / wav 等）</p>
-      <input type="file" id="audio" accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.aiff" />
+      <label for="audio" class="file-pick" id="filePick">
+        <span class="fp-icon">📁</span>
+        <span class="fp-main">點此選擇錄音檔</span>
+        <span class="fp-name" id="fileName">尚未選擇檔案</span>
+      </label>
+      <input type="file" id="audio" accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.aiff" hidden />
       <button class="big" id="go">開始辨識</button>
       <div class="warn">辨識長會議可能需要數分鐘。過程中請<b>保持螢幕開啟、不要切換到其他 App</b>，以免中斷。系統會盡量幫你維持螢幕不熄。</div>
       <details class="hint" style="margin-top:12px">
@@ -149,6 +155,12 @@ function renderNew() {
     </div>`;
   const prog = document.getElementById('prog');
   const goBtn = document.getElementById('go');
+
+  document.getElementById('audio').onchange = (e) => {
+    const f = e.target.files[0];
+    document.getElementById('fileName').textContent = f ? f.name : '尚未選擇檔案';
+    document.getElementById('filePick').classList.toggle('picked', !!f);
+  };
 
   goBtn.onclick = async () => {
     const f = document.getElementById('audio').files[0];
