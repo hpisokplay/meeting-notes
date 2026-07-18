@@ -6,9 +6,9 @@ import { formatDate } from './format.js';
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
-function ul(items) {
+function ol(items) {
   return items && items.length
-    ? '<ul>' + items.map((i) => `<li>${esc(i)}</li>`).join('') + '</ul>'
+    ? '<ol>' + items.map((i) => `<li>${esc(i)}</li>`).join('') + '</ol>'
     : '<p class="none">（無）</p>';
 }
 
@@ -19,16 +19,19 @@ export function safeFileName(title) {
 // 會議內容主體 HTML（PDF 與 Word 共用）
 export function meetingToHtmlBody(meeting) {
   const s = meeting.summary || {};
+  const actionItems = s.actionItems || [];
+  const mainPoints = s.mainPoints || s.keyPoints || [];
+  const qa = s.qa || [];
   const segs = (meeting.transcript || [])
     .map((seg) => `<p class="seg"><strong>${esc(seg.speaker)}：</strong>${esc(seg.text)}</p>`)
     .join('');
   return (
     `<h1>${esc(meeting.title)}</h1>` +
     `<p class="date">${esc(formatDate(meeting.createdAt))}</p>` +
-    `<h2>重點條列</h2>${ul(s.keyPoints)}` +
-    `<h2>待辦事項</h2>${ul(s.actionItems)}` +
-    `<h2>決議事項</h2>${ul(s.decisions)}` +
-    `<h2>逐字稿</h2>${segs || '<p class="none">（無逐字稿）</p>'}`
+    `<h2>待辦事項 Action Item</h2>${ol(actionItems)}` +
+    `<h2>會議重點 Main Point</h2>${ol(mainPoints)}` +
+    `<h2>會議提問 Q&amp;A</h2>${qa.length ? ol(qa) : '<p class="none">無</p>'}` +
+    `<h2>逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`
   );
 }
 

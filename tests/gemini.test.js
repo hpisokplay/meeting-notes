@@ -52,9 +52,9 @@ describe('gemini', () => {
                     { speaker: '說話者1', text: '大家好' },
                     { speaker: '說話者2', text: '開始吧' },
                   ],
-                  keyPoints: ['重點A'],
-                  actionItems: ['待辦B'],
-                  decisions: ['決議C'],
+                  actionItems: ['處理上線 [DRI: 待指派]'],
+                  mainPoints: ['重點A'],
+                  qa: ['問：何時上線 答：下週三'],
                 }),
               },
             ],
@@ -83,9 +83,9 @@ describe('gemini', () => {
     expect(result.transcript).toHaveLength(2);
     expect(result.transcript[0]).toEqual({ speaker: '說話者1', text: '大家好' });
     expect(result.transcript[1].speaker).toBe('說話者2');
-    expect(result.summary.keyPoints).toEqual(['重點A']);
-    expect(result.summary.actionItems).toEqual(['待辦B']);
-    expect(result.summary.decisions).toEqual(['決議C']);
+    expect(result.summary.actionItems).toEqual(['處理上線 [DRI: 待指派]']);
+    expect(result.summary.mainPoints).toEqual(['重點A']);
+    expect(result.summary.qa).toEqual(['問：何時上線 答：下週三']);
     // ListModels + 上傳(start+finalize) + generate = 4 次
     expect(fetchMock).toHaveBeenCalledTimes(4);
     // generateContent 使用挑到的型號

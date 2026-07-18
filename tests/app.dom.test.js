@@ -34,9 +34,9 @@ describe('app（整合）', () => {
         { speaker: '說話者3', text: '我明天開始測試' },
       ],
       summary: {
-        keyPoints: ['討論上線時程'],
-        actionItems: ['說話者3 明天開始測試'],
-        decisions: ['下週三上線'],
+        actionItems: ['說話者3 明天開始測試 [DRI: 說話者3]'],
+        mainPoints: ['討論上線時程'],
+        qa: [],
       },
     });
 
@@ -57,10 +57,13 @@ describe('app（整合）', () => {
     expect(html).toContain('說話者1');
     expect(html).toContain('說話者2');
     expect(html).toContain('說話者3');
-    // 摘要三區
-    expect(html).toContain('重點條列');
-    expect(html).toContain('待辦事項');
-    expect(html).toContain('決議事項');
+    // 新版四段
+    expect(html).toContain('待辦事項 Action Item');
+    expect(html).toContain('會議重點 Main Point');
+    expect(html).toContain('會議提問');
+    expect(html).toContain('[DRI: 說話者3]');
+    // Q&A 空 → 顯示「無」
+    expect(html).toMatch(/會議提問[\s\S]*?無/);
     // 語者上色（style color）
     expect(html).toMatch(/class="spk" style="color:#/);
     // 匯出按鈕

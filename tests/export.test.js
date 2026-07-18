@@ -10,25 +10,27 @@ const meeting = {
     { speaker: '說話者2', text: '下週三' },
   ],
   summary: {
-    keyPoints: ['重點A'],
-    actionItems: ['待辦B'],
-    decisions: ['決議C'],
+    actionItems: ['處理上線 [DRI: 待指派]'],
+    mainPoints: ['重點A'],
+    qa: ['問：何時上線 答：下週三'],
   },
 };
 
 describe('export', () => {
-  it('meetingToHtmlBody 含標題、語者、摘要三區', () => {
+  it('meetingToHtmlBody 含標題、語者、四段（待辦/重點/Q&A/逐字稿）', () => {
     const html = meetingToHtmlBody(meeting);
     expect(html).toContain('產品週會');
     expect(html).toContain('說話者1');
     expect(html).toContain('說話者2');
-    expect(html).toContain('重點條列');
-    expect(html).toContain('待辦事項');
-    expect(html).toContain('決議事項');
-    expect(html).toContain('重點A');
+    expect(html).toContain('待辦事項 Action Item');
+    expect(html).toContain('會議重點 Main Point');
+    expect(html).toContain('會議提問');
+    expect(html).toContain('逐字稿 Transcribe');
+    expect(html).toContain('[DRI: 待指派]');
+    expect(html).toContain('<ol>'); // 編號清單
   });
 
-  it('空摘要顯示（無）', () => {
+  it('空摘要：待辦/重點顯示（無）、Q&A 顯示無', () => {
     const html = meetingToHtmlBody({ title: 'x', createdAt: 0, transcript: [], summary: {} });
     expect(html).toContain('（無）');
     expect(html).toContain('（無逐字稿）');

@@ -95,8 +95,8 @@ async function renderList() {
   view.innerHTML =
     meetings
       .map((m) => {
-        const kp = (m.summary && m.summary.keyPoints) || [];
-        const snip = kp.length ? kp.join('、') : transcriptToText(m.transcript).slice(0, 60);
+        const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
+        const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
         return `<div class="card tap" data-id="${m.id}">
           <h3>${esc(m.title)}</h3>
           <div class="meta">${formatDate(m.createdAt)}</div>
@@ -201,9 +201,14 @@ async function renderDetail(id) {
     return;
   }
   setHeader('會議詳情', true);
-  const listHtml = (arr) =>
+  const s = m.summary || {};
+  // 向後相容舊記錄（keyPoints/decisions）
+  const actionItems = s.actionItems || [];
+  const mainPoints = s.mainPoints || s.keyPoints || [];
+  const qa = s.qa || [];
+  const olHtml = (arr) =>
     arr && arr.length
-      ? `<ul class="list">${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ul>`
+      ? `<ol class="list">${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">（無）</div>`;
 
   const colors = speakerColors(m.transcript);
@@ -217,12 +222,12 @@ async function renderDetail(id) {
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
     </div>
     <div class="card">
-      <div class="section-title" style="margin-top:0">📌 重點條列 <button class="copy" data-copy="kp">複製</button></div>
-      ${listHtml(m.summary.keyPoints)}
-      <div class="section-title">✅ 待辦事項 <button class="copy" data-copy="ai">複製</button></div>
-      ${listHtml(m.summary.actionItems)}
-      <div class="section-title">📝 決議事項 <button class="copy" data-copy="dc">複製</button></div>
-      ${listHtml(m.summary.decisions)}
+      <div class="section-title" style="margin-top:0">✅ 待辦事項 Action Item <button class="copy" data-copy="ai">複製</button></div>
+      ${olHtml(actionItems)}
+      <div class="section-title">📌 會議重點 Main Point <button class="copy" data-copy="mp">複製</button></div>
+      ${olHtml(mainPoints)}
+      <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
+      ${qa && qa.length ? olHtml(qa) : '<div class="meta" style="padding-left:4px">無</div>'}
     </div>
     <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
     <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
@@ -240,10 +245,11 @@ async function renderDetail(id) {
     await save(m);
     syncNow();
   };
+  const numbered = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
   const texts = {
-    kp: (m.summary.keyPoints || []).join('\n'),
-    ai: (m.summary.actionItems || []).join('\n'),
-    dc: (m.summary.decisions || []).join('\n'),
+    ai: numbered(actionItems),
+    mp: numbered(mainPoints),
+    qa: qa && qa.length ? numbered(qa) : '無',
     tr: transcriptToText(m.transcript),
   };
   view.querySelectorAll('.copy').forEach((b) => {
