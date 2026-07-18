@@ -1,6 +1,6 @@
 // Service Worker：快取 App 靜態殼，離線可開啟並瀏覽已存記錄。
 // Gemini API 一律走網路（不快取）。
-const CACHE = 'meeting-app-v4';
+const CACHE = 'meeting-app-v5';
 const ASSETS = [
   './',
   './index.html',
@@ -10,6 +10,8 @@ const ASSETS = [
   './js/store.js',
   './js/gemini.js',
   './js/format.js',
+  './js/export.js',
+  './js/sync.js',
   './manifest.webmanifest',
   './icons/icon-180.png',
   './icons/icon-192.png',

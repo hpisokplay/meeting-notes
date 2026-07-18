@@ -1,7 +1,10 @@
 import { getApiKey, setApiKey, hasApiKey } from './settings.js';
-import { list, get, save, remove, exportAll } from './store.js';
+import { list, get, save, remove, exportAll, getTombstones, applyMerged } from './store.js';
 import { transcribeAndSummarize } from './gemini.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
+import { exportPdf, exportWord } from './export.js';
+import * as sync from './sync.js';
+import { mergeState } from './sync.js';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -34,6 +37,52 @@ function speakerColors(segments) {
     }
   });
   return map;
+}
+
+// ---- 雲端同步 ----
+function defaultSyncConfig() {
+  return sync.getSyncConfig() || { token: '', owner: 'hpisokplay', repo: 'meeting-notes-data', path: 'meetings.json' };
+}
+function toast(msg) {
+  let t = document.getElementById('toast');
+  if (!t) {
+    t = document.createElement('div');
+    t.id = 'toast';
+    document.body.appendChild(t);
+  }
+  t.textContent = msg;
+  t.classList.add('show');
+  clearTimeout(t._h);
+  t._h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+let syncing = false;
+async function syncNow(silent) {
+  if (!sync.isEnabled() || syncing) return;
+  syncing = true;
+  try {
+    if (!silent) toast('雲端同步中…');
+    let remote = await sync.pull();
+    let merged = mergeState({ meetings: await list(), deleted: getTombstones() }, remote.doc);
+    await applyMerged(merged);
+    try {
+      await sync.push(merged, remote.sha);
+    } catch (e) {
+      if (e.message === 'CONFLICT') {
+        remote = await sync.pull();
+        merged = mergeState({ meetings: await list(), deleted: getTombstones() }, remote.doc);
+        await applyMerged(merged);
+        await sync.push(merged, remote.sha);
+      } else {
+        throw e;
+      }
+    }
+    toast('雲端已同步 ✓');
+  } catch (e) {
+    toast('同步失敗：' + (e && e.message ? e.message : e));
+  } finally {
+    syncing = false;
+  }
 }
 
 async function renderList() {
@@ -128,9 +177,10 @@ function renderNew() {
         onProgress: (msg) => show(msg),
       });
       const ts = Date.now();
-      const meeting = { id: uid(), title: defaultTitle(f.name, ts), createdAt: ts, transcript, summary };
+      const meeting = { id: uid(), title: defaultTitle(f.name, ts), createdAt: ts, updatedAt: ts, transcript, summary };
       await save(meeting);
       location.hash = '#/m/' + meeting.id;
+      syncNow();
     } catch (e) {
       show(e && e.message ? e.message : '發生未知錯誤', true);
       goBtn.disabled = false;
@@ -176,11 +226,19 @@ async function renderDetail(id) {
     </div>
     <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
     <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
-    <button class="big danger" id="del">刪除這場會議</button>`;
+    <div class="section-title">📤 匯出</div>
+    <button class="big secondary" id="pdfBtn">匯出 PDF</button>
+    <button class="big secondary" id="wordBtn" style="margin-top:8px">匯出 Word</button>
+    <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
+
+  document.getElementById('pdfBtn').onclick = () => exportPdf(m);
+  document.getElementById('wordBtn').onclick = () => exportWord(m);
 
   document.getElementById('titleInput').onchange = async (e) => {
     m.title = e.target.value.trim() || m.title;
+    m.updatedAt = Date.now();
     await save(m);
+    syncNow();
   };
   const texts = {
     kp: (m.summary.keyPoints || []).join('\n'),
@@ -204,15 +262,18 @@ async function renderDetail(id) {
     if (confirm('確定刪除這場會議記錄？此動作無法復原。')) {
       await remove(id);
       location.hash = '#/';
+      syncNow();
     }
   };
 }
 
 function renderSettings() {
   setHeader('設定', true);
+  const cfg = defaultSyncConfig();
+  const enabled = sync.isEnabled();
   view.innerHTML = `
     <div class="card">
-      <p style="margin-top:0">Gemini API 金鑰</p>
+      <p style="margin-top:0"><b>Gemini API 金鑰</b></p>
       <input type="password" id="key" placeholder="貼上你的金鑰" value="${esc(getApiKey())}" autocomplete="off" />
       <button class="big" id="saveKey">儲存</button>
       <div class="hint">
@@ -220,11 +281,43 @@ function renderSettings() {
         取得方式：到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> →
         API Keys → 複製你的免費金鑰。
       </div>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>☁️ GitHub 雲端同步（跨裝置記憶）</b>
+        <span class="meta">${enabled ? '｜狀態：已開啟' : '｜狀態：未開啟（只存本機）'}</span></p>
+      <input type="password" id="ghToken" placeholder="貼上 GitHub 權杖（token）" value="${esc(cfg.token || '')}" autocomplete="off" />
+      <input type="text" id="ghRepo" placeholder="owner/repo" value="${esc((cfg.owner || '') + '/' + (cfg.repo || ''))}" style="margin-top:8px" />
+      <button class="big" id="saveSync">儲存並同步</button>
+      <button class="big secondary" id="syncBtn" style="margin-top:8px">立即同步</button>
+      <button class="big secondary" id="clearSync" style="margin-top:8px">關閉同步（僅存本機）</button>
+      <div class="hint">
+        開啟後，會議記錄會存到你的<b>私人</b>資料庫 <code>${esc(cfg.owner)}/${esc(cfg.repo)}</code>，電腦與手機共用、長期保存。<br>
+        <b>如何拿權杖：</b>到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> →
+        Repository access 選「Only select repositories → <b>meeting-notes-data</b>」→ Permissions 的
+        <b>Contents</b> 設為 <b>Read and write</b> → 產生後貼到上面。權杖只存這台裝置。
+      </div>
     </div>`;
   document.getElementById('saveKey').onclick = () => {
     setApiKey(document.getElementById('key').value);
-    alert('已儲存');
-    location.hash = '#/';
+    toast('金鑰已儲存');
+  };
+  document.getElementById('saveSync').onclick = async () => {
+    const token = document.getElementById('ghToken').value.trim();
+    const repoField = document.getElementById('ghRepo').value.trim();
+    const [owner, repo] = repoField.split('/');
+    if (!token || !owner || !repo) {
+      alert('請填入權杖與 owner/repo');
+      return;
+    }
+    sync.setSyncConfig({ token, owner, repo, path: 'meetings.json' });
+    await syncNow();
+    router();
+  };
+  document.getElementById('syncBtn').onclick = () => syncNow();
+  document.getElementById('clearSync').onclick = () => {
+    sync.clearSyncConfig();
+    toast('已關閉雲端同步');
+    router();
   };
 }
 
@@ -237,6 +330,11 @@ function router() {
 }
 window.addEventListener('hashchange', router);
 router();
+
+// 啟動時若已開啟雲端同步：先拉取合併，再重新整理當前畫面
+if (sync.isEnabled()) {
+  syncNow(true).then(() => router());
+}
 
 // 註冊 Service Worker（PWA / 離線）
 if ('serviceWorker' in navigator) {

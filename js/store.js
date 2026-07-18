@@ -45,9 +45,41 @@ export async function list() {
 
 export async function remove(id) {
   await run('readwrite', (os) => os.delete(id));
+  const t = getTombstones();
+  if (!t.includes(id)) {
+    t.push(id);
+    setTombstones(t);
+  }
 }
 
 export async function exportAll() {
   const meetings = await list();
   return JSON.stringify({ exportedAt: Date.now(), meetings }, null, 2);
+}
+
+// ---- 刪除墓碑（供雲端同步跨裝置刪除）----
+const TOMB_KEY = 'meeting_tombstones';
+export function getTombstones() {
+  try {
+    return JSON.parse(localStorage.getItem(TOMB_KEY)) || [];
+  } catch (_) {
+    return [];
+  }
+}
+export function setTombstones(ids) {
+  localStorage.setItem(TOMB_KEY, JSON.stringify(Array.from(new Set(ids || []))));
+}
+
+// 把雲端合併後的文件套用到本機：刪掉墓碑內的、寫入所有會議、更新墓碑。
+export async function applyMerged(doc) {
+  const meetings = doc.meetings || [];
+  const deleted = doc.deleted || [];
+  const delSet = new Set(deleted);
+  for (const id of deleted) {
+    await run('readwrite', (os) => os.delete(id));
+  }
+  for (const m of meetings) {
+    if (!delSet.has(m.id)) await run('readwrite', (os) => os.put(m));
+  }
+  setTombstones(deleted);
 }

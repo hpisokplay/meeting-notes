@@ -63,5 +63,8 @@ describe('app（整合）', () => {
     expect(html).toContain('決議事項');
     // 語者上色（style color）
     expect(html).toMatch(/class="spk" style="color:#/);
+    // 匯出按鈕
+    expect(html).toContain('匯出 PDF');
+    expect(html).toContain('匯出 Word');
   });
 });
