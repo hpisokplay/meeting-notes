@@ -269,6 +269,25 @@ export async function transcribeAndSummarize(file, apiKey, opts = {}) {
   return { transcript: segments, summary };
 }
 
+// ---- 續傳用的分解式 API（供 app 逐段處理、可中斷續跑）----
+// 上傳並準備：回傳可續傳的 { model, fileUri, mime }（音檔在 Gemini 端保存約 48 小時）
+export async function uploadForJob(file, apiKey, onProgress) {
+  if (!apiKey) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
+  report(onProgress, 'model', 3, '選擇辨識型號中…');
+  const model = await resolveModel(apiKey);
+  const fileInfo = await uploadFile(file, apiKey, onProgress);
+  const active = await waitActive(fileInfo, apiKey, onProgress);
+  return { model, fileUri: active.uri, mime: active.mimeType || file.type || 'audio/mpeg' };
+}
+// 辨識單一時間段（含自動對半再切）
+export function transcribeRange(fileUri, mime, apiKey, model, start, end, whole, onProgress, label) {
+  return transcribeWindow(fileUri, mime, apiKey, model, start, end, whole, onProgress, label || '辨識中…', 0);
+}
+// 對整份逐字稿產生摘要
+export async function summarize(segments, apiKey, model, onProgress) {
+  return summarizeSegments(segments, apiKey, model, onProgress);
+}
+
 // 只根據既有逐字稿重新整理摘要（不需重傳音檔，快又省額度）
 const SUMMARY_SCHEMA = {
   type: 'object',

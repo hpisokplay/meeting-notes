@@ -1,13 +1,13 @@
 import { getApiKey, setApiKey, hasApiKey } from './settings.js';
-import { list, get, save, remove, exportAll, getTombstones, applyMerged } from './store.js';
-import { transcribeAndSummarize, regenerateSummary } from './gemini.js';
+import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
+import { uploadForJob, transcribeRange, summarize, regenerateSummary } from './gemini.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v14';
+const APP_VERSION = 'v15';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -191,96 +191,206 @@ function renderNew() {
       alert('請先選擇音檔');
       return;
     }
-    goBtn.disabled = true;
-    transcribing = true;
-    prog.hidden = false;
+    await startNewTranscription(f);
+  };
+}
 
-    // 依音檔長度估算「辨識」階段所需秒數（僅用於進度條配速，不影響結果）
-    const durSec = await getAudioDuration(f);
-    const estTranscribe = Math.max(30, Math.round((durSec || 0) * 0.5) + 25);
+// ===== 可續傳的辨識任務 =====
+const WINDOW_SEC = 20 * 60;
+let jobRunning = false;
 
-    const startAt = Date.now();
-    let barPct = 0;
-    let easeTimer = null;
-    let timeTimer = null;
-    const fmtElapsed = () => {
-      const s = Math.floor((Date.now() - startAt) / 1000);
-      return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-    };
-    prog.innerHTML = `
-      <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
-      <div class="prog-label" id="pl">準備中…</div>
-      <div class="prog-time" id="pt">已等待 0:00</div>`;
-    const setBar = (p) => {
-      barPct = Math.max(barPct, Math.min(100, p));
-      const pf = document.getElementById('pf');
-      if (pf) pf.style.width = barPct + '%';
-    };
-    const setLabel = (t) => {
-      const pl = document.getElementById('pl');
-      if (pl) pl.textContent = t;
-    };
-    timeTimer = setInterval(() => {
-      const pt = document.getElementById('pt');
-      if (pt) pt.textContent = '已等待 ' + fmtElapsed();
-    }, 1000);
-    const stopTimers = () => {
-      if (easeTimer) clearInterval(easeTimer);
-      if (timeTimer) clearInterval(timeTimer);
-      easeTimer = timeTimer = null;
-    };
-    const startEase = () => {
-      if (easeTimer) return;
-      const easeStart = Date.now();
-      easeTimer = setInterval(() => {
-        const el = (Date.now() - easeStart) / 1000;
-        setBar(45 + 50 * Math.min(1, el / estTranscribe));
-      }, 500);
-    };
-    const onProgress = (info) => {
-      if (!info) return;
-      if (info.phase === 'transcribe') {
-        startEase();
-      } else if (info.pct != null) {
-        if (easeTimer) {
-          clearInterval(easeTimer);
-          easeTimer = null;
-        }
-        setBar(info.pct);
-      }
-      if (info.message) setLabel(info.message);
-    };
+function mmssApp(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+function buildWindows(durationSec) {
+  if (!durationSec) return [{ start: 0, end: 0, whole: true, segments: null }];
+  const n = Math.max(1, Math.ceil(durationSec / WINDOW_SEC));
+  const arr = [];
+  for (let i = 0; i < n; i++) {
+    arr.push({ start: i * WINDOW_SEC, end: Math.min(durationSec, (i + 1) * WINDOW_SEC), whole: false, segments: null });
+  }
+  return arr;
+}
+async function persistJob(job) {
+  const clean = { ...job };
+  delete clean._file;
+  await saveJob(clean);
+}
 
-    // 長錄音防止螢幕鎖住中斷
-    let wakeLock = null;
-    try {
-      if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
-    } catch (_) {}
-
-    try {
-      const { transcript, summary } = await transcribeAndSummarize(f, getApiKey(), { onProgress, durationSec: durSec });
-      stopTimers();
-      setBar(100);
-      setLabel('完成！');
-      const ts = Date.now();
-      const meeting = { id: uid(), title: defaultTitle(f.name, ts), createdAt: ts, updatedAt: ts, transcript, summary };
-      await save(meeting);
-      location.hash = '#/m/' + meeting.id;
-      syncNow();
-    } catch (e) {
-      stopTimers();
-      prog.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div><button class="big secondary" id="retry">再試一次</button>`;
-      document.getElementById('retry').onclick = () => renderNew();
-      goBtn.disabled = false;
-    } finally {
-      transcribing = false;
-      if (wakeLock) {
-        try {
-          await wakeLock.release();
-        } catch (_) {}
-      }
+// 進度條 UI（回傳控制器）
+function createProgress(container, estSec) {
+  const startAt = Date.now();
+  let barPct = 0;
+  let easeTimer = null;
+  const q = (sel) => container.querySelector(sel);
+  const fmt = () => {
+    const s = Math.floor((Date.now() - startAt) / 1000);
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  };
+  container.innerHTML = `
+    <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
+    <div class="prog-label" id="pl">準備中…</div>
+    <div class="prog-time" id="pt">已等待 0:00</div>`;
+  const setBar = (p) => {
+    barPct = Math.max(barPct, Math.min(100, p));
+    const pf = q('#pf');
+    if (pf) pf.style.width = barPct + '%';
+  };
+  const setLabel = (t) => {
+    const pl = q('#pl');
+    if (pl) pl.textContent = t;
+  };
+  const timeTimer = setInterval(() => {
+    const pt = q('#pt');
+    if (pt) pt.textContent = '已等待 ' + fmt();
+  }, 1000);
+  const stopEase = () => {
+    if (easeTimer) {
+      clearInterval(easeTimer);
+      easeTimer = null;
     }
   };
+  const easeTo = (target, sec) => {
+    stopEase();
+    const from = barPct;
+    const es = Date.now();
+    easeTimer = setInterval(() => {
+      const el = (Date.now() - es) / 1000;
+      setBar(from + (target - from) * Math.min(1, el / Math.max(5, sec)));
+      if (barPct >= target - 0.5) stopEase();
+    }, 400);
+  };
+  const onProgress = (info) => {
+    if (!info) return;
+    if (info.pct != null) {
+      stopEase();
+      setBar(info.pct);
+    }
+    if (info.message) setLabel(info.message);
+  };
+  const stop = () => {
+    stopEase();
+    clearInterval(timeTimer);
+  };
+  return { onProgress, setBar, setLabel, easeTo, stopEase, stop };
+}
+
+async function processJob(job, container) {
+  const est = Math.max(30, Math.round((job.durationSec || 0) * 0.5) + 25);
+  const ui = createProgress(container, est);
+  transcribing = true;
+  jobRunning = true;
+  let wakeLock = null;
+  try {
+    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
+  } catch (_) {}
+  try {
+    // 1) 上傳（若尚未上傳）
+    if (!job.fileUri) {
+      const up = await uploadForJob(job._file, getApiKey(), ui.onProgress);
+      job.model = up.model;
+      job.fileUri = up.fileUri;
+      job.mime = up.mime;
+      await persistJob(job); // 上傳完成後才開始可續傳
+    }
+    // 2) 逐段辨識（每段完成即存檔）
+    const n = job.windows.length;
+    for (let i = 0; i < n; i++) {
+      if (job.windows[i].segments) continue;
+      const w = job.windows[i];
+      const base = 40 + (i / n) * 52;
+      const next = 40 + ((i + 1) / n) * 52;
+      ui.setBar(base);
+      ui.easeTo(next, est / n);
+      const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmssApp(w.start)}–${mmssApp(w.end)}）…` : '辨識語者與逐字稿中…';
+      const segs = await transcribeRange(job.fileUri, job.mime, getApiKey(), job.model, w.start, w.end, w.whole, ui.onProgress, label);
+      ui.stopEase();
+      job.windows[i].segments = segs;
+      await persistJob(job);
+      ui.setBar(next);
+    }
+    // 3) 摘要
+    ui.setLabel('整理摘要中…');
+    ui.easeTo(99, 20);
+    const allSegs = job.windows.reduce((acc, w) => acc.concat(w.segments || []), []);
+    const summary = await summarize(allSegs, getApiKey(), job.model, ui.onProgress);
+    ui.stopEase();
+    ui.setBar(100);
+    ui.setLabel('完成！');
+    // 4) 存成會議、清除任務
+    const meeting = { id: uid(), title: job.title, createdAt: job.createdAt, updatedAt: Date.now(), transcript: allSegs, summary };
+    await save(meeting);
+    await clearJob(job.id);
+    jobRunning = false;
+    transcribing = false;
+    location.hash = '#/m/' + meeting.id;
+    syncNow();
+  } catch (e) {
+    ui.stop();
+    jobRunning = false;
+    transcribing = false;
+    container.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
+      <div class="hint" style="margin-top:6px">${job.fileUri ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案。'}</div>
+      <button class="big" id="retryJob">${job.fileUri ? '繼續辨識' : '返回'}</button>`;
+    const rb = document.getElementById('retryJob');
+    if (rb) rb.onclick = () => (job.fileUri ? openJobProgress(job) : (location.hash = '#/new'));
+    refreshResumeBanner();
+  } finally {
+    if (wakeLock) {
+      try {
+        await wakeLock.release();
+      } catch (_) {}
+    }
+  }
+}
+
+async function openJobProgress(job) {
+  const existing = document.getElementById('resume-banner');
+  if (existing) existing.remove();
+  setHeader('辨識中', true);
+  view.innerHTML = `
+    <div class="card">
+      <div class="warn">辨識進行中。你可以<b>在 App 內</b>切到其他畫面去忙別的，它會繼續跑；就算切出 App 造成中斷，回來也會<b>從這裡接續</b>（iPhone 無法讓網頁在背景繼續運算）。</div>
+      <div class="progress" id="jobprog"></div>
+    </div>`;
+  await processJob(job, document.getElementById('jobprog'));
+}
+
+async function startNewTranscription(file) {
+  const durSec = await getAudioDuration(file);
+  const now = Date.now();
+  const job = {
+    id: 'active',
+    _file: file,
+    title: defaultTitle(file.name, now),
+    createdAt: now,
+    durationSec: durSec,
+    windows: buildWindows(durSec),
+    fileUri: null,
+    model: null,
+    mime: null,
+    done: false,
+  };
+  await openJobProgress(job);
+}
+
+async function refreshResumeBanner() {
+  const existing = document.getElementById('resume-banner');
+  if (existing) existing.remove();
+  if (jobRunning) return;
+  const job = await getActiveJob();
+  if (!job || !job.fileUri) return;
+  const doneCount = job.windows.filter((w) => w.segments).length;
+  const b = document.createElement('div');
+  b.id = 'resume-banner';
+  b.className = 'install-banner';
+  b.innerHTML = `<span>⏳ 有一場辨識未完成（${doneCount}/${job.windows.length} 段），點此繼續</span>`;
+  b.onclick = () => {
+    b.remove();
+    openJobProgress(job);
+  };
+  document.body.appendChild(b);
 }
 
 // 讀取音檔長度（秒），用於估算辨識時間；失敗回傳 0
@@ -575,6 +685,12 @@ function maybeShowInstallHint() {
   };
 }
 maybeShowInstallHint();
+
+// 未完成的辨識任務：啟動時、以及每次回到前景時，顯示「繼續」橫幅
+refreshResumeBanner();
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshResumeBanner();
+});
 
 // 註冊 Service Worker（PWA / 離線）+ 自動更新
 let refreshing = false;

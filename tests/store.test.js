@@ -1,6 +1,6 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect } from 'vitest';
-import { save, get, list, remove, exportAll } from '../js/store.js';
+import { save, get, list, remove, exportAll, saveJob, getActiveJob, clearJob } from '../js/store.js';
 
 function make(id, createdAt, title) {
   return {
@@ -38,5 +38,14 @@ describe('store', () => {
     const parsed = JSON.parse(json);
     expect(Array.isArray(parsed.meetings)).toBe(true);
     expect(parsed.meetings.some((m) => m.id === 'e')).toBe(true);
+  });
+
+  it('續傳任務：存取未完成任務、完成後清除', async () => {
+    await saveJob({ id: 'active', done: false, windows: [{ segments: null }], fileUri: 'u' });
+    const job = await getActiveJob();
+    expect(job.id).toBe('active');
+    expect(job.fileUri).toBe('u');
+    await clearJob('active');
+    expect(await getActiveJob()).toBeNull();
   });
 });

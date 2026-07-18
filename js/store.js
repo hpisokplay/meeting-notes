@@ -1,6 +1,7 @@
 const DB_NAME = 'meetings-db';
 const STORE = 'meetings';
-const VERSION = 1;
+const JOBS = 'jobs';
+const VERSION = 2;
 
 function openDb() {
   return new Promise((resolve, reject) => {
@@ -10,22 +11,41 @@ function openDb() {
       if (!db.objectStoreNames.contains(STORE)) {
         db.createObjectStore(STORE, { keyPath: 'id' });
       }
+      if (!db.objectStoreNames.contains(JOBS)) {
+        db.createObjectStore(JOBS, { keyPath: 'id' });
+      }
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
 }
 
-function run(mode, fn) {
+function runOn(storeName, mode, fn) {
   return openDb().then(
     (db) =>
       new Promise((resolve, reject) => {
-        const os = db.transaction(STORE, mode).objectStore(STORE);
+        const os = db.transaction(storeName, mode).objectStore(storeName);
         const req = fn(os);
         req.onsuccess = () => resolve(req.result);
         req.onerror = () => reject(req.error);
       })
   );
+}
+function run(mode, fn) {
+  return runOn(STORE, mode, fn);
+}
+
+// ---- 續傳任務（辨識到一半的會議）----
+export async function saveJob(job) {
+  await runOn(JOBS, 'readwrite', (os) => os.put(job));
+  return job;
+}
+export async function getActiveJob() {
+  const all = (await runOn(JOBS, 'readonly', (os) => os.getAll())) || [];
+  return all.find((j) => !j.done) || null;
+}
+export async function clearJob(id) {
+  await runOn(JOBS, 'readwrite', (os) => os.delete(id));
 }
 
 export async function save(meeting) {
