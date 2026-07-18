@@ -12,13 +12,49 @@
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; }
+html { background: #0a84ff; } /* App 啟動前的底色，消除白屏閃爍 */
 body {
   font-family: -apple-system, "PingFang TC", "Helvetica Neue", "Microsoft JhengHei", sans-serif;
   background: var(--bg);
   color: var(--ink);
   padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
   -webkit-text-size-adjust: 100%;
+  /* 原生手感：禁止長按選單、禁止整頁彈跳 */
+  -webkit-touch-callout: none;
+  overscroll-behavior: none;
+  -webkit-user-select: none;
+  user-select: none;
 }
+/* 內容區允許選取（方便手動複製） */
+input, .transcript-box, ol.list, ul.list, pre.transcript {
+  -webkit-user-select: text;
+  user-select: text;
+}
+button { touch-action: manipulation; }
+button:active { transform: scale(0.97); }
+
+/* 啟動畫面 Splash */
+#splash {
+  position: fixed; inset: 0; z-index: 9999;
+  background: linear-gradient(135deg, #0a84ff, #5e5ce6);
+  display: flex; align-items: center; justify-content: center;
+  transition: opacity 0.45s ease;
+}
+#splash.hide { opacity: 0; pointer-events: none; }
+.splash-inner { display: flex; flex-direction: column; align-items: center; animation: pop 0.5s ease both; }
+#splash img { border-radius: 22px; box-shadow: 0 10px 34px rgba(0,0,0,0.28); }
+.splash-name { color: #fff; font-size: 20px; font-weight: 600; margin-top: 16px; letter-spacing: 3px; }
+@keyframes pop { from { opacity: 0; transform: scale(0.9); } to { opacity: 1; transform: scale(1); } }
+@keyframes fadeIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* 安裝教學橫幅 */
+.install-banner {
+  position: fixed; left: 12px; right: 12px; bottom: calc(84px + env(safe-area-inset-bottom)); z-index: 60;
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.18); display: flex; align-items: center; gap: 10px; font-size: 13px; line-height: 1.5;
+  animation: fadeIn 0.3s ease both;
+}
+.install-banner .x { margin-left: auto; color: var(--muted); font-size: 20px; padding: 0 4px; }
 .topbar {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; gap: 8px;
@@ -31,6 +67,7 @@ main { padding: 8px 16px 100px; max-width: 720px; margin: 0 auto; }
 .card {
   background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px;
   box-shadow: 0 1px 3px rgba(0,0,0,.06);
+  animation: fadeIn 0.22s ease both;
 }
 .card h3 { margin: 0 0 4px; font-size: 16px; }
 .card .meta { color: var(--muted); font-size: 13px; }

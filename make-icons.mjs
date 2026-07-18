@@ -1,4 +1,4 @@
-// 產生純色圓角 App 圖示（PNG），無需外部套件。中央畫一個簡單的「聲波/麥克風」白色圖形。
+// 產生漸層質感的 App 圖示（藍→靛漸層 + 白色麥克風），無需外部套件。
 import { writeFileSync, mkdirSync } from 'node:fs';
 import zlib from 'node:zlib';
 
@@ -8,7 +8,7 @@ function crc32(buf) {
     c ^= buf[i];
     for (let k = 0; k < 8; k++) c = (c >>> 1) ^ (0xedb88320 & -(c & 1));
   }
-  return ~c >>> 0;
+  return (~c) >>> 0;
 }
 function chunk(type, data) {
   const len = Buffer.alloc(4);
@@ -23,7 +23,7 @@ function png(size, draw) {
   const stride = size * bpp + 1;
   const raw = Buffer.alloc(stride * size);
   for (let y = 0; y < size; y++) {
-    raw[y * stride] = 0; // filter type none
+    raw[y * stride] = 0;
     for (let x = 0; x < size; x++) {
       const [r, g, b] = draw(x, y, size);
       const o = y * stride + 1 + x * bpp;
@@ -35,49 +35,45 @@ function png(size, draw) {
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(size, 0);
   ihdr.writeUInt32BE(size, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 2; // color type RGB
+  ihdr[8] = 8;
+  ihdr[9] = 2;
   const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
   return Buffer.concat([sig, chunk('IHDR', ihdr), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
 }
 
-const BLUE = [10, 132, 255];
+const C1 = [10, 132, 255]; // #0A84FF
+const C2 = [94, 92, 230]; // #5E5CE6
 const WHITE = [255, 255, 255];
 
 function draw(x, y, size) {
   const cx = size / 2;
-  const cy = size / 2;
-  const nx = x / size;
-  const ny = y / size;
-  // 麥克風膠囊：中央直立圓角矩形
-  const capW = size * 0.14;
-  const capTop = size * 0.24;
-  const capBot = size * 0.56;
-  const inCapX = Math.abs(x - cx) <= capW;
-  const inCapY = y >= capTop && y <= capBot;
-  const capR = capW; // 圓角半徑（頂/底）
-  let inCap = inCapX && inCapY;
-  if (inCapY) {
-    // 頂端與底端做圓角
-    if (y < capTop + capR) {
-      const dx = x - cx;
-      const dy = y - (capTop + capR);
-      inCap = inCapX && dx * dx + dy * dy <= capR * capR ? true : y >= capTop + capR ? inCapX : inCap;
-    }
-  }
-  // 底座弧（U 形）
-  const standR1 = size * 0.2;
-  const standR2 = size * 0.24;
+  // 麥克風膠囊（stadium）：上下半圓 + 中間直條
+  const capR = size * 0.088;
+  const topC = size * 0.24;
+  const botC = size * 0.46;
   const dxc = x - cx;
-  const dyc = y - cy;
-  const dist = Math.sqrt(dxc * dxc + dyc * dyc);
-  const inArc = y > cy && dist >= standR1 && dist <= standR2;
-  // 底座直桿
-  const inStem = Math.abs(x - cx) <= size * 0.02 && y >= size * 0.72 && y <= size * 0.82;
-  const inBase = Math.abs(x - cx) <= size * 0.12 && y >= size * 0.8 && y <= size * 0.83;
+  const inBody = Math.abs(dxc) <= capR && y >= topC && y <= botC;
+  const inTop = Math.hypot(dxc, y - topC) <= capR;
+  const inBot = Math.hypot(dxc, y - botC) <= capR;
+  const inCapsule = inBody || inTop || inBot;
 
-  if (inCap || inArc || inStem || inBase) return WHITE;
-  return BLUE;
+  // 底座弧（U 形）
+  const arcCy = size * 0.46;
+  const dr = Math.hypot(x - cx, y - arcCy);
+  const inArc = y > arcCy && dr >= size * 0.185 && dr <= size * 0.225;
+  // 直桿與底座
+  const inStem = Math.abs(dxc) <= size * 0.016 && y >= size * 0.685 && y <= size * 0.78;
+  const inBase = Math.abs(dxc) <= size * 0.1 && y >= size * 0.78 && y <= size * 0.807;
+
+  if (inCapsule || inArc || inStem || inBase) return WHITE;
+
+  // 對角漸層背景
+  const t = (x + y) / (2 * size);
+  return [
+    Math.round(C1[0] + (C2[0] - C1[0]) * t),
+    Math.round(C1[1] + (C2[1] - C1[1]) * t),
+    Math.round(C1[2] + (C2[2] - C1[2]) * t),
+  ];
 }
 
 mkdirSync('icons', { recursive: true });

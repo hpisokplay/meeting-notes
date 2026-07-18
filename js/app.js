@@ -343,6 +343,36 @@ if (sync.isEnabled()) {
   syncNow(true).then(() => router());
 }
 
+// 啟動畫面：載入後淡出移除
+function hideSplash() {
+  const sp = document.getElementById('splash');
+  if (!sp) return;
+  setTimeout(() => {
+    sp.classList.add('hide');
+    setTimeout(() => sp.remove(), 500);
+  }, 550);
+}
+if (document.readyState === 'complete') hideSplash();
+else window.addEventListener('load', hideSplash);
+
+// 「加入主畫面」教學：只在 iPhone 用瀏覽器（非已安裝）且未關閉過時顯示
+function isStandalone() {
+  return window.navigator.standalone === true || window.matchMedia('(display-mode: standalone)').matches;
+}
+function maybeShowInstallHint() {
+  const isIOS = /iphone|ipad|ipod/i.test(navigator.userAgent);
+  if (!isIOS || isStandalone() || localStorage.getItem('install_hint_dismissed')) return;
+  const b = document.createElement('div');
+  b.className = 'install-banner';
+  b.innerHTML = `<span>📲 想像 App 一樣用？點下方 <b>分享鈕</b> → <b>加入主畫面</b></span><span class="x" id="closeHint">×</span>`;
+  document.body.appendChild(b);
+  document.getElementById('closeHint').onclick = () => {
+    localStorage.setItem('install_hint_dismissed', '1');
+    b.remove();
+  };
+}
+maybeShowInstallHint();
+
 // 註冊 Service Worker（PWA / 離線）
 if ('serviceWorker' in navigator) {
   window.addEventListener('load', () => navigator.serviceWorker.register('./sw.js').catch(() => {}));
