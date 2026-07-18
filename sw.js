@@ -1,6 +1,6 @@
 // Service Worker：快取 App 靜態殼，離線可開啟並瀏覽已存記錄。
 // Gemini API 一律走網路（不快取）。
-const CACHE = 'meeting-app-v3';
+const CACHE = 'meeting-app-v4';
 const ASSETS = [
   './',
   './index.html',
@@ -34,12 +34,19 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// 網路優先（network-first）：連線時一律拿最新程式碼，離線時才用快取。
+// 避免舊版程式被快取卡住，同時保留離線可開啟已存記錄的能力。
 self.addEventListener('fetch', (e) => {
   const url = new URL(e.request.url);
-  // 只處理自家同源靜態資源；其餘（含 Gemini API）走網路。
-  if (url.origin !== location.origin) return;
+  if (url.origin !== location.origin) return; // Gemini API 等外部一律走網路
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    caches.match(e.request).then((cached) => cached || fetch(e.request))
+    fetch(e.request)
+      .then((res) => {
+        const copy = res.clone();
+        caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
+        return res;
+      })
+      .catch(() => caches.match(e.request))
   );
 });
