@@ -40,40 +40,6 @@ async function resolveModel(apiKey) {
   return name;
 }
 
-const PROMPT = `你是專業的會議記錄助理。輸入是一段會議錄音，可能長達數小時，內容以台灣中文為主，偶爾夾雜英文。請完成兩件事：
-
-一、逐字稿（segments，依時間順序）：
-- 辨識不同的說話者，標記為「說話者1」「說話者2」「說話者3」以此類推；同一個人自始至終使用同一個標籤。
-- 若整段幾乎只有一個人在說，就都標「說話者1」；一旦出現對話，務必區分不同說話者。
-- 中文一律使用繁體中文（台灣用語）；英文保留原文。
-- 每個 segment 格式為 {"speaker":"說話者1","text":"這句話的內容"}；請適度斷句，不要一個 segment 塞入過長內容。
-
-二、整理（依整場內容）：
-- actionItems（待辦事項）：逐條列出每一項待辦；每一項的最後都要標註負責人，格式為「待辦內容 [DRI: 負責人]」；若無法從內容判斷負責人，就寫「[DRI: 待指派]」。
-- mainPoints（會議重點）：逐條列出會議重點。
-- qa（會議提問／Q&A）：若會議中有提問或問答環節，逐條列出，每條格式「問：… 答：…」；若整場沒有問答，回傳空陣列（不要編造）。
-每個類別若沒有內容，回傳空陣列。`;
-
-const SCHEMA = {
-  type: 'object',
-  properties: {
-    segments: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: {
-          speaker: { type: 'string' },
-          text: { type: 'string' },
-        },
-        required: ['speaker', 'text'],
-      },
-    },
-    actionItems: { type: 'array', items: { type: 'string' } },
-    mainPoints: { type: 'array', items: { type: 'string' } },
-    qa: { type: 'array', items: { type: 'string' } },
-  },
-  required: ['segments', 'actionItems', 'mainPoints', 'qa'],
-};
 
 // 進度回報統一格式：{ phase, pct, message }。pct 為 null 代表該階段無精確百分比。
 function report(onProgress, phase, pct, message) {
@@ -176,65 +142,131 @@ async function postJsonWithRetry(url, body, onProgress, label) {
   }
 }
 
-async function generate(fileUri, mimeType, apiKey, model, onProgress) {
+// ---- 逐字稿（可依時間分段，長錄音自動切割）----
+const WINDOW_SEC = 20 * 60; // 每段最長 20 分鐘，避免單次輸出超過上限
+const SEG_SCHEMA = {
+  type: 'object',
+  properties: {
+    segments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { speaker: { type: 'string' }, text: { type: 'string' } },
+        required: ['speaker', 'text'],
+      },
+    },
+  },
+  required: ['segments'],
+};
+const SEG_PROMPT =
+  `你是專業會議記錄助理。請把這段會議錄音整理成「語者分段逐字稿」：\n` +
+  `- 辨識不同說話者，標記「說話者1」「說話者2」…同一個人自始至終用同一標籤。\n` +
+  `- 中文一律使用繁體中文（台灣用語），英文保留原文。\n` +
+  `- 每個 segment 格式 {"speaker":"說話者1","text":"…"}，適度斷句。`;
+
+function mmss(sec) {
+  const s = Math.max(0, Math.round(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+// 辨識單一時間窗；若輸出被截斷（內容太密）則自動對半再切，直到塞得下
+async function transcribeWindow(fileUri, mime, apiKey, model, start, end, whole, onProgress, label, depth) {
+  const range = whole ? '' : `\n\n【只處理 ${mmss(start)} 到 ${mmss(end)} 這段時間範圍】的內容，此範圍以外請完全略過。說話者請從「說話者1」開始標記。`;
   const res = await postJsonWithRetry(
     `${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`,
     JSON.stringify({
-      contents: [
-        {
-          parts: [
-            { file_data: { mime_type: mimeType, file_uri: fileUri } },
-            { text: PROMPT },
-          ],
-        },
-      ],
+      contents: [{ parts: [{ file_data: { mime_type: mime, file_uri: fileUri } }, { text: SEG_PROMPT + range }] }],
       generationConfig: {
         responseMimeType: 'application/json',
-        responseSchema: SCHEMA,
+        responseSchema: SEG_SCHEMA,
         maxOutputTokens: 65535,
         thinkingConfig: { thinkingBudget: 0 },
       },
     }),
     onProgress,
-    '辨識語者與摘要中…（長會議可能需數分鐘）'
+    label
   );
   const data = await res.json();
   const cand = data && data.candidates && data.candidates[0];
-  const text =
-    cand && cand.content && cand.content.parts && cand.content.parts[0] && cand.content.parts[0].text;
-  if (!text) {
-    if (cand && cand.finishReason === 'MAX_TOKENS') {
-      throw new Error('這段錄音內容太長，超過單次輸出上限。建議把錄音切成較短的檔案（例如每段 30–60 分鐘）再分次上傳。');
+  const text = cand && cand.content && cand.content.parts && cand.content.parts[0] && cand.content.parts[0].text;
+  const truncated = cand && cand.finishReason === 'MAX_TOKENS';
+  let segments = null;
+  if (text) {
+    try {
+      segments = (JSON.parse(text).segments) || [];
+    } catch (_) {
+      segments = null;
     }
-    throw new Error('未取得辨識結果，請稍後再試。');
   }
-  try {
-    return JSON.parse(text);
-  } catch (e) {
-    if (cand && cand.finishReason === 'MAX_TOKENS') {
-      throw new Error('這段錄音內容太長，逐字稿被截斷。建議把錄音切成較短的檔案再分次上傳。');
-    }
+  // 內容太密被截斷 → 對半再切（有時間範圍時才能切）
+  if ((truncated || segments === null) && !whole && depth < 4 && end - start > 120) {
+    const mid = Math.floor((start + end) / 2);
+    const a = await transcribeWindow(fileUri, mime, apiKey, model, start, mid, false, onProgress, label, depth + 1);
+    const b = await transcribeWindow(fileUri, mime, apiKey, model, mid, end, false, onProgress, label, depth + 1);
+    return a.concat(b);
+  }
+  if (segments === null) {
+    if (truncated) throw new Error('這段錄音內容太密集，無法完整辨識，請重試一次。');
     throw new Error('辨識結果解析失敗，請重試一次。');
   }
+  return segments;
+}
+
+async function transcribeAudio(fileUri, mime, apiKey, model, durationSec, onProgress) {
+  if (!durationSec) {
+    // 讀不到長度：以整檔一次辨識（多數情況用不到）
+    return transcribeWindow(fileUri, mime, apiKey, model, 0, 0, true, onProgress, '辨識語者與逐字稿中…', 0);
+  }
+  const n = Math.max(1, Math.ceil(durationSec / WINDOW_SEC));
+  const all = [];
+  for (let i = 0; i < n; i++) {
+    const start = i * WINDOW_SEC;
+    const end = Math.min(durationSec, (i + 1) * WINDOW_SEC);
+    const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmss(start)}–${mmss(end)}）…` : '辨識語者與逐字稿中…';
+    const segs = await transcribeWindow(fileUri, mime, apiKey, model, start, end, false, onProgress, label, 0);
+    all.push(...segs);
+  }
+  return all;
+}
+
+async function summarizeSegments(segments, apiKey, model, onProgress) {
+  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  const res = await postJsonWithRetry(
+    `${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`,
+    JSON.stringify({
+      contents: [{ parts: [{ text: SUMMARY_PROMPT + text }] }],
+      generationConfig: {
+        responseMimeType: 'application/json',
+        responseSchema: SUMMARY_SCHEMA,
+        maxOutputTokens: 65535,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    }),
+    onProgress,
+    '整理摘要中…'
+  );
+  const data = await res.json();
+  const out =
+    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error('未取得摘要結果，請重試。');
+  const r = JSON.parse(out);
+  return { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] };
 }
 
 export async function transcribeAndSummarize(file, apiKey, opts = {}) {
   const onProgress = opts.onProgress;
+  const durationSec = opts.durationSec || 0;
   if (!apiKey) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
   const model = await resolveModel(apiKey);
   const fileInfo = await uploadFile(file, apiKey, onProgress);
   const active = await waitActive(fileInfo, apiKey, onProgress);
   const mime = active.mimeType || file.type || 'audio/mpeg';
-  const result = await generate(active.uri, mime, apiKey, model, onProgress);
-  return {
-    transcript: result.segments || [],
-    summary: {
-      actionItems: result.actionItems || [],
-      mainPoints: result.mainPoints || [],
-      qa: result.qa || [],
-    },
-  };
+  const segments = await transcribeAudio(active.uri, mime, apiKey, model, durationSec, onProgress);
+  report(onProgress, 'summary', null, '整理摘要中…');
+  const summary = await summarizeSegments(segments, apiKey, model, onProgress);
+  return { transcript: segments, summary };
 }
 
 // 只根據既有逐字稿重新整理摘要（不需重傳音檔，快又省額度）
@@ -258,26 +290,5 @@ export async function regenerateSummary(segments, apiKey, opts = {}) {
   if (!apiKey) throw new Error('尚未設定 API 金鑰');
   report(onProgress, 'model', 3, '選擇型號中…');
   const model = await resolveModel(apiKey);
-  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
-  const res = await postJsonWithRetry(
-    `${BASE}/v1beta/models/${model}:generateContent?key=${apiKey}`,
-    JSON.stringify({
-      contents: [{ parts: [{ text: SUMMARY_PROMPT + text }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SUMMARY_SCHEMA,
-        maxOutputTokens: 65535,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
-    }),
-    onProgress,
-    '重新整理摘要中…'
-  );
-  const data = await res.json();
-  const out =
-    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
-  if (!out) throw new Error('未取得摘要結果，請重試。');
-  const r = JSON.parse(out);
-  return { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] };
+  return summarizeSegments(segments, apiKey, model, onProgress);
 }

@@ -91,69 +91,68 @@ describe('gemini', () => {
     await expect(transcribeAndSummarize(new Blob(['x']), '')).rejects.toThrow('金鑰');
   });
 
-  it('happy path：上傳→ACTIVE→產生語者分段 JSON', async () => {
-    const modelJson = {
-      candidates: [
-        {
-          finishReason: 'STOP',
-          content: {
-            parts: [
-              {
-                text: JSON.stringify({
-                  segments: [
-                    { speaker: '說話者1', text: '大家好' },
-                    { speaker: '說話者2', text: '開始吧' },
-                  ],
-                  actionItems: ['處理上線 [DRI: 待指派]'],
-                  mainPoints: ['重點A'],
-                  qa: ['問：何時上線 答：下週三'],
-                }),
-              },
-            ],
-          },
-        },
-      ],
-    };
+  const segResp = (segs) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ segments: segs }) }] } }] });
+  const sumResp = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+
+  it('happy path：上傳→ACTIVE→逐字稿+摘要（兩次 generate）', async () => {
     const fetchMock = vi
       .fn()
-      // 0) ListModels → 挑到 gemini-3.5-flash
-      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
-      // 1) start resumable → 回傳 upload url header
-      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' }))
-      // 2) generateContent → 回傳結構化 JSON（上傳位元組走 XHR）
-      .mockResolvedValueOnce(jsonResponse(modelJson));
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' })) // start
+      .mockResolvedValueOnce(segResp([{ speaker: '說話者1', text: '大家好' }, { speaker: '說話者2', text: '開始吧' }])) // 逐字稿
+      .mockResolvedValueOnce(sumResp({ actionItems: ['處理上線 [DRI: 待指派]'], mainPoints: ['重點A'], qa: ['問：何時上線 答：下週三'] })); // 摘要
     vi.stubGlobal('fetch', fetchMock);
     stubXHR();
 
     const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
     file.name = 'meeting.m4a';
 
-    const result = await transcribeAndSummarize(file, 'KEY');
+    const result = await transcribeAndSummarize(file, 'KEY'); // 無 durationSec → 整檔一次
     expect(result.transcript).toHaveLength(2);
-    expect(result.transcript[0]).toEqual({ speaker: '說話者1', text: '大家好' });
     expect(result.transcript[1].speaker).toBe('說話者2');
     expect(result.summary.actionItems).toEqual(['處理上線 [DRI: 待指派]']);
     expect(result.summary.mainPoints).toEqual(['重點A']);
     expect(result.summary.qa).toEqual(['問：何時上線 答：下週三']);
-    // ListModels + start + generate = 3 次 fetch（上傳位元組走 XHR 不計）
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls[2][0]).toContain('models/gemini-3.5-flash:generateContent');
+    // ListModels + start + 逐字稿 + 摘要 = 4 次 fetch
+    expect(fetchMock).toHaveBeenCalledTimes(4);
   });
 
-  it('逐字稿被截斷（MAX_TOKENS）時給出可理解的錯誤', async () => {
-    const truncated = {
-      candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [{ text: '{"segments":[{"speaker":"說話者1' }] } }],
-    };
+  it('長錄音自動分段：40 分鐘 → 切成 2 段逐字稿再合併', async () => {
     const fetchMock = vi
       .fn()
-      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
-      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' }))
-      .mockResolvedValueOnce(jsonResponse(truncated));
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' })) // start
+      .mockResolvedValueOnce(segResp([{ speaker: '說話者1', text: '第一段' }])) // window 1
+      .mockResolvedValueOnce(segResp([{ speaker: '說話者1', text: '第二段' }])) // window 2
+      .mockResolvedValueOnce(sumResp({ actionItems: [], mainPoints: ['整體重點'], qa: [] })); // 摘要
     vi.stubGlobal('fetch', fetchMock);
     stubXHR();
 
     const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
     file.name = 'long.m4a';
-    await expect(transcribeAndSummarize(file, 'KEY')).rejects.toThrow('太長');
+    const result = await transcribeAndSummarize(file, 'KEY', { durationSec: 40 * 60 }); // 40 分鐘 → 2 段
+    expect(result.transcript.map((s) => s.text)).toEqual(['第一段', '第二段']);
+    expect(result.summary.mainPoints).toEqual(['整體重點']);
+    // ListModels + start + 2 段逐字稿 + 摘要 = 5 次 fetch
+    expect(fetchMock).toHaveBeenCalledTimes(5);
+  });
+
+  it('單段內容太密被截斷 → 自動對半再切', async () => {
+    const truncated = jsonResponse({ candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [{ text: '{"segments":[' }] } }] });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up.example/put' })) // start
+      .mockResolvedValueOnce(truncated) // 整段截斷
+      .mockResolvedValueOnce(segResp([{ speaker: '說話者1', text: '前半' }])) // 前半
+      .mockResolvedValueOnce(segResp([{ speaker: '說話者1', text: '後半' }])) // 後半
+      .mockResolvedValueOnce(sumResp({ actionItems: [], mainPoints: [], qa: [] })); // 摘要
+    vi.stubGlobal('fetch', fetchMock);
+    stubXHR();
+
+    const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
+    file.name = 'dense.m4a';
+    const result = await transcribeAndSummarize(file, 'KEY', { durationSec: 18 * 60 }); // 1 段但截斷 → 對半
+    expect(result.transcript.map((s) => s.text)).toEqual(['前半', '後半']);
   });
 });

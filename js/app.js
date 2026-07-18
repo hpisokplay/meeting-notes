@@ -7,7 +7,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v13';
+const APP_VERSION = 'v14';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -197,7 +197,7 @@ function renderNew() {
 
     // 依音檔長度估算「辨識」階段所需秒數（僅用於進度條配速，不影響結果）
     const durSec = await getAudioDuration(f);
-    const estTranscribe = Math.max(25, Math.round((durSec || 0) * 0.35) + 20);
+    const estTranscribe = Math.max(30, Math.round((durSec || 0) * 0.5) + 25);
 
     const startAt = Date.now();
     let barPct = 0;
@@ -258,7 +258,7 @@ function renderNew() {
     } catch (_) {}
 
     try {
-      const { transcript, summary } = await transcribeAndSummarize(f, getApiKey(), { onProgress });
+      const { transcript, summary } = await transcribeAndSummarize(f, getApiKey(), { onProgress, durationSec: durSec });
       stopTimers();
       setBar(100);
       setLabel('完成！');
