@@ -220,6 +220,10 @@ async function renderDetail(id) {
     <div class="card">
       <input type="text" id="titleInput" value="${esc(m.title)}" />
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
+      <div class="export-row">
+        <button class="btn-export" id="pdfBtn">📄 匯出 PDF</button>
+        <button class="btn-export" id="wordBtn">📝 匯出 Word (docx)</button>
+      </div>
     </div>
     <div class="card">
       <div class="section-title" style="margin-top:0">✅ 待辦事項 Action Item <button class="copy" data-copy="ai">複製</button></div>
@@ -231,9 +235,6 @@ async function renderDetail(id) {
     </div>
     <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
     <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
-    <div class="section-title">📤 匯出</div>
-    <button class="big secondary" id="pdfBtn">匯出 PDF</button>
-    <button class="big secondary" id="wordBtn" style="margin-top:8px">匯出 Word</button>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
   document.getElementById('pdfBtn').onclick = () => exportPdf(m);

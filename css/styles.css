@@ -50,6 +50,9 @@ button.big { width: 100%; padding: 15px; font-size: 16px; font-weight: 600; bord
 button.big.secondary { background: var(--bg); color: var(--ink); }
 button.big.danger { background: var(--danger); color: #fff; }
 button.copy { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; font-size: 13px; }
+.export-row { display: flex; gap: 8px; margin-top: 12px; }
+.btn-export { flex: 1; padding: 11px 8px; border: 1px solid var(--brand); border-radius: 10px; background: transparent; color: var(--brand); font-size: 14px; font-weight: 600; }
+.btn-export:active { background: var(--brand); color: #fff; }
 input[type=text], input[type=password] {
   width: 100%; padding: 13px; border: 1px solid var(--line); border-radius: 10px;
   font-size: 16px; background: var(--card); color: var(--ink);
@@ -76,3 +79,16 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 0
   opacity: 0; pointer-events: none; transition: opacity .25s, transform .25s; z-index: 100; max-width: 86%; text-align: center;
 }
 #toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+/* 列印 / 存成 PDF：畫面上隱藏列印容器；列印時只顯示它 */
+#print-root { display: none; }
+@media print {
+  body > *:not(#print-root) { display: none !important; }
+  #print-root { display: block !important; }
+  #print-root h1 { font-size: 20px; margin: 0 0 4px; }
+  #print-root .date { color: #555; margin: 0 0 14px; font-size: 13px; }
+  #print-root h2 { font-size: 15px; border-bottom: 2px solid #0a84ff; padding-bottom: 3px; margin: 16px 0 6px; }
+  #print-root ol { padding-left: 22px; margin: 6px 0; }
+  #print-root li, #print-root p { line-height: 1.6; margin: 4px 0; }
+  #print-root .none { color: #888; }
+}

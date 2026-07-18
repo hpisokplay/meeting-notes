@@ -2,6 +2,7 @@
 // - PDF：開新視窗載入乾淨排版後呼叫列印（中文字體用系統字體最穩，iPhone 也能存成 PDF）。
 // - Word：產生 Word 可開啟的 .doc（HTML 格式），保留中文與排版、可再編輯。
 import { formatDate } from './format.js';
+import { buildDocxBytes } from './docx.js';
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
@@ -64,24 +65,27 @@ function downloadBlob(blob, filename) {
 }
 
 export function exportWord(meeting) {
-  // Word 可直接開啟 HTML 內容的 .doc；加 BOM 確保中文正確。
-  const blob = new Blob(['﻿' + fullHtmlDoc(meeting)], { type: 'application/msword' });
-  downloadBlob(blob, safeFileName(meeting.title) + '.doc');
+  // 產生真正的 .docx（Office Open XML），各平台可正常開啟。
+  const blob = new Blob([buildDocxBytes(meeting)], {
+    type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  });
+  downloadBlob(blob, safeFileName(meeting.title) + '.docx');
 }
 
 export function exportPdf(meeting) {
-  const w = window.open('', '_blank');
-  if (!w) {
-    alert('請允許彈出視窗，才能匯出 PDF（或改用「匯出 Word」）。');
-    return;
+  // 在「原頁面」列印（不開新分頁，印完即回到 App）。
+  // iOS 會出現列印預覽，可用分享鈕存成 PDF；桌機列印可選「另存為 PDF」。
+  let root = document.getElementById('print-root');
+  if (!root) {
+    root = document.createElement('div');
+    root.id = 'print-root';
+    document.body.appendChild(root);
   }
-  w.document.write(fullHtmlDoc(meeting));
-  w.document.close();
-  w.focus();
-  // 等版面完成再叫列印；使用者在列印畫面選「儲存為 PDF」。
-  setTimeout(() => {
-    try {
-      w.print();
-    } catch (_) {}
-  }, 500);
+  root.innerHTML = meetingToHtmlBody(meeting);
+  const cleanup = () => {
+    root.innerHTML = '';
+    window.removeEventListener('afterprint', cleanup);
+  };
+  window.addEventListener('afterprint', cleanup);
+  window.print();
 }
