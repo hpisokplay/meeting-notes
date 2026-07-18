@@ -84,9 +84,18 @@ function renderNew() {
   view.innerHTML = `
     <div class="card">
       <p style="margin-top:0">選擇會議錄音檔（mp3 / m4a / wav 等）</p>
-      <input type="file" id="audio" accept="audio/*" />
+      <input type="file" id="audio" accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.aiff" />
       <button class="big" id="go">開始辨識</button>
       <div class="warn">辨識長會議可能需要數分鐘。過程中請<b>保持螢幕開啟、不要切換到其他 App</b>，以免中斷。系統會盡量幫你維持螢幕不熄。</div>
+      <details class="hint" style="margin-top:12px">
+        <summary style="cursor:pointer;font-weight:600">📌 錄音在「語音備忘錄」裡？點這看怎麼匯入</summary>
+        <div style="margin-top:8px">
+          iPhone 不允許網頁直接讀取語音備忘錄，只要先匯出一次即可：<br>
+          1. 開「語音備忘錄」App → 點該則錄音<br>
+          2. 點 <b>⋯ 或分享鈕</b> → <b>儲存到「檔案」</b> → 選個位置<br>
+          3. 回這裡按上面的欄位 → <b>選擇檔案</b> → 找到那個 .m4a 選取
+        </div>
+      </details>
       <div class="progress" id="prog" hidden></div>
     </div>`;
   const prog = document.getElementById('prog');
