@@ -74,19 +74,13 @@ describe('regenerateSummary', () => {
 });
 
 describe('translateMeeting', () => {
-  it('翻譯逐字稿+摘要（ListModels + 1 次 generate）', async () => {
-    const translated = {
-      candidates: [
-        {
-          content: {
-            parts: [
-              { text: JSON.stringify({ segments: [{ speaker: 'Speaker 1', text: 'Hello' }], actionItems: ['do X [DRI: N/A]'], mainPoints: ['point'], qa: ['Q: ? A: yes'] }) },
-            ],
-          },
-        },
-      ],
-    };
-    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(jsonResponse(translated));
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  it('分批翻譯：ListModels + 摘要 + 逐字稿批次', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels（品質模型）
+      .mockResolvedValueOnce(wrap({ actionItems: ['do X'], mainPoints: ['point'], qa: ['Q: ? A: yes'] })) // 摘要
+      .mockResolvedValueOnce(wrap({ segments: [{ speaker: 'Speaker 1', text: 'Hello' }] })); // 逐字稿批次
     vi.stubGlobal('fetch', fetchMock);
     const r = await translateMeeting(
       [{ speaker: '說話者1', text: '哈囉' }],
@@ -96,7 +90,7 @@ describe('translateMeeting', () => {
     );
     expect(r.transcript[0]).toEqual({ speaker: 'Speaker 1', text: 'Hello' });
     expect(r.summary.mainPoints).toEqual(['point']);
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
   });
 });
 
