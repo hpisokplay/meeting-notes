@@ -43,7 +43,7 @@ describe('app（整合）', () => {
     });
 
     // 載入主程式（會在載入時執行 router() 並渲染清單）
-    await import('../js/app.js');
+    const appMod = await import('../js/app.js');
     await tick();
 
     const view = document.getElementById('view');
@@ -82,6 +82,20 @@ describe('app（整合）', () => {
     expect(html).toContain('English');
     // 逐字稿段落可點擊編輯（原文檢視有 data-i）
     expect(html).toContain('data-i="0"');
+    // 四區可摺疊（sec-head + 箭頭）
+    expect(html).toContain('data-sec="ai"');
+    expect(html).toContain('data-sec="tr"');
+    expect(html).toContain('chev');
+    // 條目可點擊跳到逐字稿出處
+    expect(html).toContain('data-jump="ai:0"');
+    // 出處比對：待辦「說話者3 明天開始測試」應對到第 3 段（index 2）
+    expect(
+      appMod.bestSegIndex('說話者3 明天開始測試 [DRI: 說話者3]', [
+        { speaker: '說話者1', text: '討論上線時程' },
+        { speaker: '說話者2', text: '下週三比較穩' },
+        { speaker: '說話者3', text: '我明天開始測試' },
+      ])
+    ).toBe(2);
     // 會議問答卡片
     expect(html).toContain('問這場會議');
     expect(html).toContain('chatAsk');
