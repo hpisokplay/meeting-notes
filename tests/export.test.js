@@ -50,10 +50,12 @@ describe('export', () => {
     expect(splitQA('沒有答案的句子')).toEqual({ q: '沒有答案的句子', a: '' });
   });
 
-  it('Q&A 匯出：問答各自一段（含 答：）', () => {
+  it('Q&A 匯出：問答各自一段（問藍/答綠標籤）', () => {
     const html = meetingToHtmlBody({ title: 'x', createdAt: 0, transcript: [], summary: { qa: ['問：A？ 答：B。'] } });
-    expect(html).toContain('<b>問：</b>');
-    expect(html).toContain('<b>答：</b>');
+    expect(html).toContain('問：</b>');
+    expect(html).toContain('答：</b>');
+    expect(html).toContain('#0a58ca'); // 問 藍
+    expect(html).toContain('#1a7f37'); // 答 綠
   });
 
   it('逐字稿語者上色', () => {

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -70,6 +70,33 @@ describe('regenerateSummary', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     // 第二次 generate 用了第二把金鑰
     expect(fetchMock.mock.calls[2][0]).toContain('key=K2');
+  });
+});
+
+describe('translateMeeting', () => {
+  it('翻譯逐字稿+摘要（ListModels + 1 次 generate）', async () => {
+    const translated = {
+      candidates: [
+        {
+          content: {
+            parts: [
+              { text: JSON.stringify({ segments: [{ speaker: 'Speaker 1', text: 'Hello' }], actionItems: ['do X [DRI: N/A]'], mainPoints: ['point'], qa: ['Q: ? A: yes'] }) },
+            ],
+          },
+        },
+      ],
+    };
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(jsonResponse(translated));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await translateMeeting(
+      [{ speaker: '說話者1', text: '哈囉' }],
+      { actionItems: ['做X'], mainPoints: ['重點'], qa: ['問：？ 答：好'] },
+      'en',
+      'KEY'
+    );
+    expect(r.transcript[0]).toEqual({ speaker: 'Speaker 1', text: 'Hello' });
+    expect(r.summary.mainPoints).toEqual(['point']);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 
