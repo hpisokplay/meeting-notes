@@ -68,11 +68,14 @@ describe('app（整合）', () => {
     // 語者上色（style color）
     expect(html).toMatch(/class="spk" style="color:#/);
     // 匯出按鈕
-    expect(html).toContain('匯出 PDF');
-    expect(html).toContain('匯出 Word');
-    // 新功能：分享、重新整理摘要、語者改名 chip
-    expect(html).toContain('分享待辦與重點');
-    expect(html).toContain('重新整理摘要');
+    expect(html).toContain('📄 PDF');
+    expect(html).toContain('📝 Word');
+    // 頂部動作列：分享、重整摘要、加強按鈕、語者改名 chip、語言切換
+    expect(html).toContain('📤 分享');
+    expect(html).toContain('重整摘要');
+    expect(html).toContain('加強待辦');
+    expect(html).toContain('data-enh="qa"');
     expect(html).toContain('spk-chip');
+    expect(html).toContain('English');
   });
 });
