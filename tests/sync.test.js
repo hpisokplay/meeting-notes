@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { mergeState, b64encodeUtf8, b64decodeUtf8, pull, setSyncConfig, clearSyncConfig } from '../js/sync.js';
+import { mergeState, stripForCloud, b64encodeUtf8, b64decodeUtf8, pull, setSyncConfig, clearSyncConfig } from '../js/sync.js';
 
 describe('mergeState', () => {
   it('聯集兩邊會議、以 updatedAt 較新者為準', () => {
@@ -71,6 +71,28 @@ describe('mergeState', () => {
       { meetings: [{ id: evil, createdAt: 2 }], deleted: [] }
     );
     expect(m.meetings.map((x) => x.id)).toEqual(['ok1']);
+  });
+
+  it('墓碑 TTL：超過 180 天且有時間戳的墓碑會被清掉，沒時間戳的保留', () => {
+    const now = 1_000_000_000_000;
+    const old = now - 200 * 24 * 3600 * 1000; // 200 天前
+    const recent = now - 10 * 24 * 3600 * 1000; // 10 天前
+    const m = mergeState(
+      { meetings: [], deleted: ['expired', 'fresh', 'legacy'], deletedAt: { expired: old, fresh: recent } },
+      { meetings: [], deleted: [] },
+      now
+    );
+    expect(m.deleted).toContain('fresh'); // 10 天 → 保留
+    expect(m.deleted).toContain('legacy'); // 無時間戳 → 保守保留
+    expect(m.deleted).not.toContain('expired'); // 200 天 → 清掉
+    expect(m.deletedAt.expired).toBeUndefined();
+  });
+
+  it('stripForCloud：上雲前移除翻譯（本機物件不受影響）', () => {
+    const doc = { meetings: [{ id: '1', createdAt: 1, transcript: [], translations: { en: { transcript: [] } } }], deleted: [] };
+    const stripped = stripForCloud(doc);
+    expect(stripped.meetings[0].translations).toBeUndefined();
+    expect(doc.meetings[0].translations).toBeDefined(); // 原物件保留
   });
 });
 
