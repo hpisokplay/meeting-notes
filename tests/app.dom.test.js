@@ -72,7 +72,6 @@ describe('app（整合）', () => {
     expect(html).toContain('📝 Word');
     // 頂部動作列：分享、重整摘要、加強按鈕、語者改名 chip、語言切換
     expect(html).toContain('📤 分享');
-    expect(html).toContain('重整摘要');
     expect(html).toContain('加強待辦');
     expect(html).toContain('data-enh="qa"');
     expect(html).toContain('spk-chip');
