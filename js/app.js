@@ -5,11 +5,11 @@ import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelF
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
-import { exportPdf, exportWord } from './export.js';
+import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v21';
+const APP_VERSION = 'v22';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -526,6 +526,15 @@ async function renderDetail(id) {
     arr && arr.length
       ? `<ol class="list">${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">（無）</div>`;
+  const qaHtml = (arr) =>
+    arr && arr.length
+      ? `<ol class="list qa">${arr
+          .map((x) => {
+            const { q, a } = splitQA(x);
+            return `<li><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}</li>`;
+          })
+          .join('')}</ol>`
+      : `<div class="meta" style="padding-left:4px">無</div>`;
 
   const colors = speakerColors(m.transcript);
   const segHtml = (m.transcript || [])
@@ -555,7 +564,7 @@ async function renderDetail(id) {
       <div class="section-title">📌 會議重點 Main Point <button class="copy" data-copy="mp">複製</button></div>
       ${olHtml(mainPoints)}
       <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
-      ${qa && qa.length ? olHtml(qa) : '<div class="meta" style="padding-left:4px">無</div>'}
+      ${qaHtml(qa)}
       <button class="btn-regen" id="regenBtn">🔄 重新整理摘要（用逐字稿重跑，不需重傳音檔）</button>
     </div>
     <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
@@ -643,10 +652,19 @@ async function renderDetail(id) {
     syncNow();
   };
   const numbered = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
+  const qaText = (arr) =>
+    arr && arr.length
+      ? arr
+          .map((x, i) => {
+            const { q, a } = splitQA(x);
+            return `${i + 1}. 問：${q}\n   答：${a}`;
+          })
+          .join('\n')
+      : '無';
   const texts = {
     ai: numbered(actionItems),
     mp: numbered(mainPoints),
-    qa: qa && qa.length ? numbered(qa) : '無',
+    qa: qaText(qa),
     tr: transcriptToText(m.transcript),
   };
   view.querySelectorAll('.copy').forEach((b) => {

@@ -125,6 +125,9 @@ input[type=file] { width: 100%; font-size: 15px; margin: 10px 0; color: var(--in
 .section-title { font-weight: 600; margin: 18px 4px 8px; display: flex; justify-content: space-between; align-items: center; font-size: 15px; }
 ul.list, ol.list { margin: 0; padding-left: 22px; }
 ul.list li, ol.list li { margin: 6px 0; line-height: 1.5; }
+ol.list.qa li { margin: 10px 0; }
+.qa-a { margin-top: 3px; color: var(--muted); }
+.qa-q b, .qa-a b { color: var(--ink); }
 .seg { margin: 0 0 10px; line-height: 1.6; }
 .seg .spk { font-weight: 700; margin-right: 6px; font-size: 14px; }
 .transcript-box { background: var(--card); padding: 14px 16px; border-radius: 12px; }
@@ -158,11 +161,13 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 0
 #print-root { display: none; }
 @media print {
   body > *:not(#print-root) { display: none !important; }
-  #print-root { display: block !important; }
+  #print-root { display: block !important; -webkit-print-color-adjust: exact; print-color-adjust: exact; }
   #print-root h1 { font-size: 20px; margin: 0 0 4px; }
   #print-root .date { color: #555; margin: 0 0 14px; font-size: 13px; }
   #print-root h2 { font-size: 15px; border-bottom: 2px solid #0a84ff; padding-bottom: 3px; margin: 16px 0 6px; }
   #print-root ol { padding-left: 22px; margin: 6px 0; }
-  #print-root li, #print-root p { line-height: 1.6; margin: 4px 0; }
+  #print-root li { margin: 8px 0; }
+  #print-root p { line-height: 1.6; margin: 4px 0; }
+  #print-root .qa-a { margin-top: 3px; }
   #print-root .none { color: #888; }
 }

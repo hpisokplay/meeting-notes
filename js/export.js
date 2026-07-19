@@ -13,26 +13,67 @@ function ol(items) {
     : '<p class="none">（無）</p>';
 }
 
+// 把「問：… 答：…」拆成問、答兩段
+export function splitQA(item) {
+  const s = String(item == null ? '' : item);
+  const ai = s.search(/答\s*[：:]/);
+  if (ai >= 0) {
+    return {
+      q: s.slice(0, ai).replace(/^\s*問\s*[：:]\s*/, '').trim(),
+      a: s.slice(ai).replace(/^\s*答\s*[：:]\s*/, '').trim(),
+    };
+  }
+  return { q: s.replace(/^\s*問\s*[：:]\s*/, '').trim(), a: '' };
+}
+function qaOl(items) {
+  if (!items || !items.length) return '<p class="none">無</p>';
+  return (
+    '<ol>' +
+    items
+      .map((it) => {
+        const { q, a } = splitQA(it);
+        return `<li><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}</li>`;
+      })
+      .join('') +
+    '</ol>'
+  );
+}
+
+// 逐字稿語者顏色（白底可讀的深色）
+const SPK_COLORS = ['#0a58ca', '#1a7f37', '#b35900', '#8250df', '#cf222e', '#0a6d8a', '#9a6700'];
+function speakerColorMap(segments) {
+  const m = {};
+  let i = 0;
+  (segments || []).forEach((seg) => {
+    if (!(seg.speaker in m)) {
+      m[seg.speaker] = SPK_COLORS[i % SPK_COLORS.length];
+      i++;
+    }
+  });
+  return m;
+}
+
 export function safeFileName(title) {
   return (String(title || 'meeting').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'meeting').slice(0, 80);
 }
 
-// 會議內容主體 HTML（PDF 與 Word 共用）
+// 會議內容主體 HTML（PDF 用）
 export function meetingToHtmlBody(meeting) {
   const s = meeting.summary || {};
   const actionItems = s.actionItems || [];
   const mainPoints = s.mainPoints || s.keyPoints || [];
   const qa = s.qa || [];
+  const colors = speakerColorMap(meeting.transcript);
   const segs = (meeting.transcript || [])
-    .map((seg) => `<p class="seg"><strong>${esc(seg.speaker)}：</strong>${esc(seg.text)}</p>`)
+    .map((seg) => `<p class="seg"><strong style="color:${colors[seg.speaker] || '#111'}">${esc(seg.speaker)}：</strong>${esc(seg.text)}</p>`)
     .join('');
   return (
     `<h1>${esc(meeting.title)}</h1>` +
     `<p class="date">${esc(formatDate(meeting.createdAt))}</p>` +
-    `<h2>待辦事項 Action Item</h2>${ol(actionItems)}` +
-    `<h2>會議重點 Main Point</h2>${ol(mainPoints)}` +
-    `<h2>會議提問 Q&amp;A</h2>${qa.length ? ol(qa) : '<p class="none">無</p>'}` +
-    `<h2>逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`
+    `<h2>✅ 待辦事項 Action Item</h2>${ol(actionItems)}` +
+    `<h2>📌 會議重點 Main Point</h2>${ol(mainPoints)}` +
+    `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(qa)}` +
+    `<h2>🗣️ 逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`
   );
 }
 

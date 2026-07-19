@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { meetingToHtmlBody, fullHtmlDoc, safeFileName } from '../js/export.js';
+import { meetingToHtmlBody, fullHtmlDoc, safeFileName, splitQA } from '../js/export.js';
 
 const meeting = {
   id: '1',
@@ -40,6 +40,25 @@ describe('export', () => {
     const doc = fullHtmlDoc(meeting);
     expect(doc.startsWith('<!doctype html>')).toBe(true);
     expect(doc).toContain('<title>產品週會</title>');
+  });
+
+  it('splitQA 把問答拆成兩段', () => {
+    expect(splitQA('問：銅為什麼不能一次成型？ 答：因為要二次焊接。')).toEqual({
+      q: '銅為什麼不能一次成型？',
+      a: '因為要二次焊接。',
+    });
+    expect(splitQA('沒有答案的句子')).toEqual({ q: '沒有答案的句子', a: '' });
+  });
+
+  it('Q&A 匯出：問答各自一段（含 答：）', () => {
+    const html = meetingToHtmlBody({ title: 'x', createdAt: 0, transcript: [], summary: { qa: ['問：A？ 答：B。'] } });
+    expect(html).toContain('<b>問：</b>');
+    expect(html).toContain('<b>答：</b>');
+  });
+
+  it('逐字稿語者上色', () => {
+    const html = meetingToHtmlBody({ title: 'x', createdAt: 0, transcript: [{ speaker: '說話者1', text: 'hi' }], summary: {} });
+    expect(html).toMatch(/<strong style="color:#/);
   });
 
   it('safeFileName 去除非法字元', () => {

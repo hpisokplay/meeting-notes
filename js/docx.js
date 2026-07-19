@@ -61,12 +61,26 @@ function esc(s) {
 function run(text, opts = {}) {
   const sz = opts.sz || 22;
   const b = opts.b ? '<w:b/>' : '';
-  return `<w:r><w:rPr>${b}<w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
+  const color = opts.color ? `<w:color w:val="${opts.color}"/>` : '';
+  return `<w:r><w:rPr>${b}${color}<w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
 }
 const para = (runs) => `<w:p>${runs}</w:p>`;
 const title = (t) => para(run(t, { b: true, sz: 34 }));
 const heading = (t) => para(run(t, { b: true, sz: 26 }));
 const line = (t, sz) => para(run(t, { sz: sz || 22 }));
+
+const SPK_COLORS = ['0A58CA', '1A7F37', 'B35900', '8250DF', 'CF222E', '0A6D8A', '9A6700'];
+function splitQA(item) {
+  const s = String(item == null ? '' : item);
+  const ai = s.search(/答\s*[：:]/);
+  if (ai >= 0) {
+    return {
+      q: s.slice(0, ai).replace(/^\s*問\s*[：:]\s*/, '').trim(),
+      a: s.slice(ai).replace(/^\s*答\s*[：:]\s*/, '').trim(),
+    };
+  }
+  return { q: s.replace(/^\s*問\s*[：:]\s*/, '').trim(), a: '' };
+}
 
 function documentXml(meeting) {
   const s = meeting.summary || {};
@@ -77,19 +91,33 @@ function documentXml(meeting) {
   const body = [];
   body.push(title(meeting.title || '會議記錄'));
   body.push(line(dateStr, 18));
-  body.push(heading('待辦事項 Action Item'));
+  body.push(heading('✅ 待辦事項 Action Item'));
   if (actionItems.length) actionItems.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
   else body.push(line('（無）'));
-  body.push(heading('會議重點 Main Point'));
+  body.push(heading('📌 會議重點 Main Point'));
   if (mainPoints.length) mainPoints.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
   else body.push(line('（無）'));
-  body.push(heading('會議提問 Q&A'));
-  if (qa.length) qa.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
-  else body.push(line('無'));
-  body.push(heading('逐字稿 Transcribe'));
+  body.push(heading('❓ 會議提問 Q&A'));
+  if (qa.length) {
+    qa.forEach((x, i) => {
+      const { q, a } = splitQA(x);
+      body.push(para(run(`${i + 1}. 問：`, { b: true }) + run(q)));
+      if (a) body.push(para(run('　　答：', { b: true }) + run(a)));
+    });
+  } else body.push(line('無'));
+  body.push(heading('🗣️ 逐字稿 Transcribe'));
   const segs = meeting.transcript || [];
-  if (segs.length) segs.forEach((seg) => body.push(para(run(`${seg.speaker}：`, { b: true }) + run(seg.text))));
-  else body.push(line('（無逐字稿）'));
+  if (segs.length) {
+    const colorMap = {};
+    let ci = 0;
+    segs.forEach((seg) => {
+      if (!(seg.speaker in colorMap)) {
+        colorMap[seg.speaker] = SPK_COLORS[ci % SPK_COLORS.length];
+        ci++;
+      }
+      body.push(para(run(`${seg.speaker}：`, { b: true, color: colorMap[seg.speaker] }) + run(seg.text)));
+    });
+  } else body.push(line('（無逐字稿）'));
 
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
