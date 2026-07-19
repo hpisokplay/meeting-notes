@@ -40,6 +40,14 @@ describe('store', () => {
     expect(parsed.meetings.some((m) => m.id === 'e')).toBe(true);
   });
 
+  it('匯出含分類群組與刪除墓碑（完整備份可還原）', async () => {
+    const json = await exportAll({ groups: [{ id: 'g1', name: '客戶' }], groupsDeleted: ['gx'] });
+    const parsed = JSON.parse(json);
+    expect(parsed.groups).toEqual([{ id: 'g1', name: '客戶' }]);
+    expect(Array.isArray(parsed.deleted)).toBe(true);
+    expect(parsed.groupsDeleted).toEqual(['gx']);
+  });
+
   it('續傳任務：存取未完成任務、完成後清除', async () => {
     await saveJob({ id: 'active', done: false, windows: [{ segments: null }], fileUri: 'u' });
     const job = await getActiveJob();
