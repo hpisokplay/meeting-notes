@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v22';
+const APP_VERSION = 'v23';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
