@@ -101,8 +101,8 @@ function documentXml(meeting) {
   if (qa.length) {
     qa.forEach((x, i) => {
       const { q, a } = splitQA(x);
-      body.push(para(run(`${i + 1}. 問：`, { b: true }) + run(q)));
-      if (a) body.push(para(run('　　答：', { b: true }) + run(a)));
+      body.push(para(run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q)));
+      if (a) body.push(para(run('　　', { b: true }) + run('答：', { b: true, color: '1A7F37' }) + run(a)));
     });
   } else body.push(line('無'));
   body.push(heading('🗣️ 逐字稿 Transcribe'));

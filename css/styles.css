@@ -127,7 +127,8 @@ ul.list, ol.list { margin: 0; padding-left: 22px; }
 ul.list li, ol.list li { margin: 6px 0; line-height: 1.5; }
 ol.list.qa li { margin: 10px 0; }
 .qa-a { margin-top: 3px; }
-.qa-q b, .qa-a b { color: var(--ink); }
+.qa-q b { color: #0a84ff; }
+.qa-a b { color: #2fae56; }
 .seg { margin: 0 0 10px; line-height: 1.6; }
 .seg .spk { font-weight: 700; margin-right: 6px; font-size: 14px; }
 .transcript-box { background: var(--card); padding: 14px 16px; border-radius: 12px; }

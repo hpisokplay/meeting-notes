@@ -32,7 +32,7 @@ function qaOl(items) {
     items
       .map((it) => {
         const { q, a } = splitQA(it);
-        return `<li><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}</li>`;
+        return `<li><div class="qa-q"><b style="color:#0a58ca">問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b style="color:#1a7f37">答：</b>${esc(a)}</div>` : ''}</li>`;
       })
       .join('') +
     '</ol>'
