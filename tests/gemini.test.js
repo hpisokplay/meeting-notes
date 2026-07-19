@@ -107,6 +107,14 @@ describe('pickModel', () => {
   it('沒有可用型號時回傳 null', () => {
     expect(pickModel([{ name: 'models/embedding-001', supportedGenerationMethods: ['embedContent'] }])).toBeNull();
   });
+  it('省額度模式（preferLite）挑 flash-lite，否則挑品質優先的 flash', () => {
+    const models = [
+      { name: 'models/gemini-3.5-flash', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-2.5-flash-lite', supportedGenerationMethods: ['generateContent'] },
+    ];
+    expect(pickModel(models)).toBe('gemini-3.5-flash');
+    expect(pickModel(models, { preferLite: true })).toBe('gemini-2.5-flash-lite');
+  });
 });
 
 function jsonResponse(obj, headers = {}) {
