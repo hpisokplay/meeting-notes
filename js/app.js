@@ -9,7 +9,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v20';
+const APP_VERSION = 'v21';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -161,12 +161,12 @@ function renderNew() {
       <p style="margin-top:0">選擇會議錄音檔（mp3 / m4a / wav 等）</p>
       <label for="audio" class="file-pick" id="filePick">
         <span class="fp-icon">📁</span>
-        <span class="fp-main">點此選擇錄音檔</span>
+        <span class="fp-main">點此選擇錄音檔（可多選）</span>
         <span class="fp-name" id="fileName">尚未選擇檔案</span>
       </label>
-      <input type="file" id="audio" accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.aiff" hidden />
+      <input type="file" id="audio" accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.aiff" multiple hidden />
       <button class="big" id="go">開始辨識</button>
-      <div class="warn">辨識長會議可能需要數分鐘。過程中請<b>保持螢幕開啟、不要切換到其他 App</b>，以免中斷。系統會盡量幫你維持螢幕不熄。</div>
+      <div class="warn">長會議可以<b>分成 2~4 支較短的錄音一次選取</b>（每支建議 1 小時內），App 會依<b>檔名順序</b>接成一份逐字稿——免費層更順、更不會卡。過程請保持螢幕開啟、勿切換 App。</div>
       <details class="hint" style="margin-top:12px">
         <summary style="cursor:pointer;font-weight:600">📌 錄音在「語音備忘錄」裡？點這看怎麼匯入</summary>
         <div style="margin-top:8px">
@@ -182,18 +182,26 @@ function renderNew() {
   const goBtn = document.getElementById('go');
 
   document.getElementById('audio').onchange = (e) => {
-    const f = e.target.files[0];
-    document.getElementById('fileName').textContent = f ? f.name : '尚未選擇檔案';
-    document.getElementById('filePick').classList.toggle('picked', !!f);
+    const fs = Array.from(e.target.files || []);
+    const nameEl = document.getElementById('fileName');
+    if (!fs.length) {
+      nameEl.textContent = '尚未選擇檔案';
+    } else if (fs.length === 1) {
+      nameEl.textContent = fs[0].name;
+    } else {
+      const sorted = fs.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+      nameEl.textContent = `已選 ${fs.length} 支（依此順序接合）：\n` + sorted.map((f, i) => `${i + 1}. ${f.name}`).join('\n');
+    }
+    document.getElementById('filePick').classList.toggle('picked', !!fs.length);
   };
 
   goBtn.onclick = async () => {
-    const f = document.getElementById('audio').files[0];
-    if (!f) {
+    const fs = Array.from(document.getElementById('audio').files || []);
+    if (!fs.length) {
       alert('請先選擇音檔');
       return;
     }
-    await startNewTranscription(f);
+    await startNewTranscription(fs);
   };
 }
 
@@ -301,42 +309,56 @@ async function processJob(job, container) {
   } catch (_) {}
   const prepared = () => job.chunks && job.chunks.length && job.chunks.every((c) => c.uploads && c.uploads.length);
   try {
-    // 1) 準備（切割 + 上傳）——只在尚未備妥時做，需要原始檔（一次前景完成）
+    // 1) 準備（上傳；單檔會嘗試切割）——只在尚未備妥時做，需要原始檔（一次前景完成）
     if (!prepared()) {
-      if (!job._file) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
       const entries = getApiKeyEntries();
       ui.setBar(4);
       ui.setLabel('選擇型號中…');
       job.model = job.model || (await pickModelForKeys(entries));
 
-      // 嘗試把音檔切成小段（每段 30 分鐘），大幅降低每次請求 token
-      let blobs = null;
-      try {
-        ui.setLabel('切割音檔中…');
-        const r = await splitAudioToChunks(job._file, 30 * 60, (i, n) => ui.setLabel(`切割音檔中…（${i}/${n} 段）`));
-        blobs = r.chunks;
-        job.durationSec = r.durationSec || job.durationSec;
-      } catch (_) {
-        blobs = null; // 解碼失敗 → 改用整檔模式
-      }
-
-      if (blobs && blobs.length) {
-        job.mode = 'split';
-        job.mime = 'audio/wav';
-        job.chunks = blobs.map((c) => ({ start: c.start, end: c.end, uploads: null, segments: null }));
-        for (let i = 0; i < blobs.length; i++) {
-          ui.setBar(8 + (i / blobs.length) * 28);
-          ui.setLabel(`上傳第 ${i + 1}/${blobs.length} 段…`);
-          job.chunks[i].uploads = await uploadBlobToKeys(blobs[i].blob, entries, ui.onProgress);
-          blobs[i].blob = null; // 釋放記憶體
+      if (job.multiFile) {
+        // 多檔模式：使用者自己分段錄好，每支檔案 = 一段（不需在手機上切割）
+        if (!job._files) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
+        job.mode = 'multi';
+        const m = job.chunks.length;
+        for (let i = 0; i < m; i++) {
+          if (job.chunks[i].uploads && job.chunks[i].uploads.length) continue;
+          ui.setBar(6 + (i / m) * 30);
+          ui.setLabel(`上傳第 ${i + 1}/${m} 支（${job._files[i].name}）…`);
+          const r = await uploadBlobToKeys(job._files[i], entries, ui.onProgress);
+          job.chunks[i].uploads = r.uploads;
+          job.chunks[i].mime = r.mime;
         }
       } else {
-        // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
-        job.mode = 'whole';
-        const up = await uploadForJob(job._file, entries, ui.onProgress);
-        job.model = up.model;
-        job.mime = up.mime;
-        job.chunks = buildWindows(job.durationSec).map((w) => ({ start: w.start, end: w.end, whole: w.whole, uploads: up.uploads, segments: null }));
+        if (!job._file) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
+        // 嘗試把單一音檔切成小段（每段 30 分鐘），大幅降低每次請求 token
+        let blobs = null;
+        try {
+          ui.setLabel('切割音檔中…');
+          const r = await splitAudioToChunks(job._file, 30 * 60, (i, n) => ui.setLabel(`切割音檔中…（${i}/${n} 段）`));
+          blobs = r.chunks;
+          job.durationSec = r.durationSec || job.durationSec;
+        } catch (_) {
+          blobs = null; // 解碼失敗 → 改用整檔模式
+        }
+        if (blobs && blobs.length) {
+          job.mode = 'split';
+          job.chunks = blobs.map((c) => ({ start: c.start, end: c.end, uploads: null, mime: 'audio/wav', segments: null }));
+          for (let i = 0; i < blobs.length; i++) {
+            ui.setBar(8 + (i / blobs.length) * 28);
+            ui.setLabel(`上傳第 ${i + 1}/${blobs.length} 段…`);
+            const r = await uploadBlobToKeys(blobs[i].blob, entries, ui.onProgress);
+            job.chunks[i].uploads = r.uploads;
+            job.chunks[i].mime = r.mime;
+            blobs[i].blob = null; // 釋放記憶體
+          }
+        } else {
+          // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
+          job.mode = 'whole';
+          const up = await uploadForJob(job._file, entries, ui.onProgress);
+          job.model = up.model;
+          job.chunks = buildWindows(job.durationSec).map((w) => ({ start: w.start, end: w.end, whole: w.whole, uploads: up.uploads, mime: up.mime, segments: null }));
+        }
       }
       await persistJob(job); // 全部上傳完成後才可續傳
     }
@@ -350,9 +372,10 @@ async function processJob(job, container) {
       const next = 40 + ((i + 1) / n) * 52;
       ui.setBar(base);
       ui.easeTo(next, est / n);
-      const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmssApp(c.start)}–${mmssApp(c.end)}）…` : '辨識語者與逐字稿中…';
-      const whole = job.mode === 'split' ? true : !!c.whole;
-      c.segments = await transcribeRange(c.uploads, job.mime, job.model, c.start, c.end, whole, ui.onProgress, label);
+      let label = '辨識語者與逐字稿中…';
+      if (n > 1) label = job.mode === 'multi' ? `辨識第 ${i + 1}/${n} 支…` : `辨識第 ${i + 1}/${n} 段（${mmssApp(c.start)}–${mmssApp(c.end)}）…`;
+      const whole = job.mode === 'whole' ? !!c.whole : true;
+      c.segments = await transcribeRange(c.uploads, c.mime || job.mime, job.model, c.start || 0, c.end || 0, whole, ui.onProgress, label);
       ui.stopEase();
       await persistJob(job);
       ui.setBar(next);
@@ -405,21 +428,43 @@ async function openJobProgress(job) {
   await processJob(job, document.getElementById('jobprog'));
 }
 
-async function startNewTranscription(file) {
-  const durSec = await getAudioDuration(file);
+async function startNewTranscription(files) {
+  const list = (Array.isArray(files) ? files.slice() : [files]).sort((a, b) =>
+    a.name.localeCompare(b.name, undefined, { numeric: true })
+  );
   const now = Date.now();
-  const job = {
-    id: 'active',
-    _file: file,
-    title: defaultTitle(file.name, now),
-    createdAt: now,
-    durationSec: durSec,
-    chunks: null,
-    mode: null,
-    model: null,
-    mime: null,
-    done: false,
-  };
+  let job;
+  if (list.length > 1) {
+    // 多檔模式：使用者自己分段錄好的多支檔案，依檔名順序接成一份
+    const durs = await Promise.all(list.map(getAudioDuration));
+    job = {
+      id: 'active',
+      _files: list,
+      multiFile: true,
+      title: defaultTitle(list[0].name, now),
+      createdAt: now,
+      durationSec: durs.reduce((a, b) => a + (b || 0), 0),
+      chunks: list.map((f) => ({ name: f.name, uploads: null, mime: null, segments: null })),
+      mode: 'multi',
+      model: null,
+      mime: null,
+      done: false,
+    };
+  } else {
+    const file = list[0];
+    job = {
+      id: 'active',
+      _file: file,
+      title: defaultTitle(file.name, now),
+      createdAt: now,
+      durationSec: await getAudioDuration(file),
+      chunks: null,
+      mode: null,
+      model: null,
+      mime: null,
+      done: false,
+    };
+  }
   await openJobProgress(job);
 }
 

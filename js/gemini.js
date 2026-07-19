@@ -342,17 +342,19 @@ export async function pickModelForKeys(apiKeys) {
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   return resolveModel(kos[0].key);
 }
-// 把一個音檔片段（Blob）上傳到每一把金鑰的專案，回傳 uploads:[{key,name,fileUri}]
+// 把一個音檔（Blob/File）上傳到每一把金鑰的專案，回傳 { uploads:[{key,name,fileUri}], mime }
 export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   const uploads = [];
+  let mime = blob.type || 'audio/mpeg';
   for (let i = 0; i < kos.length; i++) {
     const info = await uploadFile(blob, kos[i].key, onProgress);
     const active = await waitActive(info, kos[i].key, onProgress);
     uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
+    mime = active.mimeType || mime;
   }
-  return uploads;
+  return { uploads, mime };
 }
 // 對整份逐字稿產生摘要（純文字，任何金鑰可用）
 export async function summarize(segments, apiKeys, model, onProgress) {

@@ -118,7 +118,7 @@ input[type=file] { width: 100%; font-size: 15px; margin: 10px 0; color: var(--in
 }
 .file-pick .fp-icon { font-size: 30px; line-height: 1; }
 .file-pick .fp-main { font-size: 16px; font-weight: 700; color: var(--brand); }
-.file-pick .fp-name { font-size: 13px; color: var(--muted); word-break: break-all; }
+.file-pick .fp-name { font-size: 13px; color: var(--muted); word-break: break-all; white-space: pre-line; text-align: left; max-width: 100%; }
 .file-pick:active { transform: scale(0.99); }
 .file-pick.picked { border-style: solid; background: color-mix(in srgb, var(--brand) 14%, transparent); }
 .file-pick.picked .fp-name { color: var(--ink); font-weight: 600; }
