@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v25';
+const APP_VERSION = 'v26';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -49,7 +49,7 @@ function speakerColors(segments) {
 
 // ---- 雲端同步 ----
 function defaultSyncConfig() {
-  return sync.getSyncConfig() || { token: '', owner: 'hpisokplay', repo: 'meeting-notes-data', path: 'meetings.json' };
+  return sync.getSyncConfig() || { token: '', owner: '', repo: '', path: 'meetings.json' };
 }
 function toast(msg) {
   let t = document.getElementById('toast');
@@ -708,16 +708,16 @@ function renderSettings() {
     <div class="card">
       <p style="margin-top:0"><b>☁️ GitHub 雲端同步（跨裝置記憶）</b>
         <span class="meta">${enabled ? '｜狀態：已開啟' : '｜狀態：未開啟（只存本機）'}</span></p>
-      <input type="password" id="ghToken" placeholder="貼上 GitHub 權杖（token）" value="${esc(cfg.token || '')}" autocomplete="off" />
-      <input type="text" id="ghRepo" placeholder="owner/repo" value="${esc((cfg.owner || '') + '/' + (cfg.repo || ''))}" style="margin-top:8px" />
+      <input type="password" id="ghToken" placeholder="貼上你的 GitHub 權杖（token）" value="${esc(cfg.token || '')}" autocomplete="off" />
+      <input type="text" id="ghRepo" placeholder="你的帳號/你的資料庫repo（例：myname/my-notes-data）" value="${cfg.owner && cfg.repo ? esc(cfg.owner + '/' + cfg.repo) : ''}" style="margin-top:8px" />
       <button class="big" id="saveSync">儲存並同步</button>
       <button class="big secondary" id="syncBtn" style="margin-top:8px">立即同步</button>
       <button class="big secondary" id="clearSync" style="margin-top:8px">關閉同步（僅存本機）</button>
       <div class="hint">
-        開啟後，會議記錄會存到你的<b>私人</b>資料庫 <code>${esc(cfg.owner)}/${esc(cfg.repo)}</code>，電腦與手機共用、長期保存。<br>
-        <b>如何拿權杖：</b>到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> →
-        Repository access 選「Only select repositories → <b>meeting-notes-data</b>」→ Permissions 的
-        <b>Contents</b> 設為 <b>Read and write</b> → 產生後貼到上面。權杖只存這台裝置。
+        <b>不填也能用</b>（記錄只存這支手機）。要跨裝置才需要設定，全部用<b>你自己的</b> GitHub：<br>
+        1. 在 GitHub 建一個<b>私人 repo</b>（例如 <code>my-notes-data</code>），把「你的帳號/repo名」填在上面欄位。<br>
+        2. 到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> → Repository access 選那個 repo → Permissions 的 <b>Contents</b> 設 <b>Read and write</b> → 產生後貼到上面。<br>
+        權杖與記錄都只存你自己的裝置與你自己的 repo。
       </div>
     </div>
     <div class="card">
