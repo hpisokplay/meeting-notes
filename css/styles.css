@@ -132,7 +132,13 @@ ul.list li, ol.list li { margin: 6px 0; line-height: 1.5; }
 .prog-bar { height: 12px; background: var(--btn2); border-radius: 8px; overflow: hidden; margin: 6px 0 12px; }
 .prog-fill { height: 100%; width: 0%; border-radius: 8px; background: linear-gradient(90deg, #0a84ff, #5e5ce6); transition: width 0.5s ease; }
 .prog-label { color: var(--ink); font-size: 15px; font-weight: 600; }
+.prog-key { color: var(--brand); font-size: 13px; font-weight: 600; margin-top: 4px; }
 .prog-time { color: var(--muted); font-size: 13px; margin-top: 4px; }
+.usage-list { margin-top: 10px; }
+.usage-row { display: flex; justify-content: space-between; font-size: 13px; padding: 5px 0; border-top: 1px solid var(--line); }
+.usage-row .u-name { color: var(--ink); font-weight: 600; }
+.usage-row .u-stat { color: var(--muted); }
+.usage-row .u-cool { color: var(--danger); }
 .spinner { display: inline-block; width: 22px; height: 22px; border: 3px solid var(--line); border-top-color: var(--brand); border-radius: 50%; animation: spin 0.8s linear infinite; margin-bottom: 10px; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .empty { text-align: center; color: var(--muted); padding: 56px 16px; line-height: 1.8; }

@@ -1,4 +1,5 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey } from './settings.js';
+import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
 import { uploadForJob, transcribeRange, summarize, regenerateSummary } from './gemini.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
@@ -7,7 +8,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v18';
+const APP_VERSION = 'v19';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -231,6 +232,7 @@ function createProgress(container, estSec) {
   container.innerHTML = `
     <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
     <div class="prog-label" id="pl">準備中…</div>
+    <div class="prog-key" id="pk" hidden></div>
     <div class="prog-time" id="pt">已等待 0:00</div>`;
   const setBar = (p) => {
     barPct = Math.max(barPct, Math.min(100, p));
@@ -261,6 +263,16 @@ function createProgress(container, estSec) {
       if (barPct >= target - 0.5) stopEase();
     }, 400);
   };
+  const setKey = (name) => {
+    const pk = q('#pk');
+    if (!pk) return;
+    if (name) {
+      pk.textContent = '🔑 目前使用：' + name;
+      pk.hidden = false;
+    } else {
+      pk.hidden = true;
+    }
+  };
   const onProgress = (info) => {
     if (!info) return;
     if (info.pct != null) {
@@ -268,6 +280,7 @@ function createProgress(container, estSec) {
       setBar(info.pct);
     }
     if (info.message) setLabel(info.message);
+    if (info.keyName !== undefined) setKey(info.keyName);
   };
   const stop = () => {
     stopEase();
@@ -288,7 +301,7 @@ async function processJob(job, container) {
   try {
     // 1) 上傳（若尚未上傳）— 每把金鑰各上傳一份，回傳 uploads:[{key,fileUri}]
     if (!job.uploads || !job.uploads.length) {
-      const up = await uploadForJob(job._file, getApiKeys(), ui.onProgress);
+      const up = await uploadForJob(job._file, getApiKeyEntries(), ui.onProgress);
       job.model = up.model;
       job.uploads = up.uploads;
       job.mime = up.mime;
@@ -314,7 +327,7 @@ async function processJob(job, container) {
     ui.setLabel('整理摘要中…');
     ui.easeTo(99, 20);
     const allSegs = job.windows.reduce((acc, w) => acc.concat(w.segments || []), []);
-    const summary = await summarize(allSegs, getApiKeys(), job.model, ui.onProgress);
+    const summary = await summarize(allSegs, getApiKeyEntries(), job.model, ui.onProgress);
     ui.stopEase();
     ui.setBar(100);
     ui.setLabel('完成！');
@@ -509,7 +522,7 @@ async function renderDetail(id) {
     btn.disabled = true;
     const old = btn.textContent;
     try {
-      const summary = await regenerateSummary(m.transcript, getApiKeys(), {
+      const summary = await regenerateSummary(m.transcript, getApiKeyEntries(), {
         onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
       });
       m.summary = summary;
@@ -587,9 +600,11 @@ function renderSettings() {
       <div id="keyList"></div>
       <button class="big secondary" id="addKey">➕ 新增一把金鑰</button>
       <button class="big" id="saveKey" style="margin-top:8px">儲存</button>
+      <div id="usageBox"></div>
       <div class="hint">
         金鑰只存在這支手機（不會上傳到任何伺服器）。到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> → API Keys 複製免費金鑰。<br>
-        <b>多把金鑰</b>：每格填一把、可自己命名，撞到用量上限時會自動換下一把。⚠️ 每把要建在<b>不同專案</b>才有各自的額度（長錄音會各上傳一份音檔）。
+        <b>多把金鑰</b>：每格填一把、可自己命名，撞到用量上限時會自動換下一把。⚠️ 每把要建在<b>不同專案</b>才有各自的額度（長錄音會各上傳一份音檔）。<br>
+        <b>用量</b>為本機統計（今日在這支手機呼叫幾次），非 Google 官方剩餘額度。
       </div>
     </div>
     <div class="card">
@@ -635,7 +650,35 @@ function renderSettings() {
     }));
     setApiKeyEntries(rows);
     toast(`已儲存 ${getApiKeys().length} 把金鑰`);
+    drawUsage();
   };
+
+  // 本機用量顯示（今日次數 + 冷卻狀態），每秒更新冷卻倒數；離開設定頁自動停止
+  const usageBox = document.getElementById('usageBox');
+  const drawUsage = () => {
+    if (!document.body.contains(usageBox)) return false;
+    const entries = getApiKeyEntries();
+    if (!entries.length) {
+      usageBox.innerHTML = '';
+      return true;
+    }
+    usageBox.innerHTML =
+      '<div class="usage-list">' +
+      entries
+        .map((e, i) => {
+          const st = getKeyStatus(e.key);
+          const name = e.name || `金鑰${i + 1}`;
+          const status = st.cooling ? `<span class="u-cool">冷卻中 ${st.cooling}s</span>` : '<span class="u-stat">可用</span>';
+          return `<div class="usage-row"><span class="u-name">${esc(name)}</span><span><span class="u-stat">今日 ${st.count} 次 ｜ </span>${status}</span></div>`;
+        })
+        .join('') +
+      '</div>';
+    return true;
+  };
+  drawUsage();
+  const usageTimer = setInterval(() => {
+    if (!drawUsage()) clearInterval(usageTimer);
+  }, 1000);
   document.getElementById('saveSync').onclick = async () => {
     const token = document.getElementById('ghToken').value.trim();
     const repoField = document.getElementById('ghRepo').value.trim();

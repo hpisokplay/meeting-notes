@@ -6,6 +6,8 @@
 // - maxOutputTokens 開到上限 65535，容納長逐字稿。
 // - responseSchema 強制結構化輸出，segments 陣列做語者辨識。
 
+import { recordUse, recordCooldown } from './usage.js';
+
 const BASE = 'https://generativelanguage.googleapis.com';
 
 // 動態挑選型號：向 API 詢問目前可用的模型，挑最適合做「長音檔 + 語者辨識」的 flash 型號。
@@ -41,9 +43,9 @@ async function resolveModel(apiKey) {
 }
 
 
-// 進度回報統一格式：{ phase, pct, message }。pct 為 null 代表該階段無精確百分比。
-function report(onProgress, phase, pct, message) {
-  if (onProgress) onProgress({ phase, pct, message });
+// 進度回報統一格式：{ phase, pct, message, keyName }。pct 為 null 代表該階段無精確百分比。
+function report(onProgress, phase, pct, message, keyName) {
+  if (onProgress) onProgress({ phase, pct, message, keyName });
 }
 
 async function uploadFile(file, apiKey, onProgress) {
@@ -140,8 +142,9 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       const v = vs[vi % vs.length];
       vi++;
       const multi = vs.length > 1;
-      report(onProgress, 'transcribe', null, round === 0 && k === 0 ? label : multi ? '切換金鑰重試中…' : `重試中…（第 ${round} 次）`);
+      report(onProgress, 'transcribe', null, round === 0 && k === 0 ? label : multi ? '切換金鑰重試中…' : `重試中…（第 ${round} 次）`, v.name);
       const { url, body } = makeReq(v);
+      if (v.key) recordUse(v.key);
       let res;
       try {
         res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
@@ -154,7 +157,9 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       lastStatus = res.status;
       if (res.status === 429) {
         sawTransient = true;
-        retryMs = Math.max(retryMs, parseRetryDelayMs(lastText));
+        const d = parseRetryDelayMs(lastText);
+        retryMs = Math.max(retryMs, d);
+        if (v.key) recordCooldown(v.key, d || 30000);
         continue;
       }
       if (isTransientStatus(res.status)) {
@@ -269,7 +274,7 @@ async function transcribeAudio(uploads, mime, model, durationSec, onProgress) {
 // 摘要是純文字（不含檔案），任何一把金鑰都能用 → 用 keys 輪替即可
 async function summarizeSegments(segments, keys, model, onProgress) {
   const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
-  const variants = toKeys(keys).map((k) => ({ key: k }));
+  const variants = toKeyObjs(keys);
   const res = await postJsonRotating(
     variants,
     (v) => ({
@@ -296,25 +301,28 @@ async function summarizeSegments(segments, keys, model, onProgress) {
   return { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] };
 }
 
-// 接受單把字串或多把陣列，統一成非空陣列
-function toKeys(k) {
-  return Array.isArray(k) ? k.filter(Boolean) : k ? [k] : [];
+// 接受字串 / 字串陣列 / {key,name} 陣列，統一成 [{key, name}]（非空 key）
+function toKeyObjs(keys) {
+  const arr = Array.isArray(keys) ? keys : keys ? [keys] : [];
+  return arr
+    .map((k) => (typeof k === 'string' ? { key: k, name: '' } : { key: k.key, name: k.name || '' }))
+    .filter((o) => o.key);
 }
 
-// 把音檔上傳到「每一把金鑰的專案」，回傳 { model, mime, uploads:[{key,fileUri}] }
+// 把音檔上傳到「每一把金鑰的專案」，回傳 { model, mime, uploads:[{key,name,fileUri}] }
 // 這樣之後辨識輪替金鑰時，每把用自己的檔案，不會 403。
 export async function uploadForJob(file, apiKeys, onProgress) {
-  const keys = toKeys(apiKeys);
-  if (!keys.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
-  const model = await resolveModel(keys[0]);
+  const model = await resolveModel(kos[0].key);
   const uploads = [];
   let mime = file.type || 'audio/mpeg';
-  for (let i = 0; i < keys.length; i++) {
-    if (keys.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${keys.length}）`);
-    const info = await uploadFile(file, keys[i], onProgress);
-    const active = await waitActive(info, keys[i], onProgress);
-    uploads.push({ key: keys[i], fileUri: active.uri });
+  for (let i = 0; i < kos.length; i++) {
+    if (kos.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${kos.length}）`, kos[i].name);
+    const info = await uploadFile(file, kos[i].key, onProgress);
+    const active = await waitActive(info, kos[i].key, onProgress);
+    uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
     mime = active.mimeType || mime;
   }
   return { model, mime, uploads };
@@ -325,18 +333,18 @@ export function transcribeRange(uploads, mime, model, start, end, whole, onProgr
 }
 // 對整份逐字稿產生摘要（純文字，任何金鑰可用）
 export async function summarize(segments, apiKeys, model, onProgress) {
-  return summarizeSegments(segments, toKeys(apiKeys), model, onProgress);
+  return summarizeSegments(segments, apiKeys, model, onProgress);
 }
 
 export async function transcribeAndSummarize(file, apiKeys, opts = {}) {
   const onProgress = opts.onProgress;
   const durationSec = opts.durationSec || 0;
-  const keys = toKeys(apiKeys);
-  if (!keys.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
-  const { model, mime, uploads } = await uploadForJob(file, keys, onProgress);
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
+  const { model, mime, uploads } = await uploadForJob(file, kos, onProgress);
   const segments = await transcribeAudio(uploads, mime, model, durationSec, onProgress);
   report(onProgress, 'summary', null, '整理摘要中…');
-  const summary = await summarizeSegments(segments, keys, model, onProgress);
+  const summary = await summarizeSegments(segments, kos, model, onProgress);
   return { transcript: segments, summary };
 }
 
@@ -358,9 +366,9 @@ const SUMMARY_PROMPT =
 
 export async function regenerateSummary(segments, apiKeys, opts = {}) {
   const onProgress = opts.onProgress;
-  const keys = toKeys(apiKeys);
-  if (!keys.length) throw new Error('尚未設定 API 金鑰');
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
   report(onProgress, 'model', 3, '選擇型號中…');
-  const model = await resolveModel(keys[0]);
-  return summarizeSegments(segments, keys, model, onProgress);
+  const model = await resolveModel(kos[0].key);
+  return summarizeSegments(segments, kos, model, onProgress);
 }
