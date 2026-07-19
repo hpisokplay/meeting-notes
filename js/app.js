@@ -1,4 +1,4 @@
-import { getApiKey, setApiKey, hasApiKey } from './settings.js';
+import { getApiKey, getApiKeys, getApiKeysRaw, setApiKey, hasApiKey } from './settings.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
 import { uploadForJob, transcribeRange, summarize, regenerateSummary } from './gemini.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
@@ -7,7 +7,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v16';
+const APP_VERSION = 'v17';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -288,7 +288,7 @@ async function processJob(job, container) {
   try {
     // 1) 上傳（若尚未上傳）
     if (!job.fileUri) {
-      const up = await uploadForJob(job._file, getApiKey(), ui.onProgress);
+      const up = await uploadForJob(job._file, getApiKeys(), ui.onProgress);
       job.model = up.model;
       job.fileUri = up.fileUri;
       job.mime = up.mime;
@@ -304,7 +304,7 @@ async function processJob(job, container) {
       ui.setBar(base);
       ui.easeTo(next, est / n);
       const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmssApp(w.start)}–${mmssApp(w.end)}）…` : '辨識語者與逐字稿中…';
-      const segs = await transcribeRange(job.fileUri, job.mime, getApiKey(), job.model, w.start, w.end, w.whole, ui.onProgress, label);
+      const segs = await transcribeRange(job.fileUri, job.mime, getApiKeys(), job.model, w.start, w.end, w.whole, ui.onProgress, label);
       ui.stopEase();
       job.windows[i].segments = segs;
       await persistJob(job);
@@ -314,7 +314,7 @@ async function processJob(job, container) {
     ui.setLabel('整理摘要中…');
     ui.easeTo(99, 20);
     const allSegs = job.windows.reduce((acc, w) => acc.concat(w.segments || []), []);
-    const summary = await summarize(allSegs, getApiKey(), job.model, ui.onProgress);
+    const summary = await summarize(allSegs, getApiKeys(), job.model, ui.onProgress);
     ui.stopEase();
     ui.setBar(100);
     ui.setLabel('完成！');
@@ -509,7 +509,7 @@ async function renderDetail(id) {
     btn.disabled = true;
     const old = btn.textContent;
     try {
-      const summary = await regenerateSummary(m.transcript, getApiKey(), {
+      const summary = await regenerateSummary(m.transcript, getApiKeys(), {
         onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
       });
       m.summary = summary;
@@ -583,13 +583,13 @@ function renderSettings() {
   const enabled = sync.isEnabled();
   view.innerHTML = `
     <div class="card">
-      <p style="margin-top:0"><b>Gemini API 金鑰</b></p>
-      <input type="password" id="key" placeholder="貼上你的金鑰" value="${esc(getApiKey())}" autocomplete="off" />
+      <p style="margin-top:0"><b>Gemini API 金鑰</b> <span class="meta">目前 ${getApiKeys().length} 把</span></p>
+      <textarea id="key" class="keybox" rows="3" placeholder="貼上你的金鑰（可多把，一行一把）" autocomplete="off" autocapitalize="off" spellcheck="false">${esc(getApiKeysRaw())}</textarea>
       <button class="big" id="saveKey">儲存</button>
       <div class="hint">
         金鑰只存在這支手機（不會上傳到任何伺服器）。<br>
-        取得方式：到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> →
-        API Keys → 複製你的免費金鑰。
+        取得方式：到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> → API Keys 複製免費金鑰。<br>
+        <b>多把金鑰</b>：一行貼一把，撞到用量上限時會自動換下一把。⚠️ 每把要在<b>不同專案</b>才有各自的額度。
       </div>
     </div>
     <div class="card">

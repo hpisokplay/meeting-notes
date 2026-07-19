@@ -89,6 +89,11 @@ button.big { width: 100%; padding: 15px; font-size: 16px; font-weight: 600; bord
 button.big.secondary { background: var(--bg); color: var(--ink); }
 button.big.danger { background: var(--danger); color: #fff; }
 button.copy { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; font-size: 13px; }
+.keybox {
+  width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 10px;
+  font-size: 15px; background: var(--card); color: var(--ink); resize: vertical; font-family: ui-monospace, monospace;
+  -webkit-appearance: none; appearance: none;
+}
 .search {
   width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
   font-size: 16px; background: var(--card); color: var(--ink); margin-bottom: 12px;

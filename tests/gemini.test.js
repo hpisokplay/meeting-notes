@@ -56,6 +56,21 @@ describe('regenerateSummary', () => {
     expect(r.qa).toEqual([]);
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
+
+  it('多金鑰：第一把 429 → 立刻換第二把成功', async () => {
+    const okJson = { candidates: [{ content: { parts: [{ text: JSON.stringify({ actionItems: [], mainPoints: ['ok'], qa: [] }) }] } }] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels（用第一把）
+      .mockResolvedValueOnce(errResponse(429, { error: { code: 429 } })) // 摘要：第一把 → 429
+      .mockResolvedValueOnce(jsonResponse(okJson)); // 摘要：第二把 → 成功
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await regenerateSummary([{ speaker: 's', text: 't' }], ['K1', 'K2']);
+    expect(r.mainPoints).toEqual(['ok']);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // 第二次 generate 用了第二把金鑰
+    expect(fetchMock.mock.calls[2][0]).toContain('key=K2');
+  });
 });
 
 describe('pickModel', () => {
@@ -72,6 +87,15 @@ function jsonResponse(obj, headers = {}) {
     ok: true,
     status: 200,
     headers: { get: (h) => headers[h] || null },
+    json: async () => obj,
+    text: async () => JSON.stringify(obj),
+  };
+}
+function errResponse(status, obj) {
+  return {
+    ok: false,
+    status,
+    headers: { get: () => null },
     json: async () => obj,
     text: async () => JSON.stringify(obj),
   };
