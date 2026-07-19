@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, clearModelCache } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, clearModelCache } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -92,6 +92,28 @@ describe('translateMeeting', () => {
     expect(r.transcript[0]).toEqual({ speaker: 'Speaker 1', text: 'Hello' });
     expect(r.summary.mainPoints).toEqual(['point']);
     expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('askMeeting', () => {
+  it('把逐字稿+問題丟給模型，回傳純文字回答', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels（品質模型）
+      .mockResolvedValueOnce(jsonResponse({ candidates: [{ content: { parts: [{ text: '結論是下週三上線。' }] } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const a = await askMeeting(
+      [{ speaker: '說話者1', text: '下週三上線' }],
+      { actionItems: [], mainPoints: ['上線時程'], qa: [] },
+      '結論是什麼？',
+      'KEY'
+    );
+    expect(a).toBe('結論是下週三上線。');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    // 提示詞內含逐字稿與問題
+    const body = fetchMock.mock.calls[1][1].body;
+    expect(body).toContain('下週三上線');
+    expect(body).toContain('結論是什麼');
   });
 });
 

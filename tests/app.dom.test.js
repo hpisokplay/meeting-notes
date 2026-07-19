@@ -12,6 +12,7 @@ const BODY = `
   <main id="view"></main>
   <nav class="tabbar">
     <button id="homeTab">📋 清單</button>
+    <button id="groupsTab">📂 分類</button>
     <button id="newTab" class="primary">＋ 新增會議</button>
   </nav>`;
 
@@ -47,6 +48,9 @@ describe('app（整合）', () => {
 
     const view = document.getElementById('view');
     expect(view.innerHTML).toContain('產品週會');
+    // 清單卡片有分類 chip（預設未分類）
+    expect(view.innerHTML).toContain('grp-chip');
+    expect(view.innerHTML).toContain('未分類');
 
     // 切到詳情頁
     location.hash = '#/m/test-1';
@@ -76,5 +80,21 @@ describe('app（整合）', () => {
     expect(html).toContain('data-enh="qa"');
     expect(html).toContain('spk-chip');
     expect(html).toContain('English');
+    // 逐字稿段落可點擊編輯（原文檢視有 data-i）
+    expect(html).toContain('data-i="0"');
+    // 會議問答卡片
+    expect(html).toContain('問這場會議');
+    expect(html).toContain('chatAsk');
+
+    // 分類頁：能渲染群組清單
+    const groups = await import('../js/groups.js');
+    groups.addGroup('客戶會議');
+    location.hash = '#/groups';
+    window.dispatchEvent(new Event('hashchange'));
+    await tick();
+    const gHtml = document.getElementById('view').innerHTML;
+    expect(gHtml).toContain('客戶會議');
+    expect(gHtml).toContain('新增群組');
+    expect(gHtml).toContain('未分類');
   });
 });

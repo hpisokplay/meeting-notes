@@ -22,6 +22,30 @@ describe('mergeState', () => {
     const a = { meetings: [{ id: 'x', createdAt: 100 }, { id: 'y', createdAt: 300 }, { id: 'z', createdAt: 200 }], deleted: [] };
     expect(mergeState(a, null).meetings.map((m) => m.id)).toEqual(['y', 'z', 'x']);
   });
+
+  it('分類群組：聯集＋updatedAt 較新者勝＋墓碑刪除', () => {
+    const a = {
+      meetings: [], deleted: [],
+      groups: [{ id: 'g1', name: '舊名', createdAt: 1, updatedAt: 10 }, { id: 'g2', name: '要刪', createdAt: 2, updatedAt: 5 }],
+      groupsDeleted: [],
+    };
+    const b = {
+      meetings: [], deleted: [],
+      groups: [{ id: 'g1', name: '新名', createdAt: 1, updatedAt: 20 }, { id: 'g3', name: '另一組', createdAt: 3, updatedAt: 5 }],
+      groupsDeleted: ['g2'],
+    };
+    const m = mergeState(a, b);
+    expect(m.groups.find((g) => g.id === 'g1').name).toBe('新名');
+    expect(m.groups.map((g) => g.id).sort()).toEqual(['g1', 'g3']);
+    expect(m.groupsDeleted).toContain('g2');
+  });
+
+  it('舊格式文件（沒有 groups 欄位）也能合併', () => {
+    const m = mergeState({ meetings: [], deleted: [] }, { meetings: [{ id: '1', createdAt: 1 }], deleted: [] });
+    expect(m.groups).toEqual([]);
+    expect(m.groupsDeleted).toEqual([]);
+    expect(m.meetings).toHaveLength(1);
+  });
 });
 
 describe('base64 UTF-8', () => {
