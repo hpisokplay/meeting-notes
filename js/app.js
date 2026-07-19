@@ -1,4 +1,4 @@
-import { getApiKey, getApiKeys, getApiKeysRaw, setApiKey, hasApiKey } from './settings.js';
+import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey } from './settings.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
 import { uploadForJob, transcribeRange, summarize, regenerateSummary } from './gemini.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
@@ -7,7 +7,7 @@ import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v17';
+const APP_VERSION = 'v18';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -286,11 +286,11 @@ async function processJob(job, container) {
     if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
   } catch (_) {}
   try {
-    // 1) 上傳（若尚未上傳）
-    if (!job.fileUri) {
+    // 1) 上傳（若尚未上傳）— 每把金鑰各上傳一份，回傳 uploads:[{key,fileUri}]
+    if (!job.uploads || !job.uploads.length) {
       const up = await uploadForJob(job._file, getApiKeys(), ui.onProgress);
       job.model = up.model;
-      job.fileUri = up.fileUri;
+      job.uploads = up.uploads;
       job.mime = up.mime;
       await persistJob(job); // 上傳完成後才開始可續傳
     }
@@ -304,7 +304,7 @@ async function processJob(job, container) {
       ui.setBar(base);
       ui.easeTo(next, est / n);
       const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmssApp(w.start)}–${mmssApp(w.end)}）…` : '辨識語者與逐字稿中…';
-      const segs = await transcribeRange(job.fileUri, job.mime, getApiKeys(), job.model, w.start, w.end, w.whole, ui.onProgress, label);
+      const segs = await transcribeRange(job.uploads, job.mime, job.model, w.start, w.end, w.whole, ui.onProgress, label);
       ui.stopEase();
       job.windows[i].segments = segs;
       await persistJob(job);
@@ -331,10 +331,10 @@ async function processJob(job, container) {
     jobRunning = false;
     transcribing = false;
     container.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
-      <div class="hint" style="margin-top:6px">${job.fileUri ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案。'}</div>
-      <button class="big" id="retryJob">${job.fileUri ? '繼續辨識' : '返回'}</button>`;
+      <div class="hint" style="margin-top:6px">${(job.uploads&&job.uploads.length) ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案。'}</div>
+      <button class="big" id="retryJob">${(job.uploads&&job.uploads.length) ? '繼續辨識' : '返回'}</button>`;
     const rb = document.getElementById('retryJob');
-    if (rb) rb.onclick = () => (job.fileUri ? openJobProgress(job) : (location.hash = '#/new'));
+    if (rb) rb.onclick = () => ((job.uploads&&job.uploads.length) ? openJobProgress(job) : (location.hash = '#/new'));
     refreshResumeBanner();
   } finally {
     if (wakeLock) {
@@ -367,7 +367,7 @@ async function startNewTranscription(file) {
     createdAt: now,
     durationSec: durSec,
     windows: buildWindows(durSec),
-    fileUri: null,
+    uploads: null,
     model: null,
     mime: null,
     done: false,
@@ -380,7 +380,7 @@ async function refreshResumeBanner() {
   if (existing) existing.remove();
   if (jobRunning) return;
   const job = await getActiveJob();
-  if (!job || !job.fileUri) return;
+  if (!job || !job.uploads || !job.uploads.length) return;
   const doneCount = job.windows.filter((w) => w.segments).length;
   const b = document.createElement('div');
   b.id = 'resume-banner';
@@ -583,13 +583,13 @@ function renderSettings() {
   const enabled = sync.isEnabled();
   view.innerHTML = `
     <div class="card">
-      <p style="margin-top:0"><b>Gemini API 金鑰</b> <span class="meta">目前 ${getApiKeys().length} 把</span></p>
-      <textarea id="key" class="keybox" rows="3" placeholder="貼上你的金鑰（可多把，一行一把）" autocomplete="off" autocapitalize="off" spellcheck="false">${esc(getApiKeysRaw())}</textarea>
-      <button class="big" id="saveKey">儲存</button>
+      <p style="margin-top:0"><b>Gemini API 金鑰</b></p>
+      <div id="keyList"></div>
+      <button class="big secondary" id="addKey">➕ 新增一把金鑰</button>
+      <button class="big" id="saveKey" style="margin-top:8px">儲存</button>
       <div class="hint">
-        金鑰只存在這支手機（不會上傳到任何伺服器）。<br>
-        取得方式：到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> → API Keys 複製免費金鑰。<br>
-        <b>多把金鑰</b>：一行貼一把，撞到用量上限時會自動換下一把。⚠️ 每把要在<b>不同專案</b>才有各自的額度。
+        金鑰只存在這支手機（不會上傳到任何伺服器）。到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> → API Keys 複製免費金鑰。<br>
+        <b>多把金鑰</b>：每格填一把、可自己命名，撞到用量上限時會自動換下一把。⚠️ 每把要建在<b>不同專案</b>才有各自的額度（長錄音會各上傳一份音檔）。
       </div>
     </div>
     <div class="card">
@@ -613,9 +613,28 @@ function renderSettings() {
       <button class="big secondary" id="forceUpdateBtn">🔄 檢查並載入最新版</button>
       <div class="hint">若畫面沒更新到最新，按這顆會清除快取並重新載入最新版。</div>
     </div>`;
+  // 金鑰清單（可命名、可新增/刪除）
+  const keyList = document.getElementById('keyList');
+  const addRow = (entry) => {
+    const div = document.createElement('div');
+    div.className = 'key-row';
+    div.innerHTML = `
+      <input type="text" class="key-name" placeholder="名稱（如：私人）" value="${esc((entry && entry.name) || '')}" autocomplete="off" />
+      <input type="password" class="key-val" placeholder="貼上金鑰" value="${esc((entry && entry.key) || '')}" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <button class="key-del" type="button" title="刪除">✕</button>`;
+    div.querySelector('.key-del').onclick = () => div.remove();
+    keyList.appendChild(div);
+  };
+  const existingEntries = getApiKeyEntries();
+  (existingEntries.length ? existingEntries : [{ name: '', key: '' }]).forEach(addRow);
+  document.getElementById('addKey').onclick = () => addRow({ name: '', key: '' });
   document.getElementById('saveKey').onclick = () => {
-    setApiKey(document.getElementById('key').value);
-    toast('金鑰已儲存');
+    const rows = Array.from(keyList.querySelectorAll('.key-row')).map((r) => ({
+      name: r.querySelector('.key-name').value,
+      key: r.querySelector('.key-val').value,
+    }));
+    setApiKeyEntries(rows);
+    toast(`已儲存 ${getApiKeys().length} 把金鑰`);
   };
   document.getElementById('saveSync').onclick = async () => {
     const token = document.getElementById('ghToken').value.trim();

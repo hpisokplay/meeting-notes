@@ -89,11 +89,10 @@ button.big { width: 100%; padding: 15px; font-size: 16px; font-weight: 600; bord
 button.big.secondary { background: var(--bg); color: var(--ink); }
 button.big.danger { background: var(--danger); color: #fff; }
 button.copy { background: var(--bg); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 5px 12px; font-size: 13px; }
-.keybox {
-  width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 10px;
-  font-size: 15px; background: var(--card); color: var(--ink); resize: vertical; font-family: ui-monospace, monospace;
-  -webkit-appearance: none; appearance: none;
-}
+.key-row { display: flex; gap: 6px; align-items: center; margin-bottom: 8px; }
+.key-row .key-name { flex: 0 0 30%; min-width: 0; padding: 11px 10px; border: 1px solid var(--line); border-radius: 10px; font-size: 14px; background: var(--card); color: var(--ink); }
+.key-row .key-val { flex: 1 1 auto; min-width: 0; padding: 11px 10px; border: 1px solid var(--line); border-radius: 10px; font-size: 14px; background: var(--card); color: var(--ink); font-family: ui-monospace, monospace; }
+.key-row .key-del { flex: 0 0 auto; background: var(--btn2); color: var(--danger); border: none; border-radius: 8px; width: 38px; height: 38px; font-size: 15px; }
 .search {
   width: 100%; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px;
   font-size: 16px; background: var(--card); color: var(--ink); margin-bottom: 12px;

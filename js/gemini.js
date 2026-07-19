@@ -123,26 +123,28 @@ export function parseRetryDelayMs(bodyText) {
   return m ? Math.min(65000, Math.ceil(parseFloat(m[1]) + 1) * 1000) : 0;
 }
 
-// 帶自動重試 + 多金鑰輪替的 POST：
-// - 某把金鑰 429/5xx/網路錯 → 立刻換下一把金鑰重試（多把金鑰各有各的每分鐘額度）
-// - 所有金鑰都受限 → 依 Google 建議秒數等待後再整輪重試
-async function postJsonWithRetry(keys, makeUrl, body, onProgress, label) {
-  const ks = keys && keys.length ? keys : [''];
+// 帶自動重試 + 多變體（金鑰/檔案）輪替的 POST：
+// variants: 陣列，makeReq(variant) → { url, body }
+// - 某變體 429/5xx/網路錯 → 立刻換下一個變體重試（多把金鑰各有各的每分鐘額度、各自的檔案）
+// - 全部受限 → 依 Google 建議秒數等待後再整輪重試
+async function postJsonRotating(variants, makeReq, onProgress, label) {
+  const vs = variants && variants.length ? variants : [{}];
   const MAX_ROUNDS = 5;
-  let ki = 0;
+  let vi = 0;
   let lastText = '';
   let lastStatus = 0;
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     let sawTransient = false;
     let retryMs = 0;
-    for (let k = 0; k < ks.length; k++) {
-      const key = ks[ki % ks.length];
-      ki++;
-      const multi = ks.length > 1;
+    for (let k = 0; k < vs.length; k++) {
+      const v = vs[vi % vs.length];
+      vi++;
+      const multi = vs.length > 1;
       report(onProgress, 'transcribe', null, round === 0 && k === 0 ? label : multi ? '切換金鑰重試中…' : `重試中…（第 ${round} 次）`);
+      const { url, body } = makeReq(v);
       let res;
       try {
-        res = await fetch(makeUrl(key), { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
       } catch (e) {
         sawTransient = true;
         continue;
@@ -163,8 +165,11 @@ async function postJsonWithRetry(keys, makeUrl, body, onProgress, label) {
     }
     if (!sawTransient || round >= MAX_ROUNDS) break;
     const wait = retryMs || Math.min(60000, 8000 * (round + 1));
-    report(onProgress, 'transcribe', null, `${ks.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
+    report(onProgress, 'transcribe', null, `${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
     await sleep(wait);
+  }
+  if (lastStatus === 403 && /permission|not exist/i.test(lastText)) {
+    throw new Error('雲端音檔已過期或無法存取，請按「新增會議」重新上傳這個檔案。');
   }
   if (lastStatus === 429) {
     throw new Error('所有金鑰都達到用量上限。稍等 1–2 分鐘再按「繼續」即可（每分鐘限制），或今日免費額度用罄（隔日恢復）／再新增一把不同專案的金鑰／開通付費。進度已保存。');
@@ -199,20 +204,22 @@ function mmss(sec) {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 }
 
-// 辨識單一時間窗；若輸出被截斷（內容太密）則自動對半再切，直到塞得下
-async function transcribeWindow(fileUri, mime, keys, model, start, end, whole, onProgress, label, depth) {
+// uploads: [{ key, fileUri }]，每把金鑰用「自己上傳的那份檔案」，才不會 403
+async function transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label, depth) {
   const range = whole ? '' : `\n\n【只處理 ${mmss(start)} 到 ${mmss(end)} 這段時間範圍】的內容，此範圍以外請完全略過。說話者請從「說話者1」開始標記。`;
-  const res = await postJsonWithRetry(
-    keys,
-    (key) => `${BASE}/v1beta/models/${model}:generateContent?key=${key}`,
-    JSON.stringify({
-      contents: [{ parts: [{ file_data: { mime_type: mime, file_uri: fileUri } }, { text: SEG_PROMPT + range }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SEG_SCHEMA,
-        maxOutputTokens: 65535,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
+  const res = await postJsonRotating(
+    uploads,
+    (u) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${u.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ file_data: { mime_type: mime, file_uri: u.fileUri } }, { text: SEG_PROMPT + range }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: SEG_SCHEMA,
+          maxOutputTokens: 65535,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
     }),
     onProgress,
     label
@@ -232,8 +239,8 @@ async function transcribeWindow(fileUri, mime, keys, model, start, end, whole, o
   // 內容太密被截斷 → 對半再切（有時間範圍時才能切）
   if ((truncated || segments === null) && !whole && depth < 4 && end - start > 120) {
     const mid = Math.floor((start + end) / 2);
-    const a = await transcribeWindow(fileUri, mime, keys, model, start, mid, false, onProgress, label, depth + 1);
-    const b = await transcribeWindow(fileUri, mime, keys, model, mid, end, false, onProgress, label, depth + 1);
+    const a = await transcribeWindow(uploads, mime, model, start, mid, false, onProgress, label, depth + 1);
+    const b = await transcribeWindow(uploads, mime, model, mid, end, false, onProgress, label, depth + 1);
     return a.concat(b);
   }
   if (segments === null) {
@@ -243,10 +250,9 @@ async function transcribeWindow(fileUri, mime, keys, model, start, end, whole, o
   return segments;
 }
 
-async function transcribeAudio(fileUri, mime, keys, model, durationSec, onProgress) {
+async function transcribeAudio(uploads, mime, model, durationSec, onProgress) {
   if (!durationSec) {
-    // 讀不到長度：以整檔一次辨識（多數情況用不到）
-    return transcribeWindow(fileUri, mime, keys, model, 0, 0, true, onProgress, '辨識語者與逐字稿中…', 0);
+    return transcribeWindow(uploads, mime, model, 0, 0, true, onProgress, '辨識語者與逐字稿中…', 0);
   }
   const n = Math.max(1, Math.ceil(durationSec / WINDOW_SEC));
   const all = [];
@@ -254,25 +260,29 @@ async function transcribeAudio(fileUri, mime, keys, model, durationSec, onProgre
     const start = i * WINDOW_SEC;
     const end = Math.min(durationSec, (i + 1) * WINDOW_SEC);
     const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmss(start)}–${mmss(end)}）…` : '辨識語者與逐字稿中…';
-    const segs = await transcribeWindow(fileUri, mime, keys, model, start, end, false, onProgress, label, 0);
+    const segs = await transcribeWindow(uploads, mime, model, start, end, false, onProgress, label, 0);
     all.push(...segs);
   }
   return all;
 }
 
+// 摘要是純文字（不含檔案），任何一把金鑰都能用 → 用 keys 輪替即可
 async function summarizeSegments(segments, keys, model, onProgress) {
   const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
-  const res = await postJsonWithRetry(
-    keys,
-    (key) => `${BASE}/v1beta/models/${model}:generateContent?key=${key}`,
-    JSON.stringify({
-      contents: [{ parts: [{ text: SUMMARY_PROMPT + text }] }],
-      generationConfig: {
-        responseMimeType: 'application/json',
-        responseSchema: SUMMARY_SCHEMA,
-        maxOutputTokens: 65535,
-        thinkingConfig: { thinkingBudget: 0 },
-      },
+  const variants = toKeys(keys).map((k) => ({ key: k }));
+  const res = await postJsonRotating(
+    variants,
+    (v) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: SUMMARY_PROMPT + text }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: SUMMARY_SCHEMA,
+          maxOutputTokens: 65535,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
     }),
     onProgress,
     '整理摘要中…'
@@ -291,40 +301,43 @@ function toKeys(k) {
   return Array.isArray(k) ? k.filter(Boolean) : k ? [k] : [];
 }
 
-export async function transcribeAndSummarize(file, apiKeys, opts = {}) {
-  const onProgress = opts.onProgress;
-  const durationSec = opts.durationSec || 0;
-  const keys = toKeys(apiKeys);
-  if (!keys.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
-  report(onProgress, 'model', 3, '選擇辨識型號中…');
-  const model = await resolveModel(keys[0]);
-  const fileInfo = await uploadFile(file, keys[0], onProgress);
-  const active = await waitActive(fileInfo, keys[0], onProgress);
-  const mime = active.mimeType || file.type || 'audio/mpeg';
-  const segments = await transcribeAudio(active.uri, mime, keys, model, durationSec, onProgress);
-  report(onProgress, 'summary', null, '整理摘要中…');
-  const summary = await summarizeSegments(segments, keys, model, onProgress);
-  return { transcript: segments, summary };
-}
-
-// ---- 續傳用的分解式 API（供 app 逐段處理、可中斷續跑）----
-// 上傳並準備：回傳可續傳的 { model, fileUri, mime }（音檔在 Gemini 端保存約 48 小時）
+// 把音檔上傳到「每一把金鑰的專案」，回傳 { model, mime, uploads:[{key,fileUri}] }
+// 這樣之後辨識輪替金鑰時，每把用自己的檔案，不會 403。
 export async function uploadForJob(file, apiKeys, onProgress) {
   const keys = toKeys(apiKeys);
   if (!keys.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
   const model = await resolveModel(keys[0]);
-  const fileInfo = await uploadFile(file, keys[0], onProgress);
-  const active = await waitActive(fileInfo, keys[0], onProgress);
-  return { model, fileUri: active.uri, mime: active.mimeType || file.type || 'audio/mpeg' };
+  const uploads = [];
+  let mime = file.type || 'audio/mpeg';
+  for (let i = 0; i < keys.length; i++) {
+    if (keys.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${keys.length}）`);
+    const info = await uploadFile(file, keys[i], onProgress);
+    const active = await waitActive(info, keys[i], onProgress);
+    uploads.push({ key: keys[i], fileUri: active.uri });
+    mime = active.mimeType || mime;
+  }
+  return { model, mime, uploads };
 }
-// 辨識單一時間段（含自動對半再切、多金鑰輪替）
-export function transcribeRange(fileUri, mime, apiKeys, model, start, end, whole, onProgress, label) {
-  return transcribeWindow(fileUri, mime, toKeys(apiKeys), model, start, end, whole, onProgress, label || '辨識中…', 0);
+// 辨識單一時間段（含自動對半再切、多金鑰輪替）。uploads:[{key,fileUri}]
+export function transcribeRange(uploads, mime, model, start, end, whole, onProgress, label) {
+  return transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label || '辨識中…', 0);
 }
-// 對整份逐字稿產生摘要
+// 對整份逐字稿產生摘要（純文字，任何金鑰可用）
 export async function summarize(segments, apiKeys, model, onProgress) {
   return summarizeSegments(segments, toKeys(apiKeys), model, onProgress);
+}
+
+export async function transcribeAndSummarize(file, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const durationSec = opts.durationSec || 0;
+  const keys = toKeys(apiKeys);
+  if (!keys.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
+  const { model, mime, uploads } = await uploadForJob(file, keys, onProgress);
+  const segments = await transcribeAudio(uploads, mime, model, durationSec, onProgress);
+  report(onProgress, 'summary', null, '整理摘要中…');
+  const summary = await summarizeSegments(segments, keys, model, onProgress);
+  return { transcript: segments, summary };
 }
 
 // 只根據既有逐字稿重新整理摘要（不需重傳音檔，快又省額度）
