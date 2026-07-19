@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, clearModelCache } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
+  clearModelCache();
 });
 
 const MODELS_RESPONSE = {
