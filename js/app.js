@@ -1,14 +1,15 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, regenerateSummary } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys } from './gemini.js';
+import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v19';
+const APP_VERSION = 'v20';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -298,35 +299,68 @@ async function processJob(job, container) {
   try {
     if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
   } catch (_) {}
+  const prepared = () => job.chunks && job.chunks.length && job.chunks.every((c) => c.uploads && c.uploads.length);
   try {
-    // 1) 上傳（若尚未上傳）— 每把金鑰各上傳一份，回傳 uploads:[{key,fileUri}]
-    if (!job.uploads || !job.uploads.length) {
-      const up = await uploadForJob(job._file, getApiKeyEntries(), ui.onProgress);
-      job.model = up.model;
-      job.uploads = up.uploads;
-      job.mime = up.mime;
-      await persistJob(job); // 上傳完成後才開始可續傳
+    // 1) 準備（切割 + 上傳）——只在尚未備妥時做，需要原始檔（一次前景完成）
+    if (!prepared()) {
+      if (!job._file) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
+      const entries = getApiKeyEntries();
+      ui.setBar(4);
+      ui.setLabel('選擇型號中…');
+      job.model = job.model || (await pickModelForKeys(entries));
+
+      // 嘗試把音檔切成小段（每段 30 分鐘），大幅降低每次請求 token
+      let blobs = null;
+      try {
+        ui.setLabel('切割音檔中…');
+        const r = await splitAudioToChunks(job._file, 30 * 60, (i, n) => ui.setLabel(`切割音檔中…（${i}/${n} 段）`));
+        blobs = r.chunks;
+        job.durationSec = r.durationSec || job.durationSec;
+      } catch (_) {
+        blobs = null; // 解碼失敗 → 改用整檔模式
+      }
+
+      if (blobs && blobs.length) {
+        job.mode = 'split';
+        job.mime = 'audio/wav';
+        job.chunks = blobs.map((c) => ({ start: c.start, end: c.end, uploads: null, segments: null }));
+        for (let i = 0; i < blobs.length; i++) {
+          ui.setBar(8 + (i / blobs.length) * 28);
+          ui.setLabel(`上傳第 ${i + 1}/${blobs.length} 段…`);
+          job.chunks[i].uploads = await uploadBlobToKeys(blobs[i].blob, entries, ui.onProgress);
+          blobs[i].blob = null; // 釋放記憶體
+        }
+      } else {
+        // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
+        job.mode = 'whole';
+        const up = await uploadForJob(job._file, entries, ui.onProgress);
+        job.model = up.model;
+        job.mime = up.mime;
+        job.chunks = buildWindows(job.durationSec).map((w) => ({ start: w.start, end: w.end, whole: w.whole, uploads: up.uploads, segments: null }));
+      }
+      await persistJob(job); // 全部上傳完成後才可續傳
     }
+
     // 2) 逐段辨識（每段完成即存檔）
-    const n = job.windows.length;
+    const n = job.chunks.length;
     for (let i = 0; i < n; i++) {
-      if (job.windows[i].segments) continue;
-      const w = job.windows[i];
+      if (job.chunks[i].segments) continue;
+      const c = job.chunks[i];
       const base = 40 + (i / n) * 52;
       const next = 40 + ((i + 1) / n) * 52;
       ui.setBar(base);
       ui.easeTo(next, est / n);
-      const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmssApp(w.start)}–${mmssApp(w.end)}）…` : '辨識語者與逐字稿中…';
-      const segs = await transcribeRange(job.uploads, job.mime, job.model, w.start, w.end, w.whole, ui.onProgress, label);
+      const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmssApp(c.start)}–${mmssApp(c.end)}）…` : '辨識語者與逐字稿中…';
+      const whole = job.mode === 'split' ? true : !!c.whole;
+      c.segments = await transcribeRange(c.uploads, job.mime, job.model, c.start, c.end, whole, ui.onProgress, label);
       ui.stopEase();
-      job.windows[i].segments = segs;
       await persistJob(job);
       ui.setBar(next);
     }
     // 3) 摘要
     ui.setLabel('整理摘要中…');
     ui.easeTo(99, 20);
-    const allSegs = job.windows.reduce((acc, w) => acc.concat(w.segments || []), []);
+    const allSegs = job.chunks.reduce((acc, c) => acc.concat(c.segments || []), []);
     const summary = await summarize(allSegs, getApiKeyEntries(), job.model, ui.onProgress);
     ui.stopEase();
     ui.setBar(100);
@@ -343,11 +377,12 @@ async function processJob(job, container) {
     ui.stop();
     jobRunning = false;
     transcribing = false;
+    const canResume = prepared();
     container.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
-      <div class="hint" style="margin-top:6px">${(job.uploads&&job.uploads.length) ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案。'}</div>
-      <button class="big" id="retryJob">${(job.uploads&&job.uploads.length) ? '繼續辨識' : '返回'}</button>`;
+      <div class="hint" style="margin-top:6px">${canResume ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案再試。'}</div>
+      <button class="big" id="retryJob">${canResume ? '繼續辨識' : '返回'}</button>`;
     const rb = document.getElementById('retryJob');
-    if (rb) rb.onclick = () => ((job.uploads&&job.uploads.length) ? openJobProgress(job) : (location.hash = '#/new'));
+    if (rb) rb.onclick = () => (prepared() ? openJobProgress(job) : (location.hash = '#/new'));
     refreshResumeBanner();
   } finally {
     if (wakeLock) {
@@ -379,8 +414,8 @@ async function startNewTranscription(file) {
     title: defaultTitle(file.name, now),
     createdAt: now,
     durationSec: durSec,
-    windows: buildWindows(durSec),
-    uploads: null,
+    chunks: null,
+    mode: null,
     model: null,
     mime: null,
     done: false,
@@ -393,12 +428,12 @@ async function refreshResumeBanner() {
   if (existing) existing.remove();
   if (jobRunning) return;
   const job = await getActiveJob();
-  if (!job || !job.uploads || !job.uploads.length) return;
-  const doneCount = job.windows.filter((w) => w.segments).length;
+  if (!job || !job.chunks || !job.chunks.length || !job.chunks.every((c) => c.uploads && c.uploads.length)) return;
+  const doneCount = job.chunks.filter((c) => c.segments).length;
   const b = document.createElement('div');
   b.id = 'resume-banner';
   b.className = 'install-banner';
-  b.innerHTML = `<span>⏳ 有一場辨識未完成（${doneCount}/${job.windows.length} 段），點此繼續</span>`;
+  b.innerHTML = `<span>⏳ 有一場辨識未完成（${doneCount}/${job.chunks.length} 段），點此繼續</span>`;
   b.onclick = () => {
     b.remove();
     openJobProgress(job);

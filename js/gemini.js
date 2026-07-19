@@ -131,7 +131,9 @@ export function parseRetryDelayMs(bodyText) {
 // - 全部受限 → 依 Google 建議秒數等待後再整輪重試
 async function postJsonRotating(variants, makeReq, onProgress, label) {
   const vs = variants && variants.length ? variants : [{}];
-  const MAX_ROUNDS = 5;
+  const MAX_ROUNDS = 4;
+  const MAX_TOTAL_WAIT = 150000; // 累計等待超過 ~2.5 分鐘就放棄（避免無限迴圈）
+  let totalWait = 0;
   let vi = 0;
   let lastText = '';
   let lastStatus = 0;
@@ -169,7 +171,9 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       throw new Error(`辨識失敗 (${res.status})：${lastText.slice(0, 300)}`);
     }
     if (!sawTransient || round >= MAX_ROUNDS) break;
-    const wait = retryMs || Math.min(60000, 8000 * (round + 1));
+    const wait = Math.min(35000, retryMs || 8000 * (round + 1));
+    if (totalWait + wait > MAX_TOTAL_WAIT) break;
+    totalWait += wait;
     report(onProgress, 'transcribe', null, `${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
     await sleep(wait);
   }
@@ -177,7 +181,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
     throw new Error('雲端音檔已過期或無法存取，請按「新增會議」重新上傳這個檔案。');
   }
   if (lastStatus === 429) {
-    throw new Error('所有金鑰都達到用量上限。稍等 1–2 分鐘再按「繼續」即可（每分鐘限制），或今日免費額度用罄（隔日恢復）／再新增一把不同專案的金鑰／開通付費。進度已保存。');
+    throw new Error('額度受限，暫時無法完成。稍等 1–2 分鐘再按「繼續」通常就會繼續跑（進度已保存）。若一直卡住，代表這段音檔對免費層的「每分鐘用量」太大，建議到 AI Studio 開通 API 付費（最有效），或用較短的錄音。');
   }
   throw new Error(`辨識失敗 (${lastStatus || ''})：${(lastText || '請重試').slice(0, 300)}`);
 }
@@ -330,6 +334,25 @@ export async function uploadForJob(file, apiKeys, onProgress) {
 // 辨識單一時間段（含自動對半再切、多金鑰輪替）。uploads:[{key,fileUri}]
 export function transcribeRange(uploads, mime, model, start, end, whole, onProgress, label) {
   return transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label || '辨識中…', 0);
+}
+
+// 挑選型號（給切割模式一次用）
+export async function pickModelForKeys(apiKeys) {
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  return resolveModel(kos[0].key);
+}
+// 把一個音檔片段（Blob）上傳到每一把金鑰的專案，回傳 uploads:[{key,name,fileUri}]
+export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  const uploads = [];
+  for (let i = 0; i < kos.length; i++) {
+    const info = await uploadFile(blob, kos[i].key, onProgress);
+    const active = await waitActive(info, kos[i].key, onProgress);
+    uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
+  }
+  return uploads;
 }
 // 對整份逐字稿產生摘要（純文字，任何金鑰可用）
 export async function summarize(segments, apiKeys, model, onProgress) {
