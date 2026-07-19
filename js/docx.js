@@ -64,9 +64,9 @@ function run(text, opts = {}) {
   const color = opts.color ? `<w:color w:val="${opts.color}"/>` : '';
   return `<w:r><w:rPr>${b}${color}<w:sz w:val="${sz}"/><w:szCs w:val="${sz}"/></w:rPr><w:t xml:space="preserve">${esc(text)}</w:t></w:r>`;
 }
-const para = (runs) => `<w:p>${runs}</w:p>`;
+const para = (runs, pr) => `<w:p>${pr ? `<w:pPr>${pr}</w:pPr>` : ''}${runs}</w:p>`;
 const title = (t) => para(run(t, { b: true, sz: 34 }));
-const heading = (t) => para(run(t, { b: true, sz: 26 }));
+const heading = (t) => para(run(t, { b: true, sz: 26 }), '<w:keepNext/><w:keepLines/>'); // 標題不與內容分頁
 const line = (t, sz) => para(run(t, { sz: sz || 22 }));
 
 const SPK_COLORS = ['0A58CA', '1A7F37', 'B35900', '8250DF', 'CF222E', '0A6D8A', '9A6700'];
@@ -101,8 +101,10 @@ function documentXml(meeting) {
   if (qa.length) {
     qa.forEach((x, i) => {
       const { q, a } = splitQA(x);
-      body.push(para(run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q)));
-      if (a) body.push(para(run('　　', { b: true }) + run('答：', { b: true, color: '1A7F37' }) + run(a)));
+      // 問與答同段、以換行分隔，並設 keepLines 讓整組不被分頁拆開（跟 PDF 一致）
+      let runs = run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
+      if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
+      body.push(para(runs, '<w:keepLines/>'));
     });
   } else body.push(line('無'));
   body.push(heading('🗣️ 逐字稿 Transcribe'));
