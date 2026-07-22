@@ -1,9 +1,10 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, clearModelCache } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
   clearModelCache();
+  resetThinkingFlag();
 });
 
 const MODELS_RESPONSE = {
@@ -114,6 +115,23 @@ describe('askMeeting', () => {
     const body = fetchMock.mock.calls[1][1].body;
     expect(body).toContain('下週三上線');
     expect(body).toContain('結論是什麼');
+  });
+});
+
+describe('400 thinkingBudget 退避', () => {
+  it('模型回 400（thinking）→ 自動移除 thinkingConfig 重試成功', async () => {
+    const okJson = { candidates: [{ content: { parts: [{ text: JSON.stringify({ actionItems: [], mainPoints: ['ok'], qa: [] }) }] } }] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(errResponse(400, { error: { code: 400, status: 'INVALID_ARGUMENT' } })) // 首次帶 thinkingConfig → 400
+      .mockResolvedValueOnce(jsonResponse(okJson)); // 移除 thinkingConfig 後重試成功
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
+    expect(r.mainPoints).toEqual(['ok']);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // 第 3 次（重試）的 body 不含 thinkingConfig
+    expect(fetchMock.mock.calls[2][1].body).not.toContain('thinkingConfig');
   });
 });
 
