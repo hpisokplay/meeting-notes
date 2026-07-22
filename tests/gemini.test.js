@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -132,6 +132,22 @@ describe('400 thinkingBudget 退避', () => {
     expect(fetchMock).toHaveBeenCalledTimes(3);
     // 第 3 次（重試）的 body 不含 thinkingConfig
     expect(fetchMock.mock.calls[2][1].body).not.toContain('thinkingConfig');
+  });
+});
+
+describe('extractTerms', () => {
+  it('挑出專有名詞，跨批次去重並帶分類與建議', async () => {
+    const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(wrap({ items: [{ term: '宏騰', category: 'org', fix: '宏騰科技' }, { term: 'Mikiya', category: 'person', fix: '' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await extractTerms([{ speaker: '說話者1', text: '宏騰跟 Mikiya 討論' }], 'KEY');
+    expect(r).toHaveLength(2);
+    expect(r[0]).toEqual({ t: '宏騰', cat: 'org', fix: '宏騰科技' });
+    expect(r[1].t).toBe('Mikiya');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 });
 

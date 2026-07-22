@@ -99,6 +99,9 @@ describe('app（整合）', () => {
     // 會議問答卡片
     expect(html).toContain('問這場會議');
     expect(html).toContain('chatAsk');
+    // 專有名詞訂正卡片（含掃描按鈕）
+    expect(html).toContain('專有名詞訂正');
+    expect(html).toContain('scanTerms');
 
     // 分類頁：能渲染群組清單
     const groups = await import('../js/groups.js');
