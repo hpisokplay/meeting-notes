@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -148,6 +148,66 @@ describe('extractTerms', () => {
     expect(r[0]).toEqual({ t: '宏騰', cat: 'org', fix: '宏騰科技' });
     expect(r[1].t).toBe('Mikiya');
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('enhanceSection 兩階段（抓全→整理潤飾）', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+
+  it('Q&A：分批抓全後再整理潤飾一次，回傳潤飾後結果', async () => {
+    const raw = [
+      '問：那個上線是什麼時候？ 答：嗯就是下週三啦',
+      '問：所以上線那天誰要待命？ 答：就我跟小明啊',
+    ];
+    const polished = ['問：上線時程與當日待命安排？ 答：下週三上線，由王小明待命'];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(wrap({ items: raw })) // 批次抓取
+      .mockResolvedValueOnce(wrap({ items: polished })); // 整理潤飾
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: '說話者1', text: '上線下週三' }], 'qa', 'KEY');
+    expect(r).toEqual(polished);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // 潤飾請求要帶上原始抓取結果，並指示合併同主題、改寫成書面語
+    const body = fetchMock.mock.calls[2][1].body;
+    expect(body).toContain('上線是什麼時候');
+    expect(body).toContain('合併');
+    expect(body).toContain('書面');
+  });
+
+  it('待辦事項：潤飾指示要求保留 [DRI: …] 標註', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: ['嗯那個小明要去弄一下伺服器 [DRI: 小明]'] }))
+      .mockResolvedValueOnce(wrap({ items: ['調整伺服器設定 [DRI: 小明]'] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'actionItems', 'KEY');
+    expect(r).toEqual(['調整伺服器設定 [DRI: 小明]']);
+    const body = fetchMock.mock.calls[2][1].body;
+    expect(body).toContain('DRI');
+  });
+
+  it('抓不到任何內容時不做潤飾（不多打一次 API），回傳空陣列', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY');
+    expect(r).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('潤飾階段解析失敗時丟錯（不靜默退回口語版）', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: ['問：A？ 答：B'] }))
+      .mockResolvedValueOnce(jsonResponse({ candidates: [{ content: { parts: [{ text: '不是JSON' }] } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY')).rejects.toThrow('整理');
   });
 });
 

@@ -500,11 +500,17 @@ const SECTION_META = {
   actionItems: {
     label: '待辦事項',
     instr: '逐條列出「所有」待辦／後續行動（action items），不要精簡、不要遺漏；每項結尾標「[DRI: 負責人]」，判斷不出就標「[DRI: 待指派]」（英文用 [DRI: TBD]）',
+    polishInstr: `- 每項結尾保留「[DRI: 負責人]」標註（英文用 [DRI: …]）；合併多條時，多位負責人可並列在同一個標註內。\n`,
   },
-  mainPoints: { label: '會議重點', instr: '逐條列出「所有」重要重點與結論，力求完整、不要精簡' },
+  mainPoints: {
+    label: '會議重點',
+    instr: '逐條列出「所有」重要重點與結論，力求完整、不要精簡',
+    polishInstr: `- 每條聚焦一個結論或重點，同一主題的多條合併後仍要保留各自的關鍵資訊（數字、日期、決議）。\n`,
+  },
   qa: {
     label: '會議提問 Q&A',
     instr: '把逐字稿中「每一組」提問與回答都抓出來（務必全部、不要只挑幾個），格式「問：… 答：…」（英文用「Q: … A: …」）',
+    polishInstr: `- 維持「問：… 答：…」格式（英文用「Q: … A: …」）；針對同一議題的多組問答合併成一條，答案濃縮成重點結論。\n`,
   },
 };
 const ITEMS_SCHEMA = { type: 'object', properties: { items: { type: 'array', items: { type: 'string' } } }, required: ['items'] };
@@ -552,7 +558,42 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
     }
     if (Array.isArray(r.items)) all.push(...r.items);
   }
-  return all;
+  if (!all.length) return all;
+  // 第二階段：把分批抓到的原始清單做一次總整理（合併同主題＋改寫成書面語）。
+  // 分批抓取為了「不遺漏」會照抄口語原文，且各批互看不到而重複；此階段統一收斂。
+  const polishPrompt =
+    `以下是從會議逐字稿分批擷取的「${meta.label}」原始清單。請整理成正式會議記錄：\n` +
+    `- 合併重複或屬於同一主題的條目成一條。\n` +
+    `- 改寫成精簡的書面語，刪除口語贅字（如「那個」「就是說」「嗯」），不要照抄逐字稿原文。\n` +
+    `- 不可遺漏任何獨立的${meta.label}條目；只做合併與潤飾，不可自行新增內容。\n` +
+    `- 使用與原始清單相同的主要語言。\n` +
+    meta.polishInstr +
+    `只輸出 JSON {"items":[...]}。\n\n原始清單：\n` +
+    all.map((s, i) => `${i + 1}. ${s}`).join('\n');
+  const label = `整理潤飾${meta.label}中…`;
+  const res = await postJsonRotating(
+    variants,
+    (v) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: polishPrompt }] }],
+        generationConfig: { responseMimeType: 'application/json', responseSchema: ITEMS_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+      }),
+    }),
+    onProgress,
+    label
+  );
+  const data = await res.json();
+  const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error(`整理${meta.label}時無回應，請重試`);
+  let r;
+  try {
+    r = JSON.parse(out);
+  } catch (_) {
+    throw new Error(`整理${meta.label}時解析失敗，請重試`);
+  }
+  if (!Array.isArray(r.items) || !r.items.length) throw new Error(`整理${meta.label}後結果為空，請重試`);
+  return r.items;
 }
 
 // 問答：根據整份逐字稿+摘要回答使用者問題（純文字，固定品質模型）
