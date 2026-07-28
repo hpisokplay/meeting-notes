@@ -559,29 +559,54 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
     if (Array.isArray(r.items)) all.push(...r.items);
   }
   if (!all.length) return all;
-  // 第二階段：把分批抓到的原始清單做一次總整理（合併同主題＋改寫成書面語）。
-  // 分批抓取為了「不遺漏」會照抄口語原文，且各批互看不到而重複；此階段統一收斂。
+  return polishItems(all, meta, model, variants, onProgress);
+}
+
+// 第二階段：逐條改寫成書面語＋只合併「同一個問題／同一件事」的重複條目。
+// 模型須為每條輸出附上涵蓋的原始編號（src）；程式據此做保底——
+// 沒被涵蓋的原始條目自動補回、一條涵蓋太多（合併過頭）就拆回原文，確保永遠不會比抓全階段少內容。
+const MERGE_CAP = 3; // 一條輸出最多涵蓋幾條原始條目
+const POLISH_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          text: { type: 'string' },
+          src: { type: 'array', items: { type: 'integer' } },
+        },
+        required: ['text', 'src'],
+      },
+    },
+  },
+  required: ['items'],
+};
+
+async function polishItems(all, meta, model, variants, onProgress) {
+  const n = all.length;
   const polishPrompt =
-    `以下是從會議逐字稿分批擷取的「${meta.label}」原始清單。請整理成正式會議記錄：\n` +
-    `- 合併重複或屬於同一主題的條目成一條。\n` +
-    `- 改寫成精簡的書面語，刪除口語贅字（如「那個」「就是說」「嗯」），不要照抄逐字稿原文。\n` +
-    `- 不可遺漏任何獨立的${meta.label}條目；只做合併與潤飾，不可自行新增內容。\n` +
+    `以下是從會議逐字稿分批擷取的「${meta.label}」原始清單，共 ${n} 條（已編號）。請逐條改寫成正式會議記錄：\n` +
+    `- 每一條都改寫成精簡的書面語，刪除口語贅字（如「那個」「就是說」「嗯」），不要照抄逐字稿原文，但保留具體資訊（數字、日期、人名、結論）。\n` +
+    `- 只有當多條記錄的是「同一個問題／同一件事」（重複、追問、或同一件事分次提到）才可合併成一條；不同的問題即使屬於同一主題，也必須各自保留一條。合併是例外而非常態，輸出條數應與原始條數相近。\n` +
+    `- 一條輸出最多合併 ${MERGE_CAP} 條原始條目。\n` +
+    `- 每條輸出都要在 src 列出它涵蓋的原始編號；${n} 條原始編號每一條都必須被涵蓋，不可遺漏、不可自行新增內容。\n` +
     `- 使用與原始清單相同的主要語言。\n` +
     meta.polishInstr +
-    `只輸出 JSON {"items":[...]}。\n\n原始清單：\n` +
+    `只輸出 JSON {"items":[{"text":"...","src":[編號]}]}。\n\n原始清單：\n` +
     all.map((s, i) => `${i + 1}. ${s}`).join('\n');
-  const label = `整理潤飾${meta.label}中…`;
   const res = await postJsonRotating(
     variants,
     (v) => ({
       url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
       body: JSON.stringify({
         contents: [{ parts: [{ text: polishPrompt }] }],
-        generationConfig: { responseMimeType: 'application/json', responseSchema: ITEMS_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+        generationConfig: { responseMimeType: 'application/json', responseSchema: POLISH_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
       }),
     }),
     onProgress,
-    label
+    `整理潤飾${meta.label}中…`
   );
   const data = await res.json();
   const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
@@ -592,8 +617,31 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
   } catch (_) {
     throw new Error(`整理${meta.label}時解析失敗，請重試`);
   }
-  if (!Array.isArray(r.items) || !r.items.length) throw new Error(`整理${meta.label}後結果為空，請重試`);
-  return r.items;
+  if (!Array.isArray(r.items)) throw new Error(`整理${meta.label}後結果為空，請重試`);
+  // 保底：ord 取涵蓋的最小原始編號以維持會議先後順序
+  const covered = new Set();
+  const outs = [];
+  for (const it of r.items) {
+    const text = it && typeof it.text === 'string' ? it.text.trim() : '';
+    if (!text) continue;
+    const src = (Array.isArray(it && it.src) ? it.src : [])
+      .map((x) => Math.trunc(Number(x)))
+      .filter((x) => x >= 1 && x <= n && !covered.has(x));
+    if (!src.length) continue;
+    if (src.length > MERGE_CAP) {
+      for (const x of src) {
+        covered.add(x);
+        outs.push({ ord: x, text: all[x - 1] });
+      }
+      continue;
+    }
+    src.forEach((x) => covered.add(x));
+    outs.push({ ord: Math.min(...src), text });
+  }
+  for (let x = 1; x <= n; x++) if (!covered.has(x)) outs.push({ ord: x, text: all[x - 1] });
+  if (!outs.length) throw new Error(`整理${meta.label}後結果為空，請重試`);
+  outs.sort((a, b) => a.ord - b.ord);
+  return outs.map((o) => o.text);
 }
 
 // 問答：根據整份逐字稿+摘要回答使用者問題（純文字，固定品質模型）
