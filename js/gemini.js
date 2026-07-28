@@ -492,7 +492,7 @@ const SUMMARY_PROMPT =
   `以下是一段會議逐字稿。請依內容整理成三類，並使用「與逐字稿相同的主要語言」` +
   `（逐字稿主要是中文就用繁體中文、主要是英文就用英文、主要是日文就用日文）：\n` +
   `- actionItems（待辦事項）：逐條列出，每項結尾標註「[DRI: 負責人]」，判斷不出負責人就寫「[DRI: 待指派]」（英文用 [DRI: TBD]）。\n` +
-  `- mainPoints（會議重點）：逐條列出。\n` +
+  `- mainPoints（會議重點）：逐條列出，每條寫成「標題：說明」（標題為 4～14 字的名詞短語，接全形冒號再寫說明；英文用「Title: …」），每條只講一個議題。\n` +
   `- qa（提問／Q&A）：格式「問：… 答：…」（英文用「Q: … A: …」），若沒有問答就回傳空陣列。\n\n逐字稿：\n`;
 
 // 加強單一區塊：分段掃過整份逐字稿，抓出「完整、不遺漏」的清單（解決 Q&A 只有幾筆的問題）
@@ -504,8 +504,14 @@ const SECTION_META = {
   },
   mainPoints: {
     label: '會議重點',
-    instr: '逐條列出「所有」重要重點與結論，力求完整、不要精簡',
-    polishInstr: `- 每條聚焦一個結論或重點，同一主題的多條合併後仍要保留各自的關鍵資訊（數字、日期、決議）。\n`,
+    instr:
+      '逐條列出「所有」重要重點與結論，力求完整、不要精簡；每條寫成「標題：說明」的點列格式' +
+      '（標題為 4～14 字的名詞短語，點出這條在講什麼，後接全形冒號與說明；英文用「Title: 說明」）',
+    cap: 2,
+    polishInstr:
+      `- 每條必須是「標題：說明」的點列格式：先寫 4～14 字的名詞短語標題，接全形冒號，再寫說明（英文用「Title: …」）。不可寫成沒有標題的長篇論述。\n` +
+      `- 每條只講「一個」議題；不同議題（例如需求、技術優缺點、成本、市場數據）一律各自一條，不可壓縮成同一條。\n` +
+      `- 說明務必保留原始的具體資訊（數字、單位、比例、日期、人名、結論）。\n`,
   },
   qa: {
     label: '會議提問 Q&A',
@@ -565,7 +571,7 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
 // 第二階段：逐條改寫成書面語＋只合併「同一個問題／同一件事」的重複條目。
 // 模型須為每條輸出附上涵蓋的原始編號（src）；程式據此做保底——
 // 沒被涵蓋的原始條目自動補回、一條涵蓋太多（合併過頭）就拆回原文，確保永遠不會比抓全階段少內容。
-const MERGE_CAP = 3; // 一條輸出最多涵蓋幾條原始條目
+const MERGE_CAP = 3; // 一條輸出最多涵蓋幾條原始條目（各區可用 meta.cap 覆寫）
 const POLISH_SCHEMA = {
   type: 'object',
   properties: {
@@ -586,11 +592,12 @@ const POLISH_SCHEMA = {
 
 async function polishItems(all, meta, model, variants, onProgress) {
   const n = all.length;
+  const cap = meta.cap || MERGE_CAP;
   const polishPrompt =
     `以下是從會議逐字稿分批擷取的「${meta.label}」原始清單，共 ${n} 條（已編號）。請逐條改寫成正式會議記錄：\n` +
     `- 每一條都改寫成精簡的書面語，刪除口語贅字（如「那個」「就是說」「嗯」），不要照抄逐字稿原文，但保留具體資訊（數字、日期、人名、結論）。\n` +
     `- 只有當多條記錄的是「同一個問題／同一件事」（重複、追問、或同一件事分次提到）才可合併成一條；不同的問題即使屬於同一主題，也必須各自保留一條。合併是例外而非常態，輸出條數應與原始條數相近。\n` +
-    `- 一條輸出最多合併 ${MERGE_CAP} 條原始條目。\n` +
+    `- 一條輸出最多合併 ${cap} 條原始條目。\n` +
     `- 每條輸出都要在 src 列出它涵蓋的原始編號；${n} 條原始編號每一條都必須被涵蓋，不可遺漏、不可自行新增內容。\n` +
     `- 使用與原始清單相同的主要語言。\n` +
     meta.polishInstr +
@@ -628,7 +635,7 @@ async function polishItems(all, meta, model, variants, onProgress) {
       .map((x) => Math.trunc(Number(x)))
       .filter((x) => x >= 1 && x <= n && !covered.has(x));
     if (!src.length) continue;
-    if (src.length > MERGE_CAP) {
+    if (src.length > cap) {
       for (const x of src) {
         covered.add(x);
         outs.push({ ord: x, text: all[x - 1] });

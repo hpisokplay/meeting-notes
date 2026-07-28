@@ -202,6 +202,31 @@ describe('enhanceSection 兩階段（抓全→整理潤飾）', () => {
     expect(r).toEqual(raw);
   });
 
+  it('會議重點：抓取與潤飾都要求「標題：說明」點列格式', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: ['發熱量達 800W 至 2000W'] }))
+      .mockResolvedValueOnce(wrap({ items: [{ text: '散熱需求：發熱量達 800W 至 2000W', src: [1] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'mainPoints', 'KEY');
+    expect(r).toEqual(['散熱需求：發熱量達 800W 至 2000W']);
+    expect(fetchMock.mock.calls[1][1].body).toContain('標題：說明'); // 第一階段抓取
+    expect(fetchMock.mock.calls[2][1].body).toContain('標題：說明'); // 第二階段潤飾
+  });
+
+  it('會議重點：合併上限比 Q&A 嚴（超過 2 條就拆回，避免多議題壓成一條論述）', async () => {
+    const raw = ['重點一：A', '重點二：B', '重點三：C'];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: raw }))
+      .mockResolvedValueOnce(wrap({ items: [{ text: '技術總覽：A、B、C', src: [1, 2, 3] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'mainPoints', 'KEY');
+    expect(r).toEqual(raw);
+  });
+
   it('待辦事項：潤飾指示要求保留 [DRI: …] 標註', async () => {
     const fetchMock = vi
       .fn()
