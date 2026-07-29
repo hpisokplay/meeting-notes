@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v52';
+const APP_VERSION = 'v53';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -106,6 +106,61 @@ function toast(msg) {
   t.classList.add('show');
   clearTimeout(t._h);
   t._h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+// ===== 會議詳情頁的長時間工作（加強／掃描／問答）=====
+// 這些工作 await 期間，使用者可能切到設定等其他頁再回來 → 畫面重繪、按鈕狀態被重置。
+// 工作本身其實還在跑（Promise 不會因為重繪而中斷），但畫面上看不出來，
+// 使用者會誤以為它停了而再點一次 → 重複燒額度、兩份結果互相覆寫。
+// 解法同辨識任務：狀態存在畫面之外，重繪後再畫回去。
+const detailTasks = new Map(); // `${meetingId}|${taskKey}` → { label }
+const taskId = (meetingId, key) => `${meetingId}|${key}`;
+
+function currentDetailId() {
+  return location.hash.startsWith('#/m/') ? location.hash.slice(4) : '';
+}
+// 把執行中的工作狀態畫回按鈕（畫面可能剛重繪過）
+function paintDetailTasks() {
+  const id = currentDetailId();
+  if (!id) return;
+  let busy = false;
+  document.querySelectorAll('[data-task]').forEach((b) => {
+    const t = detailTasks.get(taskId(id, b.dataset.task));
+    if (t) {
+      busy = true;
+      if (!b.dataset.origLabel) b.dataset.origLabel = b.textContent;
+      b.textContent = '⏳ ' + t.label;
+    } else if (b.dataset.origLabel) {
+      b.textContent = b.dataset.origLabel;
+      b.removeAttribute('data-orig-label');
+    }
+  });
+  // 有工作在跑就停用整排動作鈕，避免同時開第二個
+  document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = busy));
+}
+function detailBusy() {
+  const id = currentDetailId();
+  if (!id) return false;
+  for (const k of detailTasks.keys()) if (k.startsWith(id + '|')) return true;
+  return false;
+}
+// 執行一項會議詳情工作；fn 收到 setMsg 用來回報進度
+async function runDetailTask(meetingId, key, initialLabel, fn) {
+  const k = taskId(meetingId, key);
+  detailTasks.set(k, { label: initialLabel });
+  paintDetailTasks();
+  try {
+    return await fn((msg) => {
+      const t = detailTasks.get(k);
+      if (t && msg) {
+        t.label = msg;
+        paintDetailTasks();
+      }
+    });
+  } finally {
+    detailTasks.delete(k);
+    paintDetailTasks();
+  }
 }
 
 // 辨識中防止誤關頁面
@@ -1005,9 +1060,9 @@ async function renderDetail(id) {
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
       <div class="act-grid">
-        <button class="act-btn" data-enh="actionItems">✅ 加強待辦</button>
-        <button class="act-btn" data-enh="mainPoints">📌 加強重點</button>
-        <button class="act-btn" data-enh="qa">❓ 加強Q&A</button>
+        <button class="act-btn" data-enh="actionItems" data-task="enh:actionItems">✅ 加強待辦</button>
+        <button class="act-btn" data-enh="mainPoints" data-task="enh:mainPoints">📌 加強重點</button>
+        <button class="act-btn" data-enh="qa" data-task="enh:qa">❓ 加強Q&A</button>
       </div>
     </div>
     <div id="detailBody"></div>
@@ -1019,7 +1074,7 @@ async function renderDetail(id) {
       <div class="section-title" style="margin-top:0">💬 問這場會議 <button class="copy" id="chatClear" hidden>清除紀錄</button></div>
       <div id="chatLog"></div>
       <textarea id="chatInput" rows="2" placeholder="輸入問題，例如：這場會議最後的結論是什麼？"></textarea>
-      <button class="big" id="chatAsk">送出問題</button>
+      <button class="big" id="chatAsk" data-task="ask">送出問題</button>
       <div class="hint">AI 只根據這場會議的逐字稿回答；問答會存在這場會議裡。</div>
     </div>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
@@ -1194,15 +1249,23 @@ async function renderDetail(id) {
         document.getElementById('backZh').onclick = () => setLang('orig');
         return;
       }
+      if (detailBusy()) {
+        toast('已有一項作業進行中，請等它完成');
+        setLang('orig');
+        return;
+      }
       drawBody(l); // 顯示「翻譯中…」
       try {
         const fp = transcriptFingerprint(m.transcript); // 翻譯前記錄逐字稿指紋
-        const tr = await translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
-          onProgress: (info) => {
-            const el = document.getElementById('tprogmsg');
-            if (el && info && info.message) el.textContent = info.message;
-          },
-        });
+        const tr = await runDetailTask(id, 'tr:' + l, '翻譯中…', (setMsg) =>
+          translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
+            onProgress: (info) => {
+              setMsg(info && info.message);
+              const el = document.getElementById('tprogmsg');
+              if (el && info && info.message) el.textContent = info.message;
+            },
+          })
+        );
         // 翻譯期間若原文被改過（指紋不符）→ 丟棄這份翻譯，不落盤（避免存下對不上的翻譯）
         const cur = await get(id);
         if (cur && transcriptFingerprint(cur.transcript) !== fp) {
@@ -1291,7 +1354,7 @@ async function renderDetail(id) {
     const data = m.terms;
     if (!data || !data.items) {
       termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字改對（會同時更新逐字稿與摘要）。<br>可以先<b>逐一改好、最後按一次「套用全部訂正」</b>統一生效。</div>
-        <button class="big" id="scanTerms">🔍 自動挑出專有名詞</button>`;
+        <button class="big" id="scanTerms" data-task="terms">🔍 自動挑出專有名詞</button>`;
       const sb = document.getElementById('scanTerms');
       if (sb) sb.onclick = () => doScanTerms(sb);
       return;
@@ -1313,7 +1376,7 @@ async function renderDetail(id) {
       .join('');
     termsBody.innerHTML = `
       <div class="term-actions">
-        <button class="act-btn" id="rescanTerms">🔄 重新掃描</button>
+        <button class="act-btn" id="rescanTerms" data-task="terms">🔄 重新掃描</button>
         <button class="act-btn" id="addTerm">＋ 手動新增</button>
       </div>
       ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
@@ -1391,12 +1454,13 @@ async function renderDetail(id) {
   const doScanTerms = async (btn) => {
     if (!hasApiKey()) { alert('請先到 ⚙︎ 設定填入 Gemini 金鑰'); return; }
     if (!(m.transcript && m.transcript.length)) { alert('這場沒有逐字稿，無法挑詞'); return; }
-    const old = btn && btn.textContent;
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ 掃描中…'; }
+    if (detailBusy()) { toast('已有一項作業進行中，請等它完成'); return; }
     try {
-      const found = await extractTerms(m.transcript, getApiKeyEntries(), {
-        onProgress: (info) => { if (btn && info && info.message) btn.textContent = '⏳ ' + info.message; },
-      });
+      const found = await runDetailTask(id, 'terms', '掃描中…', (setMsg) =>
+        extractTerms(m.transcript, getApiKeyEntries(), {
+          onProgress: (info) => setMsg(info && info.message),
+        })
+      );
       // 保留已訂正過的詞，合併新挑到的
       await persist((fresh) => {
         const prevApplied = ((fresh.terms && fresh.terms.items) || []).filter((x) => x.applied);
@@ -1410,7 +1474,6 @@ async function renderDetail(id) {
       toast(n ? `挑出 ${n} 個待訂正的詞` : '沒有挑到需要訂正的詞');
     } catch (e) {
       alert('挑詞失敗：' + (e && e.message ? e.message : e));
-      if (btn) { btn.disabled = false; btn.textContent = old; }
     }
   };
   drawTerms();
@@ -1426,13 +1489,17 @@ async function renderDetail(id) {
       return;
     }
     const nameMap = { actionItems: '待辦事項', mainPoints: '會議重點', qa: '會議提問 Q&A' };
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
     if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變）。`)) return;
-    const old = btn.textContent;
-    document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = true));
     try {
-      const items = await enhanceSection(m.transcript, section, getApiKeyEntries(), {
-        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
-      });
+      const items = await runDetailTask(id, 'enh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
+        enhanceSection(m.transcript, section, getApiKeyEntries(), {
+          onProgress: (info) => setMsg(info && info.message),
+        })
+      );
       await persist((fresh) => {
         fresh.summary = fresh.summary || {};
         fresh.summary[section] = items;
@@ -1443,8 +1510,6 @@ async function renderDetail(id) {
       toast(`已加強${nameMap[section]}（共 ${items.length} 筆${skipped ? `，另略過 ${skipped} 則議程性問答` : ''}）`);
     } catch (e) {
       alert('加強失敗：' + (e && e.message ? e.message : e));
-      document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = false));
-      btn.textContent = old;
     }
   };
   document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
@@ -1522,13 +1587,16 @@ async function renderDetail(id) {
       alert('這場沒有逐字稿，無法問答');
       return;
     }
-    const btn = document.getElementById('chatAsk');
-    btn.disabled = true;
-    btn.textContent = '⏳ 思考中…';
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
     try {
-      const a = await askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
-        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '思考中…')),
-      });
+      const a = await runDetailTask(id, 'ask', '思考中…', (setMsg) =>
+        askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
+          onProgress: (info) => setMsg(info && info.message),
+        })
+      );
       await persist((fresh) => {
         fresh.chat = fresh.chat || [];
         fresh.chat.push({ q, a, at: Date.now() });
@@ -1538,9 +1606,6 @@ async function renderDetail(id) {
       chatLogEl.lastElementChild && chatLogEl.lastElementChild.scrollIntoView({ block: 'nearest' });
     } catch (e) {
       alert('問答失敗：' + (e && e.message ? e.message : e));
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '送出問題';
     }
   };
 
@@ -1559,13 +1624,27 @@ async function renderDetail(id) {
   };
 
   drawBody('orig');
+  // 重繪後把仍在跑的作業狀態畫回按鈕（離開再回來時才看得出它還在跑）
+  paintDetailTasks();
 }
 
 function renderSettings() {
   setHeader('設定', true);
   const cfg = defaultSyncConfig();
   const enabled = sync.isEnabled();
+  // 這支 App 的網址（去掉 #hash 與 ?query）——PWA 從主畫面開啟時看不到網址列，
+  // 需要換裝置或分享給別人時，這裡是唯一拿得到網址的地方。
+  const appUrl = location.origin + location.pathname;
   view.innerHTML = `
+    <div class="card">
+      <p style="margin-top:0"><b>🔗 這個 App 的網址</b></p>
+      <input type="text" id="appUrl" value="${esc(appUrl)}" readonly />
+      <button class="big secondary" id="copyUrl" style="margin-top:8px">複製網址</button>
+      <div class="hint">
+        用這個網址可在電腦或其他手機開啟同一個 App（PWA 從主畫面開啟時看不到網址列，所以放在這裡）。<br>
+        會議記錄<b>不會</b>跟著網址走：每台裝置各自存在本機，要跨裝置看到同一份記錄，需開啟下方的 GitHub 雲端同步。
+      </div>
+    </div>
     <div class="card">
       <p style="margin-top:0"><b>Gemini API 金鑰</b></p>
       <div id="keyList"></div>
@@ -1632,6 +1711,20 @@ function renderSettings() {
   };
   const existingEntries = getApiKeyEntries();
   (existingEntries.length ? existingEntries : [{ name: '', key: '' }]).forEach(addRow);
+  document.getElementById('copyUrl').onclick = async (e) => {
+    const b = e.target;
+    try {
+      await navigator.clipboard.writeText(appUrl);
+      b.textContent = '已複製 ✓';
+    } catch (_) {
+      // iOS 在非使用者手勢或無 HTTPS 時可能失敗 → 退而求其次幫他選取，讓使用者長按複製
+      const f = document.getElementById('appUrl');
+      f.focus();
+      f.setSelectionRange(0, f.value.length);
+      b.textContent = '請長按上方網址複製';
+    }
+    setTimeout(() => (b.textContent = '複製網址'), 1800);
+  };
   document.getElementById('addKey').onclick = () => addRow({ name: '', key: '' });
   document.getElementById('saveKey').onclick = () => {
     const rows = Array.from(keyList.querySelectorAll('.key-row')).map((r) => ({
