@@ -265,6 +265,88 @@ describe('enhanceSection 兩階段（抓全→整理潤飾）', () => {
     expect(r).toEqual(raw);
   });
 
+  it('Q&A：被標記略過的議程性問答不補回，且不影響其他條目', async () => {
+    const raw = [
+      '問：後續簡報有沒有要快速帶過的？ 答：建議快速帶過',
+      '問：貴司有沒有 PSU 開發經驗？ 答：伺服器 PSU 為首次開發',
+    ];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: raw }))
+      .mockResolvedValueOnce(
+        wrap({
+          items: [
+            { text: '', src: [1], drop: true },
+            { text: '問：貴司是否具備 PSU 開發經驗？ 答：伺服器 PSU 為首次開發', src: [2] },
+          ],
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY');
+    expect(r).toEqual(['問：貴司是否具備 PSU 開發經驗？ 答：伺服器 PSU 為首次開發']);
+  });
+
+  it('Q&A：略過比例過高（超過四成）→ 判定過度篩選，全部保留', async () => {
+    const raw = ['問：1 答：1', '問：2 答：2', '問：3 答：3', '問：4 答：4'];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: raw }))
+      .mockResolvedValueOnce(
+        wrap({
+          items: [
+            { text: '', src: [1], drop: true },
+            { text: '', src: [2], drop: true },
+            { text: '', src: [3], drop: true },
+            { text: '問：4 答：4', src: [4] },
+          ],
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY');
+    expect(r).toEqual(raw); // 3/4 被丟 → 不接受，全部退回原文
+  });
+
+  it('Q&A：抓取階段要求問題自足（代名詞展開），潤飾階段要求價值篩選', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: ['問：A？ 答：a'] }))
+      .mockResolvedValueOnce(wrap({ items: [{ text: '問：A？ 答：a', src: [1] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    await enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY');
+    expect(fetchMock.mock.calls[1][1].body).toContain('代名詞'); // 第一階段：自足性
+    expect(fetchMock.mock.calls[2][1].body).toContain('議程'); // 第二階段：排除議程性問答
+    // 指涉推不準時要標「（推測）」，而不是留著看不懂或直接丟掉
+    expect(fetchMock.mock.calls[1][1].body).toContain('推測');
+    expect(fetchMock.mock.calls[2][1].body).toContain('推測');
+  });
+
+  it('回傳的清單帶有 dropped 筆數，供畫面提示使用者略過了幾則', async () => {
+    const raw = ['問：要不要先簡介？ 答：好', '問：PSU 經驗？ 答：首次開發'];
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: raw }))
+      .mockResolvedValueOnce(wrap({ items: [{ text: '', src: [1], drop: true }, { text: '問：PSU 經驗？ 答：首次開發', src: [2] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY');
+    expect(r.dropped).toBe(1);
+    expect(JSON.parse(JSON.stringify(r))).toEqual(['問：PSU 經驗？ 答：首次開發']); // 存檔時不會帶著 dropped
+  });
+
+  it('待辦事項不做價值篩選：標了 drop 也照樣保留原文', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: ['交付報價 [DRI: 小明]'] }))
+      .mockResolvedValueOnce(wrap({ items: [{ text: '', src: [1], drop: true }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection([{ speaker: 's', text: 't' }], 'actionItems', 'KEY');
+    expect(r).toEqual(['交付報價 [DRI: 小明]']);
+  });
+
   it('待辦事項：潤飾指示要求保留 [DRI: …] 標註', async () => {
     const fetchMock = vi
       .fn()

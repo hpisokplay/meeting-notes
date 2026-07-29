@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v51';
+const APP_VERSION = 'v52';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1439,7 +1439,8 @@ async function renderDetail(id) {
         fresh.translations = {}; // 內容改了 → 清掉舊翻譯
       }, { edit: true });
       renderDetail(id);
-      toast(`已加強${nameMap[section]}（共 ${items.length} 筆）`);
+      const skipped = items.dropped || 0;
+      toast(`已加強${nameMap[section]}（共 ${items.length} 筆${skipped ? `，另略過 ${skipped} 則議程性問答` : ''}）`);
     } catch (e) {
       alert('加強失敗：' + (e && e.message ? e.message : e));
       document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = false));

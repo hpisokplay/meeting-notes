@@ -594,8 +594,23 @@ const SECTION_META = {
   },
   qa: {
     label: '會議提問 Q&A',
-    instr: '把逐字稿中「每一組」提問與回答都抓出來（務必全部、不要只挑幾個），格式「問：… 答：…」（英文用「Q: … A: …」）',
-    polishInstr: `- 維持「問：… 答：…」格式（英文用「Q: … A: …」）；針對同一議題的多組問答合併成一條，答案濃縮成重點結論。\n`,
+    instr:
+      '把逐字稿中「每一組」提問與回答都抓出來（務必全部、不要只挑幾個），格式「問：… 答：…」（英文用「Q: … A: …」）。' +
+      '問題必須「離開逐字稿也看得懂」：把「此類形態」「這個」「那部分」「上述」等代名詞或指示詞，' +
+      '依上下文展開成具體名詞（例如「此類形態的產品」→「Brick 型態的伺服器電源」）；' +
+      '若上下文不足以完全確定所指，仍要依前後文做出最合理的推測，並在該詞後標註「（推測）」，不可原封不動留著看不懂的指示詞',
+    allowDrop: true, // 只有 Q&A 做價值篩選：議程性、寒暄、零資訊的問答不進會議記錄
+    polishInstr:
+      `- 維持「問：… 答：…」格式（英文用「Q: … A: …」）；針對同一議題的多組問答合併成一條，答案濃縮成重點結論。\n` +
+      `- 問題必須自足：仍帶有「此類」「這個」「那部分」等指涉不明的詞時，依清單其他條目的脈絡改寫成具體名詞；` +
+      `無法完全確定時，做出最合理的推測並標註「（推測）」，例如「問：Brick 型態的伺服器電源（推測）是否為貴司首款產品？」。\n` +
+      `- 價值篩選：把「不該進會議記錄」的條目標成 drop:true（text 留空字串）。符合以下任一即標 drop：\n` +
+      `  (a) 議程或流程安排（要不要先做簡介、能不能快速帶過、時間夠不夠、換下一頁、要不要休息）；\n` +
+      `  (b) 設備或連線確認（聽得到嗎、畫面有出來嗎）、純寒暄與出席確認；\n` +
+      `  (c) 答案只是複述問題或僅表示同意，問答雙方都沒有提供任何實質資訊。\n` +
+      `- 以下一律「不可」標 drop：涉及技術、規格、時程、成本、產能、商務條件、責任歸屬、風險的問答；` +
+      `答案為「尚未決定／待確認／再回覆」的也必須保留（那是有意義的狀態）。\n` +
+      `- 標 drop 應是少數；若你想標掉的超過三成，代表判斷過於嚴格，請重新檢視並只保留最明確的議程性條目。\n`,
   },
 };
 const ITEMS_SCHEMA = { type: 'object', properties: { items: { type: 'array', items: { type: 'string' } } }, required: ['items'] };
@@ -661,6 +676,7 @@ const POLISH_SCHEMA = {
         properties: {
           text: { type: 'string' },
           src: { type: 'array', items: { type: 'integer' } },
+          drop: { type: 'boolean' }, // 僅 Q&A 使用：標記為不該進會議記錄的議程性／零資訊條目
         },
         required: ['text', 'src'],
       },
@@ -704,16 +720,38 @@ async function polishItems(all, meta, model, variants, onProgress) {
     throw new Error(`整理${meta.label}時解析失敗，請重試`);
   }
   if (!Array.isArray(r.items)) throw new Error(`整理${meta.label}後結果為空，請重試`);
-  // 保底：ord 取涵蓋的最小原始編號以維持會議先後順序
+
+  let built = assemblePolished(r.items, all, n, cap, !!meta.allowDrop);
+  // 過度篩選保護：略過太多就整批不採納，退回「只潤飾不篩選」。
+  // 門檻用 max(2, 40%) —— 條目少時比例天生浮動，不該因此觸發。
+  if (built.dropped > Math.max(2, n * 0.4) || !built.list.length) {
+    built = assemblePolished(r.items, all, n, cap, false);
+  }
+  if (!built.list.length) throw new Error(`整理${meta.label}後結果為空，請重試`);
+  // 讓呼叫端能顯示「另略過 N 則」，使篩選對使用者可見（不可列舉 → 不會被寫進 IndexedDB）
+  Object.defineProperty(built.list, 'dropped', { value: built.dropped, enumerable: false });
+  return built.list;
+}
+
+// 依模型回傳組出最終清單。honorDrop=false 時忽略所有 drop 標記（等於只潤飾不篩選）。
+// ord 取涵蓋的最小原始編號，以維持會議先後順序。
+function assemblePolished(items, all, n, cap, honorDrop) {
   const covered = new Set();
   const outs = [];
-  for (const it of r.items) {
+  let dropped = 0;
+  for (const it of items) {
+    const isDrop = honorDrop && !!(it && it.drop === true);
     const text = it && typeof it.text === 'string' ? it.text.trim() : '';
-    if (!text) continue;
+    if (!isDrop && !text) continue;
     const src = (Array.isArray(it && it.src) ? it.src : [])
       .map((x) => Math.trunc(Number(x)))
       .filter((x) => x >= 1 && x <= n && !covered.has(x));
     if (!src.length) continue;
+    if (isDrop) {
+      src.forEach((x) => covered.add(x));
+      dropped += src.length;
+      continue;
+    }
     if (src.length > cap) {
       for (const x of src) {
         covered.add(x);
@@ -724,10 +762,10 @@ async function polishItems(all, meta, model, variants, onProgress) {
     src.forEach((x) => covered.add(x));
     outs.push({ ord: Math.min(...src), text });
   }
+  // 沒被涵蓋也沒被標略過的 → 補回原文（防漏保證不變）
   for (let x = 1; x <= n; x++) if (!covered.has(x)) outs.push({ ord: x, text: all[x - 1] });
-  if (!outs.length) throw new Error(`整理${meta.label}後結果為空，請重試`);
   outs.sort((a, b) => a.ord - b.ord);
-  return outs.map((o) => o.text);
+  return { list: outs.map((o) => o.text), dropped };
 }
 
 // 問答：根據整份逐字稿+摘要回答使用者問題（純文字，固定品質模型）
