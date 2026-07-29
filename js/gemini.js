@@ -23,6 +23,30 @@ export function resetThinkingFlag() {
   thinkingRejected = false;
 }
 
+// ---- 中斷（使用者按「停止辨識」）----
+// 停止必須立即生效：除了不再發新請求，連「等待重試」的睡眠也要能被打斷，
+// 否則按下停止後畫面還要卡完那 8～35 秒，跟當機沒兩樣。
+let aborted = false;
+const abortWaiters = new Set();
+export function requestAbort() {
+  aborted = true;
+  for (const w of Array.from(abortWaiters)) w();
+  abortWaiters.clear();
+}
+export function clearAbort() {
+  aborted = false;
+}
+export function isAborted() {
+  return aborted;
+}
+export const ABORT_MSG = '已停止這場辨識';
+function throwIfAborted() {
+  if (aborted) throw new Error(ABORT_MSG);
+}
+function isAbortError(e) {
+  return !!(e && e.message === ABORT_MSG);
+}
+
 // 動態挑選型號：向 API 詢問目前可用的模型，挑最適合的。
 // 這樣 Google 汰換型號名稱（如 2.5-flash → 3.5-flash）時 App 不會壞。
 export function pickModel(models, opts = {}) {
@@ -63,6 +87,7 @@ export function clearModelCache() {
 // apiKeys 可為單把字串或多把陣列 → 多把時逐把嘗試查型號（某把冷卻/失敗會換下一把）
 // opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
 async function resolveModel(apiKeys, opts = {}) {
+  throwIfAborted();
   const lite = opts.preferLite != null ? opts.preferLite : preferLite;
   const ck = String(lite);
   if (modelCache[ck]) return modelCache[ck];
@@ -99,6 +124,7 @@ function report(onProgress, phase, pct, message, keyName) {
 }
 
 async function uploadFile(file, apiKey, onProgress) {
+  throwIfAborted();
   report(onProgress, 'upload', 5, '準備上傳…');
   const mime = file.type || 'audio/mpeg';
   const start = await fetch(`${BASE}/upload/v1beta/files?key=${apiKey}`, {
@@ -112,7 +138,11 @@ async function uploadFile(file, apiKey, onProgress) {
     },
     body: JSON.stringify({ file: { display_name: file.name || 'meeting-audio' } }),
   });
-  if (!start.ok) throw new Error(`上傳啟動失敗 (${start.status})：${(await start.text()).slice(0, 200)}`);
+  if (!start.ok) {
+    const err = new Error(`上傳啟動失敗 (${start.status})：${(await start.text()).slice(0, 200)}`);
+    err.status = start.status; // 供上層判斷是否值得重試
+    throw err;
+  }
   const uploadUrl = start.headers.get('X-Goog-Upload-URL');
   if (!uploadUrl) throw new Error('未取得上傳網址');
 
@@ -136,10 +166,16 @@ async function uploadFile(file, apiKey, onProgress) {
           reject(new Error('上傳回應解析失敗'));
         }
       } else {
-        reject(new Error(`上傳失敗 (${xhr.status})`));
+        const err = new Error(`上傳失敗 (${xhr.status})`);
+        err.status = xhr.status;
+        reject(err);
       }
     };
-    xhr.onerror = () => reject(new Error('上傳失敗（網路中斷）'));
+    xhr.onerror = () => {
+      const err = new Error('上傳失敗（網路中斷）');
+      err.status = 0; // 網路層錯誤，值得重試
+      reject(err);
+    };
     xhr.send(file);
   });
   return info; // { uri, name, state, mimeType }
@@ -165,7 +201,20 @@ async function waitActive(fileInfo, apiKey, onProgress) {
   return { uri, mimeType };
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 可被中斷的睡眠：按下停止時立刻醒來，不必等完退避秒數
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    if (aborted) return resolve();
+    const wake = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      abortWaiters.delete(wake);
+      resolve();
+    }, ms);
+    abortWaiters.add(wake);
+  });
 export function isTransientStatus(status) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
@@ -193,6 +242,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
     let sawTransient = false;
     let retryMs = 0;
     for (let k = 0; k < vs.length; k++) {
+      throwIfAborted();
       const v = vs[vi % vs.length];
       vi++;
       const multi = vs.length > 1;
@@ -255,6 +305,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
     totalWait += wait;
     report(onProgress, 'transcribe', null, `${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
     await sleep(wait);
+    throwIfAborted();
   }
   if (lastStatus === 403 && /permission|not exist/i.test(lastText)) {
     throw new Error('雲端音檔已過期或無法存取，請按「新增會議」重新上傳這個檔案。');
@@ -404,6 +455,60 @@ function toKeyObjs(keys) {
     .filter((o) => o.key);
 }
 
+// 單把金鑰的上傳（含暫時性失敗重試）。
+// 沒有重試時，一次 429／5xx／網路瞬斷就會讓這把金鑰被踢出整場任務的輪替名單，
+// 之後辨識撞到額度上限只能乾等——這正是「有兩把金鑰卻不會切換」的根因。
+const UPLOAD_TRIES = 3;
+function isRetriableUpload(e) {
+  const s = e && e.status;
+  return s === 0 || s === 408 || s === 429 || (s >= 500 && s <= 599);
+}
+async function uploadOnce(file, ko, onProgress) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < UPLOAD_TRIES; attempt++) {
+    throwIfAborted();
+    try {
+      const info = await uploadFile(file, ko.key, onProgress);
+      const active = await waitActive(info, ko.key, onProgress);
+      return active;
+    } catch (e) {
+      if (isAbortError(e)) throw e;
+      lastErr = e;
+      if (!isRetriableUpload(e) || attempt === UPLOAD_TRIES - 1) break;
+      const wait = 1500 * (attempt + 1);
+      report(onProgress, 'upload', null, `${ko.name || '金鑰'} 上傳失敗，${Math.round(wait / 1000)} 秒後重試…`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+// 依序把音檔上傳到指定的每一把金鑰；單把失敗會明確回報（不再靜默略過）
+async function uploadToKeys(file, kos, onProgress, showIndex) {
+  const uploads = [];
+  let mime = file.type || 'audio/mpeg';
+  let lastErr = null;
+  for (let i = 0; i < kos.length; i++) {
+    throwIfAborted();
+    if (showIndex && kos.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${kos.length}）`, kos[i].name);
+    try {
+      const active = await uploadOnce(file, kos[i], onProgress);
+      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
+      mime = active.mimeType || mime;
+    } catch (e) {
+      if (isAbortError(e)) throw e;
+      lastErr = e;
+      // 靜默略過會讓使用者以為還有多把金鑰在輪替 → 明確告知這場少了哪一把
+      report(onProgress, 'upload', null, `⚠️ ${kos[i].name || `金鑰${i + 1}`} 上傳失敗，本場將無法用它輪替`);
+    }
+  }
+  return { uploads, mime, lastErr };
+}
+// 找出還沒上傳過這個檔案的金鑰（續傳時用來補傳，恢復輪替能力）
+export function missingKeyEntries(uploads, apiKeys) {
+  const have = new Set((uploads || []).map((u) => u.key));
+  return toKeyObjs(apiKeys).filter((k) => !have.has(k.key));
+}
+
 // 把音檔上傳到「每一把金鑰的專案」，回傳 { model, mime, uploads:[{key,name,fileUri}] }
 // 這樣之後辨識輪替金鑰時，每把用自己的檔案，不會 403。
 export async function uploadForJob(file, apiKeys, onProgress) {
@@ -411,21 +516,7 @@ export async function uploadForJob(file, apiKeys, onProgress) {
   if (!kos.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
   const model = await resolveModel(kos.map((k) => k.key));
-  const uploads = [];
-  let mime = file.type || 'audio/mpeg';
-  let lastErr = null;
-  for (let i = 0; i < kos.length; i++) {
-    if (kos.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${kos.length}）`, kos[i].name);
-    try {
-      const info = await uploadFile(file, kos[i].key, onProgress);
-      const active = await waitActive(info, kos[i].key, onProgress);
-      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
-      mime = active.mimeType || mime;
-    } catch (e) {
-      // 單把金鑰上傳失敗（打錯字/專案停用）不該拖垮整個任務 → 略過這把，只要有一把成功就繼續
-      lastErr = e;
-    }
-  }
+  const { uploads, mime, lastErr } = await uploadToKeys(file, kos, onProgress, true);
   if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { model, mime, uploads };
 }
@@ -445,19 +536,7 @@ export async function pickModelForKeys(apiKeys, opts = {}) {
 export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
-  const uploads = [];
-  let mime = blob.type || 'audio/mpeg';
-  let lastErr = null;
-  for (let i = 0; i < kos.length; i++) {
-    try {
-      const info = await uploadFile(blob, kos[i].key, onProgress);
-      const active = await waitActive(info, kos[i].key, onProgress);
-      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
-      mime = active.mimeType || mime;
-    } catch (e) {
-      lastErr = e; // 單把失敗略過，至少一把成功即可繼續
-    }
-  }
+  const { uploads, mime, lastErr } = await uploadToKeys(blob, kos, onProgress, false);
   if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { uploads, mime };
 }

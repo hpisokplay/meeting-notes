@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, requestAbort, clearAbort, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
   clearModelCache();
   resetThinkingFlag();
+  clearAbort();
 });
 
 const MODELS_RESPONSE = {
@@ -16,6 +17,43 @@ const MODELS_RESPONSE = {
     { name: 'models/gemini-3.5-flash-image', supportedGenerationMethods: ['generateContent'] },
   ],
 };
+
+describe('中斷（停止辨識）', () => {
+  it('請求前已要求中斷 → 立刻丟出中斷錯誤，不再打 API', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    requestAbort();
+    await expect(regenerateSummary([{ speaker: 's', text: 't' }], 'KEY')).rejects.toThrow('已停止');
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('等待重試期間被中斷 → 不等完就結束（不再繼續重試）', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValue(errResponse(429, { error: { code: 429 } })); // 之後一律 429 → 進入等待
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
+    await new Promise((r) => setTimeout(r, 10));
+    requestAbort();
+    await expect(p).rejects.toThrow('已停止');
+    const calls = fetchMock.mock.calls.length;
+    await new Promise((r) => setTimeout(r, 60));
+    expect(fetchMock.mock.calls.length).toBe(calls); // 中斷後沒有再打任何請求
+  });
+
+  it('clearAbort 後可以重新開始', async () => {
+    requestAbort();
+    clearAbort();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ actionItems: [], mainPoints: ['ok'], qa: [] }) }] } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
+    expect(r.mainPoints).toEqual(['ok']);
+  });
+});
 
 describe('isTransientStatus', () => {
   it('5xx / 429 視為暫時性可重試', () => {
@@ -259,6 +297,54 @@ describe('enhanceSection 兩階段（抓全→整理潤飾）', () => {
       .mockResolvedValueOnce(jsonResponse({ candidates: [{ content: { parts: [{ text: '不是JSON' }] } }] }));
     vi.stubGlobal('fetch', fetchMock);
     await expect(enhanceSection([{ speaker: 's', text: 't' }], 'qa', 'KEY')).rejects.toThrow('整理');
+  });
+});
+
+describe('uploadForJob 多金鑰上傳', () => {
+  it('某把金鑰上傳暫時失敗 → 自動重試後成功，兩把都進輪替名單', async () => {
+    // start(K1) ok → start(K2) 503 → 重試 start(K2) ok
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up/1' })) // K1 start
+      .mockResolvedValueOnce(errResponse(503, { error: { code: 503 } })) // K2 start 失敗
+      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up/2' })); // K2 重試成功
+    vi.stubGlobal('fetch', fetchMock);
+    stubXHR();
+    const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
+    file.name = 'm.m4a';
+    const r = await uploadForJob(file, [{ name: 'SY', key: 'K1' }, { name: 'DD', key: 'K2' }]);
+    expect(r.uploads.map((u) => u.name)).toEqual(['SY', 'DD']);
+  });
+
+  it('某把金鑰重試後仍失敗 → 回報警告讓使用者知道只剩一把可輪替', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(jsonResponse({}, { 'X-Goog-Upload-URL': 'https://up/1' })) // K1 start ok
+      .mockResolvedValue(errResponse(400, { error: { code: 400 } })); // K2 一直失敗
+    vi.stubGlobal('fetch', fetchMock);
+    stubXHR();
+    const msgs = [];
+    const file = new Blob([new Uint8Array([1, 2, 3])], { type: 'audio/mp4' });
+    file.name = 'm.m4a';
+    const r = await uploadForJob(file, [{ name: 'SY', key: 'K1' }, { name: 'DD', key: 'K2' }], (info) => {
+      if (info && info.message) msgs.push(info.message);
+    });
+    expect(r.uploads.map((u) => u.name)).toEqual(['SY']);
+    expect(msgs.some((m) => m.includes('DD') && m.includes('上傳失敗'))).toBe(true);
+  });
+});
+
+describe('missingKeyEntries', () => {
+  it('找出尚未上傳過這個檔案的金鑰（續傳時補傳用）', () => {
+    const uploads = [{ key: 'K1', name: 'SY', fileUri: 'u1' }];
+    const r = missingKeyEntries(uploads, [{ name: 'SY', key: 'K1' }, { name: 'DD', key: 'K2' }]);
+    expect(r.map((k) => k.name)).toEqual(['DD']);
+  });
+  it('全部都已上傳時回空陣列', () => {
+    const uploads = [{ key: 'K1' }, { key: 'K2' }];
+    expect(missingKeyEntries(uploads, ['K1', 'K2'])).toEqual([]);
   });
 });
 
