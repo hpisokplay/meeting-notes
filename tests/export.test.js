@@ -63,6 +63,33 @@ describe('export', () => {
     expect(html).toMatch(/<strong style="color:#/);
   });
 
+  it('可選擇不匯出待辦事項（該段標題與內容都不出現）', () => {
+    const html = meetingToHtmlBody(meeting, { actionItems: false });
+    expect(html).not.toContain('待辦事項');
+    expect(html).not.toContain('處理上線 [DRI: 待指派]');
+    // 其他段落不受影響
+    expect(html).toContain('會議重點');
+    expect(html).toContain('會議提問');
+    expect(html).toContain('逐字稿');
+  });
+
+  it('可同時關閉多段，只留逐字稿', () => {
+    const html = meetingToHtmlBody(meeting, { actionItems: false, mainPoints: false, qa: false });
+    expect(html).not.toContain('待辦事項');
+    expect(html).not.toContain('會議重點');
+    expect(html).not.toContain('會議提問');
+    expect(html).toContain('逐字稿');
+    expect(html).toContain(meeting.title); // 標題與日期一律保留
+  });
+
+  it('未指定選項時四段全出（維持原行為）', () => {
+    const html = meetingToHtmlBody(meeting);
+    expect(html).toContain('待辦事項');
+    expect(html).toContain('會議重點');
+    expect(html).toContain('會議提問');
+    expect(html).toContain('逐字稿');
+  });
+
   it('safeFileName 去除非法字元', () => {
     expect(safeFileName('客說會/2026:上線?')).toBe('客說會_2026_上線_');
   });
