@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { meetingToHtmlBody, fullHtmlDoc, safeFileName, splitQA } from '../js/export.js';
+import { meetingToHtmlBody, fullHtmlDoc, safeFileName, splitQA, exportPdf } from '../js/export.js';
 
 const meeting = {
   id: '1',
@@ -88,6 +88,30 @@ describe('export', () => {
     expect(html).toContain('會議重點');
     expect(html).toContain('會議提問');
     expect(html).toContain('逐字稿');
+  });
+
+  it('列印期間把 document.title 換成會議名稱（另存 PDF 的檔名來源）', () => {
+    document.title = 'DD會議紀錄';
+    window.print = () => {};
+    exportPdf(meeting);
+    expect(document.title).toBe('產品週會');
+  });
+
+  it('afterprint 不可還原標題（iOS 會在真正存檔前就觸發，太早還原檔名就變回 App 標題）', () => {
+    document.title = 'DD會議紀錄';
+    window.print = () => {};
+    exportPdf(meeting);
+    window.dispatchEvent(new Event('afterprint'));
+    expect(document.title).toBe('產品週會');
+  });
+
+  it('使用者回到 App 有操作後才還原標題', async () => {
+    document.title = 'DD會議紀錄';
+    window.print = () => {};
+    exportPdf(meeting);
+    document.dispatchEvent(new Event('pointerdown', { bubbles: true }));
+    await new Promise((r) => setTimeout(r, 5));
+    expect(document.title).toBe('DD會議紀錄');
   });
 
   it('safeFileName 去除非法字元', () => {
