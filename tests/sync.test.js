@@ -126,6 +126,33 @@ describe('pull（防資料清空）', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
+  // GitHub 的 contents 回應帶 cache-control: max-age=60 但「沒有 Vary: Accept」，
+  // 瀏覽器因此把兩次請求視為同一份快取 → raw 重抓會拿到第一次的 metadata（沒有 meetings）
+  // → 誤判成「雲端資料格式異常」。兩次請求都必須繞過 HTTP 快取。
+  it('兩次請求都要繞過 HTTP 快取，raw 重抓還要有不同的網址（否則會拿到快取的 metadata）', async () => {
+    const doc = { meetings: [{ id: '1', createdAt: 1 }], deleted: [] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(resp({ content: '', encoding: 'none', sha: 'SHA1' }))
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify(doc) });
+    vi.stubGlobal('fetch', fetchMock);
+    await pull();
+    expect(fetchMock.mock.calls[0][1].cache).toBe('no-store');
+    expect(fetchMock.mock.calls[1][1].cache).toBe('no-store');
+    // raw 重抓的網址必須與第一次不同，快取才不可能命中
+    expect(fetchMock.mock.calls[1][0]).not.toBe(fetchMock.mock.calls[0][0]);
+  });
+
+  it('raw 重抓拿到 metadata（快取污染的徵狀）→ 丟出看得懂的錯誤，不是含糊的格式異常', async () => {
+    const meta = { name: 'meetings.json', path: 'meetings.json', sha: 'S', size: 1234567, content: '', encoding: 'none' };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(resp({ content: '', encoding: 'none', sha: 'S' }))
+      .mockResolvedValueOnce({ ok: true, status: 200, text: async () => JSON.stringify(meta) });
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(pull()).rejects.toThrow(/快取/);
+  });
+
   it('內容壞掉（JSON 解析失敗）→ 丟錯中止，絕不 fallback 成空文件', async () => {
     const fetchMock = vi.fn().mockResolvedValue({ ok: true, status: 200, text: async () => '{壞掉的', json: async () => ({ content: '', encoding: 'none', sha: 'S' }) });
     vi.stubGlobal('fetch', fetchMock);
