@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { meetingToHtmlBody, fullHtmlDoc, safeFileName, splitQA, exportPdf } from '../js/export.js';
 
 const meeting = {
@@ -112,6 +112,44 @@ describe('export', () => {
     document.dispatchEvent(new Event('pointerdown', { bubbles: true }));
     await new Promise((r) => setTimeout(r, 5));
     expect(document.title).toBe('DD會議紀錄');
+  });
+
+  // iOS 主畫面 App（standalone）的列印名稱取自 manifest 的 App 名稱，不吃 document.title，
+  // 所以改開一般 Safari 分頁列印；桌機維持就地列印（已驗證可用，不要動它）。
+  it('iOS standalone：改開新分頁列印，不動原頁面的 document.title', () => {
+    document.title = 'DD會議紀錄';
+    const written = [];
+    const fakeWin = { document: { write: (h) => written.push(h), close: () => {} } };
+    const openSpy = vi.spyOn(window, 'open').mockReturnValue(fakeWin);
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)');
+    navigator.standalone = true;
+    let printed = false;
+    window.print = () => (printed = true);
+
+    expect(exportPdf(meeting)).toBe('newtab');
+    expect(openSpy).toHaveBeenCalled();
+    expect(written.join('')).toContain('<title>產品週會</title>'); // 新分頁的標題＝檔名來源
+    expect(printed).toBe(false); // 不在原頁面列印
+    expect(document.title).toBe('DD會議紀錄'); // 原頁面標題不受影響
+
+    delete navigator.standalone;
+    vi.restoreAllMocks();
+  });
+
+  it('iOS standalone 但新分頁被擋 → 退回原本的就地列印', () => {
+    document.title = 'DD會議紀錄';
+    vi.spyOn(window, 'open').mockReturnValue(null);
+    vi.spyOn(navigator, 'userAgent', 'get').mockReturnValue('Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X)');
+    navigator.standalone = true;
+    let printed = false;
+    window.print = () => (printed = true);
+
+    expect(exportPdf(meeting)).not.toBe('newtab');
+    expect(printed).toBe(true);
+    expect(document.title).toBe('產品週會');
+
+    delete navigator.standalone;
+    vi.restoreAllMocks();
   });
 
   it('safeFileName 去除非法字元', () => {
