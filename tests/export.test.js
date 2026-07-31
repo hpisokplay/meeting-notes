@@ -129,6 +129,9 @@ describe('export', () => {
     expect(exportPdf(meeting)).toBe('newtab');
     expect(openSpy).toHaveBeenCalled();
     expect(written.join('')).toContain('<title>產品週會</title>'); // 新分頁的標題＝檔名來源
+    // iOS 開的新視窗沒有 Safari 工具列 → 這一頁必須自備列印與關閉，否則使用者會卡住
+    expect(written.join('')).toContain('window.print()');
+    expect(written.join('')).toContain('window.close()');
     expect(printed).toBe(false); // 不在原頁面列印
     expect(document.title).toBe('DD會議紀錄'); // 原頁面標題不受影響
 
