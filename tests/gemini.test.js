@@ -1,11 +1,14 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, requestAbort, clearAbort, clearModelCache, resetThinkingFlag } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { recordCooldown } from '../js/usage.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
   clearModelCache();
   resetThinkingFlag();
   clearAbort();
+  resetKeyRotation();
+  localStorage.clear();
 });
 
 const MODELS_RESPONSE = {
@@ -52,6 +55,34 @@ describe('中斷（停止辨識）', () => {
     vi.stubGlobal('fetch', fetchMock);
     const r = await regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
     expect(r.mainPoints).toEqual(['ok']);
+  });
+});
+
+describe('多金鑰輪替', () => {
+  const okResp = () => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ actionItems: [], mainPoints: ['x'], qa: [] }) }] } }] });
+  const usedKeys = (fetchMock) =>
+    fetchMock.mock.calls
+      .map((c) => String(c[0]))
+      .filter((u) => u.includes(':generateContent'))
+      .map((u) => (u.match(/key=([^&]+)/) || [])[1]);
+
+  it('連續請求輪流從不同金鑰起頭（否則第三把永遠用不到）', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValue(okResp());
+    vi.stubGlobal('fetch', fetchMock);
+    const keys = ['K1', 'K2', 'K3'];
+    await regenerateSummary([{ speaker: 's', text: 't' }], keys);
+    await regenerateSummary([{ speaker: 's', text: 't' }], keys);
+    await regenerateSummary([{ speaker: 's', text: 't' }], keys);
+    // 三次都成功 → 每次只打一把；三次應涵蓋三把不同金鑰
+    expect(new Set(usedKeys(fetchMock)).size).toBe(3);
+  });
+
+  it('冷卻中的金鑰排到最後，不會明知會 429 還先打它', async () => {
+    recordCooldown('K1', 30000); // K1 剛撞到限速
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValue(okResp());
+    vi.stubGlobal('fetch', fetchMock);
+    await regenerateSummary([{ speaker: 's', text: 't' }], ['K1', 'K2']);
+    expect(usedKeys(fetchMock)[0]).toBe('K2');
   });
 });
 
