@@ -1,6 +1,7 @@
 import 'fake-indexeddb/auto';
 import { describe, it, expect } from 'vitest';
-import { save, get, list, remove, exportAll, saveJob, getActiveJob, clearJob } from '../js/store.js';
+import { save, get, list, remove, exportAll, saveJob, getActiveJob, clearJob, applyMerged } from '../js/store.js';
+import { mergeMeeting } from '../js/sync.js';
 
 function make(id, createdAt, title) {
   return {
@@ -55,5 +56,33 @@ describe('store', () => {
     expect(job.fileUri).toBe('u');
     await clearJob('active');
     expect(await getActiveJob()).toBeNull();
+  });
+});
+
+// 同步是「讀快照 → 合併 → 整批寫回」，寫回時若直接覆蓋，
+// 同步期間才存進來的本機變更（例如專有名詞草稿）就會被舊快照吃掉。
+describe('applyMerged 不吃掉同步期間的本機變更', () => {
+  it('寫回時與當下的本機版本合併，草稿得以保留', async () => {
+    await save({
+      id: 'race1',
+      createdAt: 1,
+      updatedAt: 100,
+      editedAt: 50,
+      terms: { items: [{ t: '泰昇科技', cat: 'org', draft: '鈦昇科技' }] },
+    });
+    // 同步快照＝草稿存進來「之前」的版本
+    const snapshot = {
+      meetings: [{ id: 'race1', createdAt: 1, updatedAt: 90, editedAt: 50, terms: { items: [{ t: '泰昇科技', cat: 'org' }] } }],
+      deleted: [],
+    };
+    await applyMerged(snapshot, mergeMeeting);
+    const got = await get('race1');
+    expect(got.terms.items[0].draft).toBe('鈦昇科技');
+  });
+
+  it('沒有給合併函式時維持原本的覆寫行為', async () => {
+    await save({ id: 'race2', createdAt: 1, updatedAt: 100, title: '本機' });
+    await applyMerged({ meetings: [{ id: 'race2', createdAt: 1, updatedAt: 90, title: '快照' }], deleted: [] });
+    expect((await get('race2')).title).toBe('快照');
   });
 });
