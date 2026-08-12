@@ -57,6 +57,52 @@ describe('mergeState', () => {
     expect(m.meetings[0].transcript[0].text).toBe('修正後');
   });
 
+  // 專有名詞的草稿是「只存本機、不上雲」的暫存資料。mergeMeeting 原本只欄位級合併
+  // chat 與 translations，terms 整包由 editStamp 較新的一邊決定 → 只要雲端那份較新
+  // （例如另一台裝置動過），同步就會把本機做到一半的草稿整包蓋掉、按鈕跟著消失。
+  it('欄位級合併：terms 草稿不會被另一邊的版本蓋掉', () => {
+    const local = {
+      meetings: [{ id: 'a', createdAt: 1, updatedAt: 5, editedAt: 5,
+        terms: { items: [{ t: '泰昇科技', cat: 'org', draft: '鈦昇科技' }, { t: 'EMIB', cat: 'term' }] } }],
+      deleted: [],
+    };
+    // 雲端那份較新（另一台裝置動過），但沒有本機的草稿
+    const remote = {
+      meetings: [{ id: 'a', createdAt: 1, updatedAt: 9, editedAt: 9,
+        terms: { items: [{ t: '泰昇科技', cat: 'org' }, { t: 'EMIB', cat: 'term' }] } }],
+      deleted: [],
+    };
+    const m = mergeState(local, remote).meetings[0];
+    const t = m.terms.items.find((x) => x.t === '泰昇科技');
+    expect(t.draft).toBe('鈦昇科技');
+  });
+
+  it('欄位級合併：已套用的訂正兩邊互補，不會遺失', () => {
+    const local = {
+      meetings: [{ id: 'a', createdAt: 1, updatedAt: 9, editedAt: 9,
+        terms: { items: [{ t: 'AAA', applied: 'A1' }] } }],
+      deleted: [],
+    };
+    const remote = {
+      meetings: [{ id: 'a', createdAt: 1, updatedAt: 5, editedAt: 5,
+        terms: { items: [{ t: 'AAA', applied: 'A1' }, { t: 'BBB', applied: 'B1' }] } }],
+      deleted: [],
+    };
+    const items = mergeState(local, remote).meetings[0].terms.items;
+    expect(items.map((x) => x.t).sort()).toEqual(['AAA', 'BBB']);
+    expect(items.find((x) => x.t === 'BBB').applied).toBe('B1');
+  });
+
+  it('欄位級合併：一邊完全沒有 terms 時，另一邊的完整保留', () => {
+    const local = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 9, editedAt: 9 }], deleted: [] };
+    const remote = {
+      meetings: [{ id: 'a', createdAt: 1, updatedAt: 5, editedAt: 5, terms: { items: [{ t: 'X', draft: 'Y' }] } }],
+      deleted: [],
+    };
+    const m = mergeState(local, remote).meetings[0];
+    expect(m.terms.items[0].draft).toBe('Y');
+  });
+
   it('欄位級合併：兩台各問一個問題 → chat 以 at 聯集，都保留', () => {
     const a = { meetings: [{ id: '1', createdAt: 1, editedAt: 100, chat: [{ at: 10, q: 'Q1', a: 'A1' }] }], deleted: [] };
     const b = { meetings: [{ id: '1', createdAt: 1, editedAt: 100, chat: [{ at: 20, q: 'Q2', a: 'A2' }] }], deleted: [] };
