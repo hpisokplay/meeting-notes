@@ -774,3 +774,43 @@ describe('逐字稿時間戳', () => {
     expect(segs[2].t).toBe(30);
   });
 });
+
+describe('學習筆記的指令品質', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  const segs = Array.from({ length: 20 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
+
+  it('關鍵數據要有排除清單：議程性數量與型號／世代名稱不算數據', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(wrap({ figures: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    await enhanceNotesSection(segs, 'figures', 'KEY');
+    const body = fetchMock.mock.calls[1][1].body;
+    expect(body).toContain('不算'); // 明確的排除規則
+    expect(body).toContain('講者'); // 幾位講者這類議程性數量
+    expect(body).toContain('名稱的一部分'); // 5G、3D、B200 這類
+  });
+
+  it('一次生成的關鍵數據也套用同一套排除規則', async () => {
+    clearModelCache();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ outline: [], concepts: [], tables: [], figures: [], quiz: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    await generateNotes(segs, 'KEY');
+    const body = fetchMock.mock.calls[1][1].body;
+    expect(body).toContain('不算');
+    expect(body).toContain('名稱的一部分');
+  });
+
+  it('加強指令要強調「全部、不要精簡」，否則跟一次生成沒兩樣', async () => {
+    for (const sec of ['outline', 'concepts', 'tables', 'quiz']) {
+      clearModelCache();
+      const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(wrap({ [sec]: [] }));
+      vi.stubGlobal('fetch', fetchMock);
+      await enhanceNotesSection(segs, sec, 'KEY');
+      const body = fetchMock.mock.calls[1][1].body;
+      expect(body, `${sec} 的加強指令`).toContain('全部');
+      expect(body, `${sec} 的加強指令`).toContain('不要精簡');
+    }
+  });
+});
