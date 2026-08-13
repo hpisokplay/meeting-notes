@@ -218,3 +218,30 @@ describe('base64 UTF-8', () => {
     expect(b64decodeUtf8(withNewlines)).toBe('哈囉世界');
   });
 });
+
+// 學習筆記與 terms 一樣，必須做欄位級合併：
+// 若整包由 editStamp 較新的一邊決定，剛產生好的筆記會被另一邊的舊版本蓋掉。
+describe('mergeState：學習筆記', () => {
+  const withNotes = (id, stamp, notes) => ({ id, createdAt: 1, updatedAt: stamp, editedAt: stamp, notes });
+  const N = (title) => ({ outline: [{ title, anchor: '', points: ['p'] }], concepts: [], tables: [], figures: [], quiz: [] });
+
+  it('一邊有筆記、另一邊沒有 → 筆記保留（不論哪邊較新）', () => {
+    const local = { meetings: [withNotes('a', 5, N('本機筆記'))], deleted: [] };
+    const remote = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 9, editedAt: 9 }], deleted: [] };
+    const m = mergeState(local, remote).meetings[0];
+    expect(m.notes.outline[0].title).toBe('本機筆記');
+  });
+
+  it('兩邊都有筆記 → 取 editStamp 較新的那份（內容整份一致，不半新半舊）', () => {
+    const local = { meetings: [withNotes('a', 5, N('舊'))], deleted: [] };
+    const remote = { meetings: [withNotes('a', 9, N('新'))], deleted: [] };
+    const m = mergeState(local, remote).meetings[0];
+    expect(m.notes.outline[0].title).toBe('新');
+  });
+
+  it('兩邊都沒有筆記 → 不會憑空生出 notes 欄位', () => {
+    const local = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 5 }], deleted: [] };
+    const remote = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 9 }], deleted: [] };
+    expect(mergeState(local, remote).meetings[0].notes).toBeUndefined();
+  });
+});

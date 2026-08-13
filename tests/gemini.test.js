@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, generateNotes, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
 import { recordCooldown } from '../js/usage.js';
 
 beforeEach(() => {
@@ -584,5 +584,62 @@ describe('gemini', () => {
     file.name = 'dense.m4a';
     const result = await transcribeAndSummarize(file, 'KEY', { durationSec: 18 * 60 }); // 1 段但截斷 → 對半
     expect(result.transcript.map((s) => s.text)).toEqual(['前半', '後半']);
+  });
+});
+
+describe('generateNotes（學習筆記）', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  const full = {
+    outline: [{ title: '氣冷與水冷的取捨', anchor: '我們先看氣冷的部分', points: ['氣冷成熟可靠', '水冷單位體積解熱大'] }],
+    concepts: [{ term: 'dry-out', plain: '毛細結構供液不足導致局部乾燒', why: '決定解熱上限' }],
+    tables: [{ title: '氣冷 vs 水冷', headers: ['項目', '氣冷', '水冷'], rows: [['成本', '低', '約 5 倍'], ['漏液風險', '無', '千分之一']] }],
+    figures: ['全鋁方案實測解熱 1600W'],
+    quiz: [{ q: '為何 1300W 會出現溫度跳動？', a: '毛細回流阻力過大造成局部 dry-out。' }],
+  };
+
+  it('一次生成五區，ListModels + 一次 generate', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(wrap(full));
+    vi.stubGlobal('fetch', fetchMock);
+    const n = await generateNotes([{ speaker: '說話者1', text: '我們先看氣冷的部分' }], 'KEY');
+    expect(n.outline[0].title).toBe('氣冷與水冷的取捨');
+    expect(n.outline[0].anchor).toBe('我們先看氣冷的部分');
+    expect(n.concepts[0].term).toBe('dry-out');
+    expect(n.tables[0].headers).toEqual(['項目', '氣冷', '水冷']);
+    expect(n.tables[0].rows[1]).toEqual(['漏液風險', '無', '千分之一']);
+    expect(n.figures).toEqual(['全鋁方案實測解熱 1600W']);
+    expect(n.quiz[0].q).toContain('1300W');
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it('提示詞要求忠於逐字稿、表格列長與欄位一致、錨點用原話', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(wrap(full));
+    vi.stubGlobal('fetch', fetchMock);
+    await generateNotes([{ speaker: 's', text: 't' }], 'KEY');
+    const body = fetchMock.mock.calls[1][1].body;
+    expect(body).toContain('原話');
+    expect(body).toContain('相同');
+    expect(body).toContain('不可自行');
+  });
+
+  it('模型把表格列回成字串時自動拆成欄位（用 | 分隔）', async () => {
+    const odd = { ...full, tables: [{ title: 'T', headers: ['A', 'B'], rows: ['x | y', 'z | w'] }] };
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)).mockResolvedValueOnce(wrap(odd));
+    vi.stubGlobal('fetch', fetchMock);
+    const n = await generateNotes([{ speaker: 's', text: 't' }], 'KEY');
+    expect(n.tables[0].rows).toEqual([['x', 'y'], ['z', 'w']]);
+  });
+
+  it('缺欄位或空表格不會壞掉，一律正規化成陣列', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ outline: [{ title: '只有標題' }], tables: [{ title: '沒有列', headers: ['A'], rows: [] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const n = await generateNotes([{ speaker: 's', text: 't' }], 'KEY');
+    expect(n.outline[0].points).toEqual([]);
+    expect(n.tables).toEqual([]); // 沒有資料列的表格直接丟掉，不顯示空殼
+    expect(n.concepts).toEqual([]);
+    expect(n.figures).toEqual([]);
+    expect(n.quiz).toEqual([]);
   });
 });
