@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, generateNotes, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
 import { recordCooldown } from '../js/usage.js';
 
 beforeEach(() => {
@@ -641,5 +641,105 @@ describe('generateNotes（學習筆記）', () => {
     expect(n.concepts).toEqual([]);
     expect(n.figures).toEqual([]);
     expect(n.quiz).toEqual([]);
+  });
+});
+
+describe('翻譯涵蓋學習筆記', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  const notes = {
+    outline: [{ title: '氣冷與水冷', anchor: '先看氣冷', points: ['氣冷可靠'] }],
+    concepts: [{ term: 'dry-out', plain: '局部乾燒', why: '決定上限' }],
+    tables: [{ title: '比較', headers: ['項目', '氣冷'], rows: [['成本', '低']] }],
+    figures: ['1600W'],
+    quiz: [{ q: '為何？', a: '因為。' }],
+  };
+
+  it('有筆記時一併翻譯，結構與陣列長度不變', async () => {
+    const en = {
+      outline: [{ title: 'Air vs Liquid Cooling', anchor: '先看氣冷', points: ['Air cooling is reliable'] }],
+      concepts: [{ term: 'dry-out', plain: 'Local dry burning', why: 'Sets the ceiling' }],
+      tables: [{ title: 'Comparison', headers: ['Item', 'Air'], rows: [['Cost', 'Low']] }],
+      figures: ['1600W'],
+      quiz: [{ q: 'Why?', a: 'Because.' }],
+    };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ actionItems: [], mainPoints: ['point'], qa: [] })) // 摘要
+      .mockResolvedValueOnce(wrap(en)) // 學習筆記
+      .mockResolvedValueOnce(wrap({ segments: [{ speaker: 'Speaker 1', text: 'Hello' }] })); // 逐字稿
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await translateMeeting([{ speaker: '說話者1', text: '哈囉' }], { mainPoints: ['重點'] }, 'en', 'KEY', { notes });
+    expect(r.notes.outline[0].title).toBe('Air vs Liquid Cooling');
+    expect(r.notes.tables[0].rows[0]).toEqual(['Cost', 'Low']);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
+  });
+
+  it('沒有筆記時不會多打一次（維持原本次數）', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ actionItems: [], mainPoints: ['point'], qa: [] }))
+      .mockResolvedValueOnce(wrap({ segments: [{ speaker: 'Speaker 1', text: 'Hello' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await translateMeeting([{ speaker: '說話者1', text: '哈囉' }], { mainPoints: ['重點'] }, 'en', 'KEY');
+    expect(r.notes).toBeUndefined();
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+  });
+});
+
+describe('enhanceNotesSection（學習筆記分區加強）', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  // 160 段 → 每 80 段一批 → 兩批
+  const longSegs = Array.from({ length: 160 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
+
+  it('分批掃過整份逐字稿，概念以 term 跨批去重', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ concepts: [{ term: 'dry-out', plain: '局部乾燒' }, { term: 'TSV', plain: '矽穿孔' }] }))
+      .mockResolvedValueOnce(wrap({ concepts: [{ term: 'dry-out', plain: '重複的' }, { term: 'CoWoS', plain: '封裝' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceNotesSection(longSegs, 'concepts', 'KEY');
+    expect(r.map((x) => x.term)).toEqual(['dry-out', 'TSV', 'CoWoS']);
+    expect(r[0].plain).toBe('局部乾燒'); // 先出現的保留
+    expect(fetchMock).toHaveBeenCalledTimes(3); // ListModels + 2 批
+  });
+
+  it('章節大綱依講述順序串接，相鄰同名章節合併', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ outline: [{ title: '氣冷', anchor: 'a1', points: ['p1'] }, { title: '水冷', anchor: 'a2', points: ['p2'] }] }))
+      .mockResolvedValueOnce(wrap({ outline: [{ title: '水冷', anchor: 'a3', points: ['p3'] }, { title: '成本', anchor: 'a4', points: ['p4'] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceNotesSection(longSegs, 'outline', 'KEY');
+    expect(r.map((x) => x.title)).toEqual(['氣冷', '水冷', '成本']);
+    expect(r[1].points).toEqual(['p2', 'p3']); // 跨批的同一章節合併重點
+    expect(r[1].anchor).toBe('a2'); // 錨點取最先出現的
+  });
+
+  it('表格以標題去重、關鍵數據以字串去重', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ tables: [{ title: '比較', headers: ['A'], rows: [['1']] }], figures: ['1600W'] }))
+      .mockResolvedValueOnce(wrap({ tables: [{ title: '比較', headers: ['A'], rows: [['9']] }], figures: ['1600W', '5 倍'] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const t = await enhanceNotesSection(longSegs, 'tables', 'KEY');
+    expect(t).toHaveLength(1);
+    clearModelCache();
+    const fetchMock2 = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ figures: ['1600W'] }))
+      .mockResolvedValueOnce(wrap({ figures: ['1600W', '5 倍'] }));
+    vi.stubGlobal('fetch', fetchMock2);
+    const f = await enhanceNotesSection(longSegs, 'figures', 'KEY');
+    expect(f).toEqual(['1600W', '5 倍']);
+  });
+
+  it('未知的區塊名稱會丟錯', async () => {
+    await expect(enhanceNotesSection(longSegs, 'nope', 'KEY')).rejects.toThrow('區塊');
   });
 });

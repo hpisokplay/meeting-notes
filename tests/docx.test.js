@@ -48,3 +48,45 @@ describe('docx', () => {
     expect(findBytes(z, 'a.txt')).toBe(true);
   });
 });
+
+describe('學習筆記與表格', () => {
+  const withNotes = {
+    title: '研討會',
+    createdAt: 0,
+    transcript: [{ speaker: '講者', text: 'hi' }],
+    summary: { actionItems: [], mainPoints: [], qa: [] },
+    notes: {
+      outline: [{ title: '氣冷與水冷', points: ['氣冷可靠'] }],
+      concepts: [{ term: 'dry-out', plain: '局部乾燒', why: '決定上限' }],
+      tables: [{ title: '氣冷 vs 水冷', headers: ['項目', '氣冷'], rows: [['成本', '低'], ['漏液', '無']] }],
+      figures: ['1600W'],
+      quiz: [{ q: '為何？', a: '因為。' }],
+    },
+  };
+  const xml = (m, opts) => {
+    const bytes = buildDocxBytes(m, opts);
+    return new TextDecoder().decode(bytes);
+  };
+
+  it('勾選學習筆記時產生真正的 Word 表格（w:tbl）', () => {
+    const s = xml(withNotes, { notes: true });
+    expect(s).toContain('<w:tbl>');
+    expect(s).toContain('<w:tblGrid>');
+    expect(s).toContain('氣冷 vs 水冷');
+    expect(s).toContain('章節大綱');
+    expect(s).toContain('dry-out');
+  });
+
+  it('預設不輸出學習筆記，也不會有表格', () => {
+    const s = xml(withNotes);
+    expect(s).not.toContain('<w:tbl>');
+    expect(s).not.toContain('章節大綱');
+  });
+
+  it('表格列比欄位少時補空白，不會產生破損的 XML', () => {
+    const m = { ...withNotes, notes: { ...withNotes.notes, tables: [{ title: 'T', headers: ['A', 'B', 'C'], rows: [['1']] }] } };
+    const s = xml(m, { notes: true });
+    const cells = (s.match(/<w:tc>/g) || []).length;
+    expect(cells).toBe(6); // 3 欄標題 + 3 欄資料（缺的補空）
+  });
+});

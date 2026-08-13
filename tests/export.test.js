@@ -164,3 +164,45 @@ describe('export', () => {
     expect(html).toContain('a&lt;b&gt;&amp;c');
   });
 });
+
+describe('學習筆記匯出', () => {
+  const withNotes = {
+    ...meeting,
+    notes: {
+      outline: [{ title: '氣冷與水冷', anchor: 'a', points: ['氣冷可靠', '水冷解熱大'] }],
+      concepts: [{ term: 'dry-out', plain: '局部乾燒', why: '決定解熱上限' }],
+      tables: [{ title: '氣冷 vs 水冷', headers: ['項目', '氣冷', '水冷'], rows: [['成本', '低', '5 倍'], ['漏液', '無', '千分之一']] }],
+      figures: ['實測 1600W'],
+      quiz: [{ q: '為何水冷貴？', a: '管件安裝成本高。' }],
+    },
+  };
+
+  it('勾選學習筆記時，五區與真正的 <table> 都出現', () => {
+    const html = meetingToHtmlBody(withNotes, { notes: true });
+    expect(html).toContain('章節大綱');
+    expect(html).toContain('重要概念');
+    expect(html).toContain('對照表');
+    expect(html).toContain('關鍵數據');
+    expect(html).toContain('自我測驗');
+    expect(html).toContain('<table>');
+    expect(html).toContain('<th>項目</th>');
+    expect(html).toContain('<td>千分之一</td>');
+    expect(html).toContain('dry-out');
+  });
+
+  it('預設（未指定）不輸出學習筆記，維持舊行為', () => {
+    const html = meetingToHtmlBody(withNotes);
+    expect(html).not.toContain('章節大綱');
+  });
+
+  it('只勾學習筆記時，會議三區不出現', () => {
+    const html = meetingToHtmlBody(withNotes, { actionItems: false, mainPoints: false, qa: false, transcript: false, notes: true });
+    expect(html).not.toContain('待辦事項');
+    expect(html).not.toContain('逐字稿');
+    expect(html).toContain('章節大綱');
+  });
+
+  it('沒有筆記的會議勾了也不會壞掉', () => {
+    expect(() => meetingToHtmlBody(meeting, { notes: true })).not.toThrow();
+  });
+});
