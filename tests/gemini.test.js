@@ -814,3 +814,47 @@ describe('學習筆記的指令品質', () => {
     }
   });
 });
+
+describe('錯誤訊息與 400→429 的處理', () => {
+  it('400(thinking) 重試後變 429 → 視為暫時性換金鑰重試，不可報成「檔案格式不支援」', async () => {
+    const ok = { candidates: [{ content: { parts: [{ text: JSON.stringify({ actionItems: [], mainPoints: ['ok'], qa: [] }) }] } }] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
+      .mockResolvedValueOnce(errResponse(400, { error: { code: 400, status: 'INVALID_ARGUMENT' } })) // K1 帶 thinking → 400
+      .mockResolvedValueOnce(errResponse(429, { error: { code: 429, message: 'You exceeded your current quota' } })) // K1 去掉 thinking → 429
+      .mockResolvedValueOnce(jsonResponse(ok)); // K2 → 成功
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await regenerateSummary([{ speaker: 's', text: 't' }], ['K1', 'K2']);
+    expect(r.mainPoints).toEqual(['ok']);
+  });
+
+  it('純文字請求（沒有音檔）的 400，錯誤訊息不可叫使用者換音檔', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(400, { error: { code: 400, message: 'bad request' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(regenerateSummary([{ speaker: 's', text: 't' }], 'KEY')).rejects.toThrow(/失敗 \(400\)/);
+    await expect(regenerateSummary([{ speaker: 's', text: 't' }], 'KEY')).rejects.not.toThrow(/音檔/);
+  });
+
+  it('額度用盡（429）最終仍失敗時，訊息要講額度而不是檔案格式', async () => {
+    // 重試退避總共會等 80 秒 → 用假時鐘快轉，否則測試會逾時
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(429, { error: { code: 429, message: 'You exceeded your current quota' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/額度/);
+    expect(String(err.message)).not.toMatch(/音檔.*格式/);
+  });
+});
