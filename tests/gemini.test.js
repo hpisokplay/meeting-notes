@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
 import { recordCooldown } from '../js/usage.js';
 
 beforeEach(() => {
@@ -741,5 +741,36 @@ describe('enhanceNotesSection（學習筆記分區加強）', () => {
 
   it('未知的區塊名稱會丟錯', async () => {
     await expect(enhanceNotesSection(longSegs, 'nope', 'KEY')).rejects.toThrow('區塊');
+  });
+});
+
+describe('逐字稿時間戳', () => {
+  const segResp2 = (segs) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ segments: segs }) }] } }] });
+
+  it('提示詞要求每段標秒數（相對於這個音檔開頭），且時間戳為選填', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(segResp2([{ speaker: '講者', text: '哈囉', t: 12 }]));
+    vi.stubGlobal('fetch', fetchMock);
+    const segs = await transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/mp4', 'gemini-3.5-flash', 0, 600, false);
+    expect(segs[0].t).toBe(12);
+    const body = fetchMock.mock.calls[0][1].body;
+    expect(body).toContain('秒數');
+    expect(body).toContain('音檔開頭');
+  });
+
+  it('模型沒給時間戳也不會壞掉（欄位就是不存在）', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(segResp2([{ speaker: '講者', text: '哈囉' }]));
+    vi.stubGlobal('fetch', fetchMock);
+    const segs = await transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/mp4', 'gemini-3.5-flash', 0, 600, false);
+    expect(segs[0].text).toBe('哈囉');
+    expect(segs[0].t).toBeUndefined();
+  });
+
+  it('時間戳為負或非數字會被丟掉，不會顯示成亂碼', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(segResp2([{ speaker: 'a', text: 'x', t: -5 }, { speaker: 'b', text: 'y', t: 'abc' }, { speaker: 'c', text: 'z', t: 30 }]));
+    vi.stubGlobal('fetch', fetchMock);
+    const segs = await transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/mp4', 'gemini-3.5-flash', 0, 600, false);
+    expect(segs[0].t).toBeUndefined();
+    expect(segs[1].t).toBeUndefined();
+    expect(segs[2].t).toBe(30);
   });
 });

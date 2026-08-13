@@ -115,3 +115,65 @@ describe('app（整合）', () => {
     expect(gHtml).toContain('未分類');
   });
 });
+
+// 跳到逐字稿出處時，整段閃爍還是看不出是哪一句（段落常常很長）。
+// bestSentence 在段落內再往下找一層，指出最相符的那一句。
+describe('bestSentence（段落內精準定位）', () => {
+  it('從長段落中找出最相符的那一句', async () => {
+    const appMod = await import('../js/app.js');
+    const seg = '我們先看氣冷的部分。氣冷行之有年、可靠度高、成本也低。但在有限空間內，單位體積解熱能力已經無法支援更高發熱量的 GPU。';
+    const hit = appMod.bestSentence('氣冷在有限空間內單位體積解熱能力不足', seg);
+    expect(hit).toContain('單位體積解熱能力');
+    expect(hit).not.toContain('我們先看氣冷的部分');
+  });
+
+  it('英文句子用句點斷句也可以', async () => {
+    const appMod = await import('../js/app.js');
+    const seg = 'We looked at air cooling first. Liquid cooling has a leak risk of about one in a thousand.';
+    expect(appMod.bestSentence('leak risk one in a thousand', seg)).toContain('leak risk');
+  });
+
+  it('完全比不上時回傳空字串（不要亂標）', async () => {
+    const appMod = await import('../js/app.js');
+    expect(appMod.bestSentence('完全無關的內容 zzz', '甲乙丙。丁戊己。')).toBe('');
+  });
+
+  it('段落只有一句時就回傳那一句', async () => {
+    const appMod = await import('../js/app.js');
+    expect(appMod.bestSentence('氣冷可靠', '氣冷行之有年可靠度高')).toBe('氣冷行之有年可靠度高');
+  });
+});
+
+// 專有名詞套用時，學習筆記也必須一起訂正——否則逐字稿改對了、筆記還是錯字。
+describe('applyTermInNotes（訂正也要套到學習筆記）', () => {
+  const notes = () => ({
+    outline: [{ title: '泰昇科技的方案', anchor: '泰昇科技提到', points: ['泰昇科技用全鋁'] }],
+    concepts: [{ term: '泰昇科技', plain: '泰昇科技是散熱廠', why: '本案主角' }],
+    tables: [{ title: '泰昇科技 vs 他廠', headers: ['項目', '泰昇科技'], rows: [['成本', '泰昇科技較低']] }],
+    figures: ['泰昇科技實測 1600W'],
+    quiz: [{ q: '泰昇科技做什麼？', a: '泰昇科技做散熱模組。' }],
+  });
+  const fix = (s) => String(s).split('泰昇科技').join('鈦昇科技');
+
+  it('五區的每一個文字欄位都會被替換', async () => {
+    const appMod = await import('../js/app.js');
+    const n = notes();
+    appMod.applyTermInNotes(n, fix);
+    expect(JSON.stringify(n)).not.toContain('泰昇科技');
+    expect(n.outline[0].title).toBe('鈦昇科技的方案');
+    expect(n.outline[0].anchor).toBe('鈦昇科技提到');
+    expect(n.outline[0].points[0]).toBe('鈦昇科技用全鋁');
+    expect(n.concepts[0].term).toBe('鈦昇科技');
+    expect(n.tables[0].headers[1]).toBe('鈦昇科技');
+    expect(n.tables[0].rows[0][1]).toBe('鈦昇科技較低');
+    expect(n.figures[0]).toContain('鈦昇科技');
+    expect(n.quiz[0].q).toContain('鈦昇科技');
+    expect(n.quiz[0].a).toContain('鈦昇科技');
+  });
+
+  it('沒有筆記時不會丟錯', async () => {
+    const appMod = await import('../js/app.js');
+    expect(() => appMod.applyTermInNotes(null, fix)).not.toThrow();
+    expect(() => appMod.applyTermInNotes({}, fix)).not.toThrow();
+  });
+});
