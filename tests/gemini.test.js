@@ -210,13 +210,14 @@ describe('extractTerms', () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE)) // ListModels
-      .mockResolvedValueOnce(wrap({ items: [{ term: '宏騰', category: 'org', fix: '宏騰科技' }, { term: 'Mikiya', category: 'person', fix: '' }] }));
+      .mockResolvedValueOnce(wrap({ items: [{ term: '宏騰', category: 'org', fix: '宏騰科技' }, { term: 'Mikiya', category: 'person', fix: '' }] }))
+      .mockResolvedValueOnce(wrap({ groups: [] })); // 分組階段：兩者無關，不歸組
     vi.stubGlobal('fetch', fetchMock);
     const r = await extractTerms([{ speaker: '說話者1', text: '宏騰跟 Mikiya 討論' }], 'KEY');
     expect(r).toHaveLength(2);
-    expect(r[0]).toEqual({ t: '宏騰', cat: 'org', fix: '宏騰科技' });
+    expect(r[0]).toEqual({ t: '宏騰', cat: 'org', fix: '宏騰科技', alts: [] });
     expect(r[1].t).toBe('Mikiya');
-    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock).toHaveBeenCalledTimes(3); // ListModels + 1 批 + 分組
   });
 });
 
@@ -856,5 +857,65 @@ describe('錯誤訊息與 400→429 的處理', () => {
     vi.useRealTimers();
     expect(String(err.message)).toMatch(/額度/);
     expect(String(err.message)).not.toMatch(/音檔.*格式/);
+  });
+});
+
+describe('專有名詞：同一實體的多種寫法歸組', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  // 160 段 → 兩批；同一家公司在不同批被聽成不同寫法
+  const segs = Array.from({ length: 160 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
+
+  it('跨批次的不同寫法歸成一組：只留一筆，其餘放進 alts', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: [{ term: '合訊', category: 'org', fix: '' }, { term: 'TSV', category: 'term', fix: '' }] }))
+      .mockResolvedValueOnce(wrap({ items: [{ term: '和迅', category: 'org', fix: '' }, { term: '禾訊', category: 'org', fix: '' }] }))
+      .mockResolvedValueOnce(wrap({ groups: [{ terms: ['合訊', '和迅', '禾訊'], best: '禾迅' }] })); // 分組階段
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await extractTerms(segs, 'KEY');
+    const org = r.find((x) => x.cat === 'org');
+    expect(org.t).toBe('合訊'); // 主寫法＝最先出現的
+    expect(org.alts.sort()).toEqual(['和迅', '禾訊']);
+    expect(org.fix).toBe('禾迅'); // 分組時順便給的建議寫法
+    expect(r.map((x) => x.t)).toEqual(['合訊', 'TSV']); // 變體不再各自佔一列
+    expect(fetchMock).toHaveBeenCalledTimes(4); // ListModels + 2 批 + 1 次分組
+  });
+
+  it('分組階段失敗不影響主流程，退回未分組的清單', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: [{ term: '合訊', category: 'org', fix: '' }, { term: '和迅', category: 'org', fix: '' }] }))
+      .mockResolvedValueOnce(wrap({ items: [] }))
+      .mockResolvedValueOnce(jsonResponse({ candidates: [{ content: { parts: [{ text: '不是JSON' }] } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await extractTerms(segs, 'KEY');
+    expect(r.map((x) => x.t)).toEqual(['合訊', '和迅']);
+  });
+
+  it('只有一個詞時不做分組（省一次呼叫）', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: [{ term: '合訊', category: 'org', fix: '' }] }))
+      .mockResolvedValueOnce(wrap({ items: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await extractTerms(segs, 'KEY');
+    expect(r).toHaveLength(1);
+    expect(fetchMock).toHaveBeenCalledTimes(3); // 沒有第 4 次
+  });
+
+  it('分組回傳不存在的詞會被忽略，不會憑空生出項目', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: [{ term: '合訊', category: 'org', fix: '' }, { term: 'TSV', category: 'term', fix: '' }] }))
+      .mockResolvedValueOnce(wrap({ items: [] }))
+      .mockResolvedValueOnce(wrap({ groups: [{ terms: ['合訊', '不存在的詞'], best: '禾迅' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await extractTerms(segs, 'KEY');
+    expect(r.find((x) => x.t === '合訊').alts).toEqual([]);
+    expect(r.map((x) => x.t)).toEqual(['合訊', 'TSV']);
   });
 });
