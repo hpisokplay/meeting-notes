@@ -177,3 +177,80 @@ describe('applyTermInNotes（訂正也要套到學習筆記）', () => {
     expect(() => appMod.applyTermInNotes({}, fix)).not.toThrow();
   });
 });
+
+// 加強有時會讓某一區變差。保留前一版並可來回切換，比單向還原安全（按錯不會失去新版）。
+describe('加強前後兩版切換', () => {
+  it('swapSectionVersion 交換目前版與備份版（兩版都留著）', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { qa: ['新A', '新B'] }, alt: { 'summary:qa': ['舊A'] } };
+    appMod.swapSectionVersion(m, 'summary', 'qa');
+    expect(m.summary.qa).toEqual(['舊A']);
+    expect(m.alt['summary:qa']).toEqual(['新A', '新B']);
+    // 再換一次回到原狀
+    appMod.swapSectionVersion(m, 'summary', 'qa');
+    expect(m.summary.qa).toEqual(['新A', '新B']);
+    expect(m.alt['summary:qa']).toEqual(['舊A']);
+  });
+
+  it('學習筆記各區也適用，且互不影響', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { notes: { concepts: [{ term: '新' }], figures: ['F'] }, alt: { 'notes:concepts': [{ term: '舊' }] } };
+    appMod.swapSectionVersion(m, 'notes', 'concepts');
+    expect(m.notes.concepts).toEqual([{ term: '舊' }]);
+    expect(m.notes.figures).toEqual(['F']); // 其他區不動
+  });
+
+  it('沒有備份版時不做任何事', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { qa: ['A'] } };
+    expect(appMod.swapSectionVersion(m, 'summary', 'qa')).toBe(false);
+    expect(m.summary.qa).toEqual(['A']);
+  });
+
+  it('removeSectionItem 刪掉指定位置的那一條', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { mainPoints: ['一', '二', '三'] } };
+    appMod.removeSectionItem(m, 'summary', 'mainPoints', 1);
+    expect(m.summary.mainPoints).toEqual(['一', '三']);
+    // 超出範圍不會壞掉
+    appMod.removeSectionItem(m, 'summary', 'mainPoints', 9);
+    expect(m.summary.mainPoints).toEqual(['一', '三']);
+  });
+});
+
+// 有時候兩版各有好料 → 合併聯集去重，再由使用者刪掉多餘的
+describe('合併兩版', () => {
+  it('字串清單：聯集去重，目前版在前', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { qa: ['問A 答a', '問B 答b'] }, alt: { 'summary:qa': ['問B 答b', '問C 答c'] } };
+    appMod.mergeSectionVersions(m, 'summary', 'qa');
+    expect(m.summary.qa).toEqual(['問A 答a', '問B 答b', '問C 答c']);
+  });
+
+  it('物件清單：概念以名詞去重、測驗以題目去重', async () => {
+    const appMod = await import('../js/app.js');
+    const m = {
+      notes: { concepts: [{ term: 'A', plain: '新的' }], quiz: [{ q: 'Q1', a: 'a1' }] },
+      alt: { 'notes:concepts': [{ term: 'A', plain: '舊的' }, { term: 'B', plain: 'b' }] },
+    };
+    appMod.mergeSectionVersions(m, 'notes', 'concepts');
+    expect(m.notes.concepts.map((x) => x.term)).toEqual(['A', 'B']);
+    expect(m.notes.concepts[0].plain).toBe('新的'); // 重複時保留目前版
+  });
+
+  it('合併後仍可用切換退回合併前', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { qa: ['新'] }, alt: { 'summary:qa': ['舊'] } };
+    appMod.mergeSectionVersions(m, 'summary', 'qa');
+    expect(m.summary.qa).toEqual(['新', '舊']);
+    appMod.swapSectionVersion(m, 'summary', 'qa');
+    expect(m.summary.qa).toEqual(['新']); // 退回合併前的目前版
+  });
+
+  it('沒有備份版時不做任何事', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { qa: ['A'] } };
+    expect(appMod.mergeSectionVersions(m, 'summary', 'qa')).toBe(false);
+    expect(m.summary.qa).toEqual(['A']);
+  });
+});

@@ -245,3 +245,25 @@ describe('mergeState：學習筆記', () => {
     expect(mergeState(local, remote).meetings[0].notes).toBeUndefined();
   });
 });
+
+
+// 加強前的備份版（alt）也要保住，否則同步一次就沒得換回去了
+describe('mergeState：加強前的備份版', () => {
+  it('一邊有備份版、另一邊沒有 → 保留（不論哪邊較新）', () => {
+    const local = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 5, editedAt: 5, alt: { 'summary:qa': ['舊'] } }], deleted: [] };
+    const remote = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 9, editedAt: 9 }], deleted: [] };
+    expect(mergeState(local, remote).meetings[0].alt['summary:qa']).toEqual(['舊']);
+  });
+
+  it('兩邊都有 → 取 editStamp 較新的那份', () => {
+    const local = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 9, editedAt: 9, alt: { 'summary:qa': ['新的備份'] } }], deleted: [] };
+    const remote = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 5, editedAt: 5, alt: { 'summary:qa': ['舊的備份'] } }], deleted: [] };
+    expect(mergeState(local, remote).meetings[0].alt['summary:qa']).toEqual(['新的備份']);
+  });
+
+  it('兩邊都沒有 → 不會憑空生出 alt', () => {
+    const local = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 5 }], deleted: [] };
+    const remote = { meetings: [{ id: 'a', createdAt: 1, updatedAt: 9 }], deleted: [] };
+    expect(mergeState(local, remote).meetings[0].alt).toBeUndefined();
+  });
+});
