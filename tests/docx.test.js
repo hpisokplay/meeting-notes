@@ -59,7 +59,7 @@ describe('學習筆記與表格', () => {
       outline: [{ title: '氣冷與水冷', points: ['氣冷可靠'] }],
       concepts: [{ term: 'dry-out', plain: '局部乾燒', why: '決定上限' }],
       tables: [{ title: '氣冷 vs 水冷', headers: ['項目', '氣冷'], rows: [['成本', '低'], ['漏液', '無']] }],
-      figures: ['1600W'],
+      figures: [{ group: '效能', label: '解熱能力', value: '1600 W' }, { group: '市場', label: '預估規模', value: '81.1 億美元' }],
       quiz: [{ q: '為何？', a: '因為。' }],
     },
   };
@@ -74,6 +74,8 @@ describe('學習筆記與表格', () => {
     expect(s).toContain('<w:tblGrid>');
     expect(s).toContain('氣冷 vs 水冷');
     expect(s).toContain('章節大綱');
+    expect(s).toContain('解熱能力'); // 關鍵數據的標籤
+    expect(s).toContain('<w:jc w:val="right"/>'); // 數值靠右對齊
     expect(s).toContain('dry-out');
   });
 
@@ -84,7 +86,8 @@ describe('學習筆記與表格', () => {
   });
 
   it('表格列比欄位少時補空白，不會產生破損的 XML', () => {
-    const m = { ...withNotes, notes: { ...withNotes.notes, tables: [{ title: 'T', headers: ['A', 'B', 'C'], rows: [['1']] }] } };
+    // 只留對照表（清空關鍵數據），儲存格數才只反映這張表
+    const m = { ...withNotes, notes: { ...withNotes.notes, figures: [], tables: [{ title: 'T', headers: ['A', 'B', 'C'], rows: [['1']] }] } };
     const s = xml(m, { notes: true });
     const cells = (s.match(/<w:tc>/g) || []).length;
     expect(cells).toBe(6); // 3 欄標題 + 3 欄資料（缺的補空）

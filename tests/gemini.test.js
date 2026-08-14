@@ -594,7 +594,7 @@ describe('generateNotes（學習筆記）', () => {
     outline: [{ title: '氣冷與水冷的取捨', anchor: '我們先看氣冷的部分', points: ['氣冷成熟可靠', '水冷單位體積解熱大'] }],
     concepts: [{ term: 'dry-out', plain: '毛細結構供液不足導致局部乾燒', why: '決定解熱上限' }],
     tables: [{ title: '氣冷 vs 水冷', headers: ['項目', '氣冷', '水冷'], rows: [['成本', '低', '約 5 倍'], ['漏液風險', '無', '千分之一']] }],
-    figures: ['全鋁方案實測解熱 1600W'],
+    figures: [{ group: '效能', label: '全鋁方案實測解熱', value: '1600 W' }],
     quiz: [{ q: '為何 1300W 會出現溫度跳動？', a: '毛細回流阻力過大造成局部 dry-out。' }],
   };
 
@@ -607,7 +607,7 @@ describe('generateNotes（學習筆記）', () => {
     expect(n.concepts[0].term).toBe('dry-out');
     expect(n.tables[0].headers).toEqual(['項目', '氣冷', '水冷']);
     expect(n.tables[0].rows[1]).toEqual(['漏液風險', '無', '千分之一']);
-    expect(n.figures).toEqual(['全鋁方案實測解熱 1600W']);
+    expect(n.figures).toEqual([{ group: '效能', label: '全鋁方案實測解熱', value: '1600 W' }]);
     expect(n.quiz[0].q).toContain('1300W');
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
@@ -724,8 +724,8 @@ describe('enhanceNotesSection（學習筆記分區加強）', () => {
     const fetchMock = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
-      .mockResolvedValueOnce(wrap({ tables: [{ title: '比較', headers: ['A'], rows: [['1']] }], figures: ['1600W'] }))
-      .mockResolvedValueOnce(wrap({ tables: [{ title: '比較', headers: ['A'], rows: [['9']] }], figures: ['1600W', '5 倍'] }));
+      .mockResolvedValueOnce(wrap({ tables: [{ title: '比較', headers: ['A'], rows: [['1']] }] }))
+      .mockResolvedValueOnce(wrap({ tables: [{ title: '比較', headers: ['A'], rows: [['9']] }] }));
     vi.stubGlobal('fetch', fetchMock);
     const t = await enhanceNotesSection(longSegs, 'tables', 'KEY');
     expect(t).toHaveLength(1);
@@ -733,11 +733,11 @@ describe('enhanceNotesSection（學習筆記分區加強）', () => {
     const fetchMock2 = vi
       .fn()
       .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
-      .mockResolvedValueOnce(wrap({ figures: ['1600W'] }))
-      .mockResolvedValueOnce(wrap({ figures: ['1600W', '5 倍'] }));
+      .mockResolvedValueOnce(wrap({ figures: [{ group: 'g', label: '解熱能力', value: '1600 W' }] }))
+      .mockResolvedValueOnce(wrap({ figures: [{ group: 'g', label: '解熱能力', value: '1600 W' }, { group: 'g', label: '成本倍數', value: '5 倍' }] }));
     vi.stubGlobal('fetch', fetchMock2);
     const f = await enhanceNotesSection(longSegs, 'figures', 'KEY');
-    expect(f).toEqual(['1600W', '5 倍']);
+    expect(f.map((x) => x.label)).toEqual(['解熱能力', '成本倍數']); // 跨批以 label 去重
   });
 
   it('未知的區塊名稱會丟錯', async () => {
@@ -917,5 +917,68 @@ describe('專有名詞：同一實體的多種寫法歸組', () => {
     const r = await extractTerms(segs, 'KEY');
     expect(r.find((x) => x.t === '合訊').alts).toEqual([]);
     expect(r.map((x) => x.t)).toEqual(['合訊', 'TSV']);
+  });
+});
+
+describe('關鍵數據改為「分組＋標籤／數值」結構', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  const segs = Array.from({ length: 20 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
+
+  it('新結構：每筆有 group／label／value', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(
+        wrap({
+          outline: [], concepts: [], tables: [], quiz: [],
+          figures: [
+            { group: '市場規模', label: '2024 年 FOPLP／GCS', value: '6.51 億美元' },
+            { group: '市場規模', label: '2030 年（預估）', value: '81.1 億美元' },
+            { group: '公司與團隊', label: '東捷科技成立', value: '1998 年' },
+          ],
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const n = await generateNotes(segs, 'KEY');
+    expect(n.figures[0]).toEqual({ group: '市場規模', label: '2024 年 FOPLP／GCS', value: '6.51 億美元' });
+    expect(n.figures.map((f) => f.group)).toEqual(['市場規模', '市場規模', '公司與團隊']);
+  });
+
+  it('舊資料（純字串）自動轉成新結構，不會壞掉', async () => {
+    clearModelCache();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ outline: [], concepts: [], tables: [], quiz: [], figures: ['10.8%：志聖投資東捷科技之持股比例', '沒有冒號的舊資料'] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const n = await generateNotes(segs, 'KEY');
+    // 舊格式是「數值：說明」→ 轉成標籤在前、數值在後
+    expect(n.figures[0]).toEqual({ group: '', label: '志聖投資東捷科技之持股比例', value: '10.8%' });
+    expect(n.figures[1]).toEqual({ group: '', label: '沒有冒號的舊資料', value: '' });
+  });
+
+  it('缺 label 或 value 的項目會被丟掉，不留半截資料', async () => {
+    clearModelCache();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ outline: [], concepts: [], tables: [], quiz: [], figures: [{ group: 'g', label: '', value: '5%' }, { group: 'g', label: 'ok', value: '1 年' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const n = await generateNotes(segs, 'KEY');
+    expect(n.figures).toHaveLength(1);
+    expect(n.figures[0].label).toBe('ok');
+  });
+
+  it('提示詞要求分組，並把「兩者比較」的數據改放對照表', async () => {
+    clearModelCache();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ outline: [], concepts: [], tables: [], figures: [], quiz: [] }));
+    vi.stubGlobal('fetch', fetchMock);
+    await generateNotes(segs, 'KEY');
+    const body = fetchMock.mock.calls[1][1].body;
+    expect(body).toContain('group');
+    expect(body).toContain('對照表'); // 比較型改放表格
   });
 });

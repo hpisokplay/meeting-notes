@@ -172,7 +172,7 @@ describe('學習筆記匯出', () => {
       outline: [{ title: '氣冷與水冷', anchor: 'a', points: ['氣冷可靠', '水冷解熱大'] }],
       concepts: [{ term: 'dry-out', plain: '局部乾燒', why: '決定解熱上限' }],
       tables: [{ title: '氣冷 vs 水冷', headers: ['項目', '氣冷', '水冷'], rows: [['成本', '低', '5 倍'], ['漏液', '無', '千分之一']] }],
-      figures: ['實測 1600W'],
+      figures: [{ group: '效能', label: '全鋁方案實測解熱', value: '1600 W' }, { group: '市場', label: '2030 年預估規模', value: '81.1 億美元' }],
       quiz: [{ q: '為何水冷貴？', a: '管件安裝成本高。' }],
     },
   };
@@ -183,6 +183,9 @@ describe('學習筆記匯出', () => {
     expect(html).toContain('重要概念');
     expect(html).toContain('對照表');
     expect(html).toContain('關鍵數據');
+    expect(html).toContain('<td>全鋁方案實測解熱</td>');
+    expect(html).toContain('class="fv">1600 W</td>'); // 數值靠右欄
+    expect(html).toContain('效能'); // 分組標題
     expect(html).toContain('自我測驗');
     expect(html).toContain('<table>');
     expect(html).toContain('<th>項目</th>');
