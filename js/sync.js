@@ -265,7 +265,9 @@ export async function pull() {
 }
 
 // 上雲前把「翻譯」拿掉：翻譯是衍生資料（各裝置可自行重翻），且通常占整份體積一半以上。
-// 不上雲 → 雲端檔案大幅變小、更慢碰到 GitHub 1MB 界線，也減少多裝置合併衝突。
+// 不上雲 → 雲端檔案大幅變小。注意：1MB 不是容量上限，只是 Contents API 的回應格式門檻
+// （超過就要改用 raw media type 取內容，見 pull()）；此 API 讀取的真正上限是 100MB。
+// 檔案小的實際好處是每次同步的傳輸量與耗時較低，以及減少多裝置合併衝突。
 // （本機 IndexedDB 仍保留完整翻譯，這裡只影響推到 GitHub 的內容。）
 export function stripForCloud(doc) {
   return {
