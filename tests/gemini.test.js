@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
-import { recordCooldown } from '../js/usage.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
@@ -980,5 +980,46 @@ describe('關鍵數據改為「分組＋標籤／數值」結構', () => {
     const body = fetchMock.mock.calls[1][1].body;
     expect(body).toContain('group');
     expect(body).toContain('對照表'); // 比較型改放表格
+  });
+});
+
+describe('上傳金鑰數上限（避免金鑰一多就上傳爆炸）', () => {
+  it('金鑰超過上限時只挑幾把上傳，不是每把都傳', () => {
+    const keys = ['K1', 'K2', 'K3', 'K4', 'K5', 'K6'].map((k) => ({ name: k, key: k }));
+    expect(pickUploadKeys(keys, 3)).toHaveLength(3);
+    expect(pickUploadKeys(keys, 3).every((k) => keys.some((x) => x.key === k.key))).toBe(true);
+  });
+
+  it('金鑰數少於上限時全部都用', () => {
+    const keys = [{ name: 'A', key: 'A' }, { name: 'B', key: 'B' }];
+    expect(pickUploadKeys(keys, 3).map((k) => k.key)).toEqual(['A', 'B']);
+  });
+
+  it('優先挑「今日用量少」的，冷卻中的排最後', () => {
+    recordCooldown('BUSY', 60000);
+    for (let i = 0; i < 5; i++) recordUse('USED');
+    const keys = [
+      { name: 'busy', key: 'BUSY' },
+      { name: 'used', key: 'USED' },
+      { name: 'fresh', key: 'FRESH' },
+    ];
+    expect(pickUploadKeys(keys, 2).map((k) => k.key)).toEqual(['FRESH', 'USED']);
+  });
+});
+
+describe('長錄音無法切割時的處置', () => {
+  it('切割失敗且錄音超過單一時間窗 → 明確拒絕，不可退回整檔模式', () => {
+    // 整檔模式下每次請求都要送完整音檔，180 分鐘 = 34.5 萬 token × 多次，免費層必定卡死
+    expect(canUseWholeMode(180 * 60)).toBe(false);
+    expect(canUseWholeMode(60 * 60)).toBe(false);
+  });
+
+  it('錄音在單一時間窗以內 → 整檔模式可用（只送一次）', () => {
+    expect(canUseWholeMode(30 * 60)).toBe(true);
+    expect(canUseWholeMode(40 * 60)).toBe(true);
+  });
+
+  it('長度未知（0）時保守允許，避免擋掉本來能跑的短檔', () => {
+    expect(canUseWholeMode(0)).toBe(true);
   });
 });
