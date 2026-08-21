@@ -776,6 +776,77 @@ describe('逐字稿時間戳', () => {
   });
 });
 
+describe('重試時仍看得出跑到第幾段', () => {
+  const segResp3 = (segs) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ segments: segs }) }] } }] });
+
+  it('換金鑰重試的訊息要帶著段號，否則使用者無法判斷是不是做到一半', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(errResponse(429, { error: { code: 429 } })) // 第一把 → 429
+      .mockResolvedValueOnce(segResp3([{ speaker: 'a', text: 'x' }])); // 第二把 → 成功
+    vi.stubGlobal('fetch', fetchMock);
+    const seen = [];
+    const onProgress = (p) => seen.push(p && p.message);
+    await transcribeRange(
+      [{ key: 'K1', name: 'DD2', fileUri: 'u1' }, { key: 'K2', name: 'DD3', fileUri: 'u2' }],
+      'audio/wav',
+      'gemini-3.5-flash',
+      1800,
+      3600,
+      false,
+      onProgress,
+      '辨識第 2/3 段（30:00–60:00）…'
+    );
+    const retry = seen.filter((s) => s && s.includes('切換金鑰重試中'));
+    expect(retry.length).toBeGreaterThan(0);
+    expect(retry[0]).toContain('第 2/3 段');
+  });
+
+  it('只有一把金鑰時，重試訊息一樣要帶段號', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(errResponse(503, { error: { code: 503 } }))
+      .mockResolvedValueOnce(segResp3([{ speaker: 'a', text: 'x' }]));
+    vi.stubGlobal('fetch', fetchMock);
+    const seen = [];
+    await transcribeRange(
+      [{ key: 'K1', fileUri: 'u1' }],
+      'audio/wav',
+      'gemini-3.5-flash',
+      0,
+      1800,
+      false,
+      (p) => seen.push(p && p.message),
+      '辨識第 1/3 段（00:00–30:00）…'
+    );
+    expect(seen.some((s) => s && s.includes('第 1/3 段') && s.includes('重試中'))).toBe(true);
+    // 等待訊息也要帶段號
+    expect(seen.some((s) => s && s.includes('第 1/3 段') && s.includes('暫時受限'))).toBe(true);
+    // 單把金鑰要先等一輪才會重試，這裡會真的睡 8 秒
+  }, 20000);
+
+  it('沒有段號的動作（例如摘要）不會多出奇怪的前綴', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(errResponse(429, { error: { code: 429 } }))
+      .mockResolvedValueOnce(segResp3([{ speaker: 'a', text: 'x' }]));
+    vi.stubGlobal('fetch', fetchMock);
+    const seen = [];
+    await transcribeRange(
+      [{ key: 'K1', name: 'A', fileUri: 'u1' }, { key: 'K2', name: 'B', fileUri: 'u2' }],
+      'audio/wav',
+      'gemini-3.5-flash',
+      0,
+      600,
+      true,
+      (p) => seen.push(p && p.message),
+      '辨識語者與逐字稿中…'
+    );
+    const retry = seen.filter((s) => s && s.includes('切換金鑰重試中'));
+    expect(retry[0]).toBe('切換金鑰重試中…');
+  });
+});
+
 describe('學習筆記的指令品質', () => {
   const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
   const segs = Array.from({ length: 20 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
