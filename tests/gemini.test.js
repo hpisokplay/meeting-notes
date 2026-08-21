@@ -776,6 +776,70 @@ describe('逐字稿時間戳', () => {
   });
 });
 
+describe('思考型模型的多段回應（gemini 3.x）', () => {
+  const segsJson = (segs) => JSON.stringify({ segments: segs });
+
+  it('回應夾帶思考摘要時，要跳過思考段落讀真正的答案', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        candidates: [
+          {
+            finishReason: 'STOP',
+            content: {
+              parts: [
+                { thought: true, text: '我先聽一遍這段錄音，判斷有幾個人在說話…' },
+                { text: segsJson([{ speaker: '說話者1', text: '今天開會討論預算' }]) },
+              ],
+            },
+          },
+        ],
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const segs = await transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.7-flash', 1800, 3600, true);
+    expect(segs).toEqual([{ speaker: '說話者1', text: '今天開會討論預算' }]);
+    expect(fetchMock).toHaveBeenCalledTimes(1); // 不該觸發對半重問
+  });
+
+  it('長答案被拆成多段 text 時要接起來，不能只讀第一段', async () => {
+    const full = segsJson([{ speaker: 'a', text: '前半句' }, { speaker: 'b', text: '後半句' }]);
+    const cut = Math.floor(full.length / 2);
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        candidates: [{ finishReason: 'STOP', content: { parts: [{ text: full.slice(0, cut) }, { text: full.slice(cut) }] } }],
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const segs = await transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.7-flash', 0, 0, true);
+    expect(segs.map((s) => s.text)).toEqual(['前半句', '後半句']);
+  });
+
+  it('摘要也要吃得下思考型模型的回應', async () => {
+    const body = { actionItems: [], mainPoints: ['重點一'], qa: [] };
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(
+        jsonResponse({
+          candidates: [{ content: { parts: [{ thought: true, text: '思考中…' }, { text: JSON.stringify(body) }] } }],
+        })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await regenerateSummary([{ speaker: 's', text: 't' }], ['K1']);
+    expect(r.mainPoints).toEqual(['重點一']);
+  });
+
+  it('整份回應都只有思考、沒有答案 → 仍要明確報錯，不可當成空結果吞掉', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      jsonResponse({ candidates: [{ finishReason: 'STOP', content: { parts: [{ thought: true, text: '想了很久' }] } }] })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(
+      transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.7-flash', 0, 0, true)
+    ).rejects.toThrow(/解析失敗/);
+  });
+});
+
 describe('辨識結果解析失敗時的補救', () => {
   const segOk = (segs) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ segments: segs }) }] } }] });
   const badJson = (finishReason = 'STOP') =>
