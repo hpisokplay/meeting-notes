@@ -776,6 +776,54 @@ describe('逐字稿時間戳', () => {
   });
 });
 
+describe('辨識結果解析失敗時的補救', () => {
+  const segOk = (segs) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ segments: segs }) }] } }] });
+  const badJson = (finishReason = 'STOP') =>
+    jsonResponse({ candidates: [{ finishReason, content: { parts: [{ text: '這不是 JSON' }] } }] });
+
+  it('切段模式解析失敗 → 在這個音檔內對半再問，不再整段報廢', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(badJson()) // 整段 → 解析不出來
+      .mockResolvedValueOnce(segOk([{ speaker: 'a', text: '前半' }]))
+      .mockResolvedValueOnce(segOk([{ speaker: 'a', text: '後半' }]));
+    vi.stubGlobal('fetch', fetchMock);
+    // 切段模式：whole=true，start/end 是這段在整場裡的絕對時間（第 2 段：30–60 分）
+    const segs = await transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.5-flash', 1800, 3600, true);
+    expect(segs.map((s) => s.text)).toEqual(['前半', '後半']);
+    expect(fetchMock).toHaveBeenCalledTimes(3);
+    // 對半的時間範圍要用「檔案內的相對時間」，因為上傳的就是這一段的音檔
+    expect(fetchMock.mock.calls[1][1].body).toContain('0:00 到 15:00');
+    expect(fetchMock.mock.calls[2][1].body).toContain('15:00 到 30:00');
+  });
+
+  it('切不動時（長度不明）要把模型實際回了什麼帶進錯誤訊息', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ candidates: [{ finishReason: 'SAFETY' }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    // 多檔模式：沒有時間範圍（start=end=0）→ 無從對半，只能報錯
+    await expect(
+      transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.5-flash', 0, 0, true)
+    ).rejects.toThrow(/SAFETY/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('回應有內容但格式跑掉時，錯誤訊息要附上回應開頭', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(badJson('STOP'));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(
+      transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.5-flash', 0, 0, true)
+    ).rejects.toThrow(/這不是 JSON/);
+  });
+
+  it('被截斷（MAX_TOKENS）仍走原本的訊息，不與解析失敗混為一談', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse({ candidates: [{ finishReason: 'MAX_TOKENS', content: { parts: [{ text: '{"segments":[' }] } }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    await expect(
+      transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.5-flash', 0, 0, true)
+    ).rejects.toThrow(/內容太密集/);
+  });
+});
+
 describe('重試時仍看得出跑到第幾段', () => {
   const segResp3 = (segs) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ segments: segs }) }] } }] });
 
