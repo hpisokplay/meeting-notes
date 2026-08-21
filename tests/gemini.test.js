@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
 import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
@@ -773,6 +773,46 @@ describe('逐字稿時間戳', () => {
     expect(segs[0].t).toBeUndefined();
     expect(segs[1].t).toBeUndefined();
     expect(segs[2].t).toBe(30);
+  });
+});
+
+describe('型號忙線時換型號', () => {
+  it('rankModels 依偏好排名，pickModel 取第一名', () => {
+    const models = [
+      { name: 'models/gemini-3.7-flash', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3.0-flash', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3.7-pro', supportedGenerationMethods: ['generateContent'] },
+    ];
+    const ranked = rankModels(models, { preferLite: false });
+    expect(ranked[0]).toBe('gemini-3.7-flash');
+    expect(pickModel(models, { preferLite: false })).toBe(ranked[0]);
+    expect(ranked).toContain('gemini-3.0-flash');
+    expect(ranked.length).toBe(3);
+  });
+
+  it('nextModelForKeys 回傳排名中的下一個', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      jsonResponse({
+        models: [
+          { name: 'models/gemini-3.7-flash', supportedGenerationMethods: ['generateContent'] },
+          { name: 'models/gemini-3.0-flash', supportedGenerationMethods: ['generateContent'] },
+        ],
+      })
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const first = await pickModelForKeys(['K1']);
+    expect(first).toBe('gemini-3.7-flash');
+    expect(await nextModelForKeys(['K1'], 'gemini-3.7-flash')).toBe('gemini-3.0-flash');
+    // 已經是最後一名 → 沒有下一個
+    expect(await nextModelForKeys(['K1'], 'gemini-3.0-flash')).toBe(null);
+  });
+
+  it('isModelOverloaded 只認忙線，不把額度或格式問題誤判成忙線', () => {
+    expect(isModelOverloaded(new Error('辨識失敗 (503)：{"status":"UNAVAILABLE"}'))).toBe(true);
+    expect(isModelOverloaded(new Error('This model is currently experiencing high demand.'))).toBe(true);
+    expect(isModelOverloaded(new Error('額度受限，暫時無法完成。'))).toBe(false);
+    expect(isModelOverloaded(new Error('辨識失敗 (400)：格式不支援'))).toBe(false);
+    expect(isModelOverloaded(null)).toBe(false);
   });
 });
 
