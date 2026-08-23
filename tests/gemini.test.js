@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
 import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
@@ -773,6 +773,48 @@ describe('逐字稿時間戳', () => {
     expect(segs[0].t).toBeUndefined();
     expect(segs[1].t).toBeUndefined();
     expect(segs[2].t).toBe(30);
+  });
+});
+
+describe('Groq 備援的判斷與繁體轉換', () => {
+  it('isQuotaStall 只認 429 收場訊息', () => {
+    expect(isQuotaStall(new Error('額度受限，暫時無法完成。稍等 1–2 分鐘…'))).toBe(true);
+    expect(isQuotaStall(new Error('辨識失敗 (503)：UNAVAILABLE'))).toBe(false);
+    expect(isQuotaStall(null)).toBe(false);
+  });
+
+  it('convertToTraditional：批次轉換，長度相符才採用', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(
+        jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ texts: ['大家好', '今天討論預算'] }) }] } }] })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await convertToTraditional(['大家好', '今天讨论预算'], ['K1']);
+    expect(out).toEqual(['大家好', '今天討論預算']);
+  });
+
+  it('convertToTraditional：長度不符 → 該批保留原文，不丟錯', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(
+        jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify({ texts: ['只回了一句'] }) }] } }] })
+      );
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await convertToTraditional(['句一', '句二'], ['K1']);
+    expect(out).toEqual(['句一', '句二']);
+  });
+
+  it('convertToTraditional：請求失敗 → 保留原文，不丟錯', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(400, { error: { code: 400 } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const out = await convertToTraditional(['句一'], ['K1']);
+    expect(out).toEqual(['句一']);
   });
 });
 
