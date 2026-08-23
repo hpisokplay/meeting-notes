@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
 import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
@@ -781,6 +781,15 @@ describe('Groq 備援的判斷與繁體轉換', () => {
     expect(isQuotaStall(new Error('額度受限，暫時無法完成。稍等 1–2 分鐘…'))).toBe(true);
     expect(isQuotaStall(new Error('辨識失敗 (503)：UNAVAILABLE'))).toBe(false);
     expect(isQuotaStall(null)).toBe(false);
+  });
+
+  it('isContentBlocked 認得安全過濾器的三種標記，不誤吃其他錯誤', () => {
+    expect(isContentBlocked(new Error('辨識結果解析失敗，請重試一次。（型號 gemini-3.7-flash／finishReason: PROHIBITED_CONTENT）這次回應沒有任何文字內容。'))).toBe(true);
+    expect(isContentBlocked(new Error('（finishReason: SAFETY）這次回應沒有任何文字內容。'))).toBe(true);
+    expect(isContentBlocked(new Error('blockReason: OTHER'))).toBe(true);
+    expect(isContentBlocked(new Error('額度受限，暫時無法完成。'))).toBe(false);
+    expect(isContentBlocked(new Error('辨識失敗 (503)：UNAVAILABLE'))).toBe(false);
+    expect(isContentBlocked(null)).toBe(false);
   });
 
   it('convertToTraditional：批次轉換，長度相符才採用', async () => {
