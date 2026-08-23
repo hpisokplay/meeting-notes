@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { groqTranscribeBlob, groqTranscribeRange, planGroqSlices, getGroqKey, setGroqKey, hasGroqKey } from '../js/groq.js';
+import { groqTranscribeBlob, groqTranscribeRange, groqSummarize, planGroqSlices, getGroqKey, setGroqKey, hasGroqKey } from '../js/groq.js';
 
 const jsonResponse = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
@@ -112,6 +112,37 @@ describe('groqTranscribeBlob', () => {
     expect(segs[0].text).toBe('ok');
     expect(fetchMock).toHaveBeenCalledTimes(2);
     vi.useRealTimers();
+  });
+});
+
+describe('groqSummarize（摘要備援）', () => {
+  const chat = (content) => jsonResponse({ choices: [{ message: { content } }] });
+
+  it('回傳與 Gemini 摘要相同的結構', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(
+      chat(JSON.stringify({ actionItems: ['回報進度 [DRI: 待指派]'], mainPoints: ['重點一'], qa: [{ q: '問', a: '答' }] }))
+    );
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await groqSummarize([{ speaker: '說話者1', text: '哈囉' }], 'gsk');
+    expect(r).toEqual({ actionItems: ['回報進度 [DRI: 待指派]'], mainPoints: ['重點一'], qa: [{ q: '問', a: '答' }] });
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain('chat/completions');
+    const body = JSON.parse(init.body);
+    expect(body.model).toBe('llama-3.3-70b-versatile');
+    expect(body.response_format).toEqual({ type: 'json_object' });
+    expect(body.messages[0].content).toContain('說話者1：哈囉');
+    expect(body.messages[0].content).toContain('繁體中文');
+  });
+
+  it('缺鍵時補成空陣列，不會壞掉', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(chat(JSON.stringify({ mainPoints: ['只有重點'] }))));
+    const r = await groqSummarize([{ speaker: 'a', text: 'x' }], 'gsk');
+    expect(r).toEqual({ actionItems: [], mainPoints: ['只有重點'], qa: [] });
+  });
+
+  it('回傳不是 JSON → 明確報錯', async () => {
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(chat('抱歉我不會')));
+    await expect(groqSummarize([{ speaker: 'a', text: 'x' }], 'gsk')).rejects.toThrow(/解析失敗/);
   });
 });
 
