@@ -837,6 +837,116 @@ describe('純文字功能的 Groq 收場備援', () => {
   });
 });
 
+// ===================================================================
+// 【2026-08-24】使用者實測回報：「看起來沒有轉 Groq」。
+// 查下去是三件事疊在一起，這一組測試各釘一件。
+// ===================================================================
+describe('備援沒生效時，要說得出為什麼（不得靜靜吞掉）', () => {
+  it('沒設 Groq 金鑰 → 錯誤訊息要指名「尚未設定 Groq 金鑰」', async () => {
+    vi.useFakeTimers();
+    localStorage.removeItem('groq_api_key');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    // 舊版是 `catch (_) {}`：四種失敗長成同一句 Gemini 錯誤，使用者結構上分不出來。
+    expect(String(err.message)).toMatch(/尚未設定 Groq 金鑰/);
+  });
+
+  it('Groq 自己也失敗 → 要講出 Groq 的錯，不可以只報 Gemini 的錯', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem('groq_api_key', 'gsk_rescue');
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('api.groq.com')) return Promise.resolve(errResponse(401, { error: { message: 'bad key' } }));
+      if (String(url).includes('/models?')) return Promise.resolve(jsonResponse(MODELS_RESPONSE));
+      return Promise.resolve(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/Groq 備援未生效/);
+    localStorage.removeItem('groq_api_key');
+  });
+
+  it('帶音檔轉不了時，理由要說是音檔，不是金鑰', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem('groq_api_key', 'gsk_rescue');
+    const fetchMock = vi.fn().mockResolvedValue(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const p = transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.7-flash', 0, 0, true).then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/帶了音檔/);
+    expect(String(err.message)).not.toMatch(/尚未設定 Groq 金鑰/);
+    localStorage.removeItem('groq_api_key');
+  });
+});
+
+describe('純文字請求不必等滿 2.5 分鐘才轉 Groq', () => {
+  it('第一輪金鑰就全部受限 → 立刻打 Groq（不等待）', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem('groq_api_key', 'gsk_rescue');
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('api.groq.com')) {
+        return Promise.resolve(
+          jsonResponse({ choices: [{ message: { content: JSON.stringify({ actionItems: [], mainPoints: ['早救'], qa: [] }) } }] })
+        );
+      }
+      if (String(url).includes('/models?')) return Promise.resolve(jsonResponse(MODELS_RESPONSE));
+      return Promise.resolve(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
+    // **只推進 1 秒**。舊版要等滿 5 輪／~150 秒才會走到 Groq，這一步會 timeout。
+    await vi.advanceTimersByTimeAsync(1000);
+    const r = await p;
+    vi.useRealTimers();
+    expect(r.mainPoints).toEqual(['早救']);
+    localStorage.removeItem('groq_api_key');
+  });
+});
+
+describe('503 是型號忙線，不是金鑰問題', () => {
+  it('錯誤訊息不得叫使用者去換金鑰或加額度', async () => {
+    vi.useFakeTimers();
+    localStorage.removeItem('groq_api_key');
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(503, { error: { code: 503, message: 'This model is currently experiencing high demand.' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    const m = String(err.message);
+    expect(m).toMatch(/忙不過來|忙線/);
+    expect(m).toMatch(/不.*是.*你的金鑰|不是你的金鑰/);
+    // 反方向：不得再叫人去 AI Studio 加額度——那對 503 沒有用
+    expect(m).not.toMatch(/開通 API 付費/);
+  });
+});
+
 describe('Groq 備援的判斷與繁體轉換', () => {
   it('isQuotaStall 只認 429 收場訊息', () => {
     expect(isQuotaStall(new Error('額度受限，暫時無法完成。稍等 1–2 分鐘…'))).toBe(true);
@@ -1084,8 +1194,14 @@ describe('重試時仍看得出跑到第幾段', () => {
       '辨識第 1/3 段（00:00–30:00）…'
     );
     expect(seen.some((s) => s && s.includes('第 1/3 段') && s.includes('重試中'))).toBe(true);
-    // 等待訊息也要帶段號
-    expect(seen.some((s) => s && s.includes('第 1/3 段') && s.includes('暫時受限'))).toBe(true);
+    // 等待訊息也要帶段號。
+    // 【2026-08-24】原本比對「暫時受限」四個字，而這個情境是 **503**，
+    // 措辭已改成「型號忙線中」（503 不是金鑰的問題，見下面那支測試）。
+    // 這支測試真正保護的是「**等待訊息要帶段號**」，不是那四個字，
+    // 所以判準改成「等待訊息（兩種措辭都算）必須帶段號」——保護的東西一個字沒少。
+    expect(
+      seen.some((s) => s && s.includes('第 1/3 段') && (s.includes('暫時受限') || s.includes('忙線')))
+    ).toBe(true);
     // 單把金鑰要先等一輪才會重試，這裡會真的睡 8 秒
   }, 20000);
 
