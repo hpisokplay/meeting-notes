@@ -776,6 +776,67 @@ describe('逐字稿時間戳', () => {
   });
 });
 
+describe('純文字功能的 Groq 收場備援', () => {
+  it('Gemini 全 429 且設了 Groq 金鑰 → 改走 Llama，功能照常成功', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem('groq_api_key', 'gsk_rescue');
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('api.groq.com')) {
+        return Promise.resolve(
+          jsonResponse({ choices: [{ message: { content: JSON.stringify({ actionItems: [], mainPoints: ['Llama 救回'], qa: [] }) } }] })
+        );
+      }
+      if (String(url).includes('/models?')) return Promise.resolve(jsonResponse(MODELS_RESPONSE));
+      return Promise.resolve(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
+    await vi.advanceTimersByTimeAsync(200000);
+    const r = await p;
+    vi.useRealTimers();
+    expect(r.mainPoints).toEqual(['Llama 救回']);
+    // 確認真的打到 Groq，且要求 JSON 模式
+    const groqCall = fetchMock.mock.calls.find(([u]) => String(u).includes('api.groq.com'));
+    expect(groqCall).toBeTruthy();
+    expect(JSON.parse(groqCall[1].body).response_format).toEqual({ type: 'json_object' });
+    localStorage.removeItem('groq_api_key');
+  });
+
+  it('帶音檔的請求不可轉給 Llama（它聽不了聲音）→ 照原本報額度錯誤', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem('groq_api_key', 'gsk_rescue');
+    const fetchMock = vi.fn().mockResolvedValue(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const p = transcribeRange([{ key: 'K1', fileUri: 'u' }], 'audio/wav', 'gemini-3.7-flash', 0, 0, true).then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/額度受限/);
+    expect(fetchMock.mock.calls.some(([u]) => String(u).includes('api.groq.com'))).toBe(false);
+    localStorage.removeItem('groq_api_key');
+  });
+
+  it('沒設 Groq 金鑰 → 行為與從前完全相同', async () => {
+    vi.useFakeTimers();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(429, { error: { code: 429, message: 'quota' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(200000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/額度/);
+  });
+});
+
 describe('Groq 備援的判斷與繁體轉換', () => {
   it('isQuotaStall 只認 429 收場訊息', () => {
     expect(isQuotaStall(new Error('額度受限，暫時無法完成。稍等 1–2 分鐘…'))).toBe(true);
