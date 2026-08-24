@@ -782,6 +782,7 @@ describe('純文字功能的 Groq 收場備援', () => {
     localStorage.setItem('groq_api_key', 'gsk_rescue');
     const fetchMock = vi.fn((url) => {
       if (String(url).includes('api.groq.com')) {
+        if (String(url).includes('/models')) return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-oss-120b' }] }));
         return Promise.resolve(
           jsonResponse({ choices: [{ message: { content: JSON.stringify({ actionItems: [], mainPoints: ['Llama 救回'], qa: [] }) } }] })
         );
@@ -796,7 +797,7 @@ describe('純文字功能的 Groq 收場備援', () => {
     vi.useRealTimers();
     expect(r.mainPoints).toEqual(['Llama 救回']);
     // 確認真的打到 Groq，且要求 JSON 模式
-    const groqCall = fetchMock.mock.calls.find(([u]) => String(u).includes('api.groq.com'));
+    const groqCall = fetchMock.mock.calls.find(([u]) => String(u).includes('chat/completions'));
     expect(groqCall).toBeTruthy();
     expect(JSON.parse(groqCall[1].body).response_format).toEqual({ type: 'json_object' });
     localStorage.removeItem('groq_api_key');
@@ -905,6 +906,7 @@ describe('純文字請求不必等滿 2.5 分鐘才轉 Groq', () => {
     localStorage.setItem('groq_api_key', 'gsk_rescue');
     const fetchMock = vi.fn((url) => {
       if (String(url).includes('api.groq.com')) {
+        if (String(url).includes('/models')) return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-oss-120b' }] }));
         return Promise.resolve(
           jsonResponse({ choices: [{ message: { content: JSON.stringify({ actionItems: [], mainPoints: ['早救'], qa: [] }) } }] })
         );

@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { groqTranscribeBlob, groqTranscribeRange, groqSummarize, planGroqSlices, getGroqKey, setGroqKey, hasGroqKey } from '../js/groq.js';
+import { groqTranscribeBlob, groqTranscribeRange, groqSummarize, planGroqSlices, getGroqKey, setGroqKey, hasGroqKey, resetGroqModelCache } from '../js/groq.js';
 
 const jsonResponse = (obj, status = 200) =>
   new Response(JSON.stringify(obj), { status, headers: { 'Content-Type': 'application/json' } });
@@ -117,31 +117,73 @@ describe('groqTranscribeBlob', () => {
 
 describe('groqSummarize（摘要備援）', () => {
   const chat = (content) => jsonResponse({ choices: [{ message: { content } }] });
+  const MODELS = jsonResponse({
+    data: [
+      { id: 'whisper-large-v3-turbo' },
+      { id: 'meta-llama/llama-guard-4-12b' },
+      { id: 'openai/gpt-oss-120b' },
+      { id: 'qwen/qwen3-32b' },
+    ],
+  });
+  // 模型清單 + 聊天：依網址分流
+  const routed = (chatResp) =>
+    vi.fn((url) => {
+      if (String(url).includes('/models')) return Promise.resolve(MODELS.clone());
+      return Promise.resolve(chatResp);
+    });
 
-  it('回傳與 Gemini 摘要相同的結構', async () => {
-    const fetchMock = vi.fn().mockResolvedValueOnce(
+  beforeEach(() => resetGroqModelCache());
+
+  it('回傳與 Gemini 摘要相同的結構；模型從清單挑（不寫死）', async () => {
+    const fetchMock = routed(
       chat(JSON.stringify({ actionItems: ['回報進度 [DRI: 待指派]'], mainPoints: ['重點一'], qa: [{ q: '問', a: '答' }] }))
     );
     vi.stubGlobal('fetch', fetchMock);
     const r = await groqSummarize([{ speaker: '說話者1', text: '哈囉' }], 'gsk');
     expect(r).toEqual({ actionItems: ['回報進度 [DRI: 待指派]'], mainPoints: ['重點一'], qa: [{ q: '問', a: '答' }] });
-    const [url, init] = fetchMock.mock.calls[0];
-    expect(url).toContain('chat/completions');
-    const body = JSON.parse(init.body);
-    expect(body.model).toBe('llama-3.3-70b-versatile');
+    const chatCall = fetchMock.mock.calls.find(([u]) => String(u).includes('chat/completions'));
+    const body = JSON.parse(chatCall[1].body);
+    // 官方建議的替代者優先；whisper／guard 不可入選
+    expect(body.model).toBe('openai/gpt-oss-120b');
     expect(body.response_format).toEqual({ type: 'json_object' });
     expect(body.messages[0].content).toContain('說話者1：哈囉');
     expect(body.messages[0].content).toContain('繁體中文');
   });
 
+  it('快取的模型被下架（404）→ 重抓清單換一個，不整場失敗', async () => {
+    let modelCalls = 0;
+    let chatCallsN = 0;
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('/models')) {
+        modelCalls++;
+        // 第二次抓清單時，已下架的模型不見了
+        return Promise.resolve(
+          jsonResponse({ data: modelCalls === 1 ? [{ id: 'openai/gpt-oss-120b' }, { id: 'qwen/qwen3-32b' }] : [{ id: 'qwen/qwen3-32b' }] })
+        );
+      }
+      chatCallsN++;
+      return Promise.resolve(
+        chatCallsN === 1
+          ? new Response('{"error":{"message":"The model `openai/gpt-oss-120b` does not exist","code":"model_not_found"}}', { status: 404 })
+          : chat(JSON.stringify({ mainPoints: ['換模型成功'] }))
+      );
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await groqSummarize([{ speaker: 'a', text: 'x' }], 'gsk');
+    expect(r.mainPoints).toEqual(['換模型成功']);
+    // 第二次聊天用的是換過的模型
+    const chatCalls = fetchMock.mock.calls.filter(([u]) => String(u).includes('chat/completions'));
+    expect(JSON.parse(chatCalls[1][1].body).model).toBe('qwen/qwen3-32b');
+  });
+
   it('缺鍵時補成空陣列，不會壞掉', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(chat(JSON.stringify({ mainPoints: ['只有重點'] }))));
+    vi.stubGlobal('fetch', routed(chat(JSON.stringify({ mainPoints: ['只有重點'] }))));
     const r = await groqSummarize([{ speaker: 'a', text: 'x' }], 'gsk');
     expect(r).toEqual({ actionItems: [], mainPoints: ['只有重點'], qa: [] });
   });
 
   it('回傳不是 JSON → 明確報錯', async () => {
-    vi.stubGlobal('fetch', vi.fn().mockResolvedValueOnce(chat('抱歉我不會')));
+    vi.stubGlobal('fetch', routed(chat('抱歉我不會')));
     await expect(groqSummarize([{ speaker: 'a', text: 'x' }], 'gsk')).rejects.toThrow(/解析失敗/);
   });
 });
