@@ -689,6 +689,55 @@ describe('翻譯涵蓋學習筆記', () => {
   });
 });
 
+describe('連線掛住不可無限等待', () => {
+  it('fetch 永不回應 → 逾時後換金鑰，最終轉 Groq 而不是卡死', async () => {
+    vi.useFakeTimers();
+    localStorage.setItem('groq_api_key', 'gsk_rescue');
+    const fetchMock = vi.fn((url, init) => {
+      if (String(url).includes('api.groq.com')) {
+        if (String(url).includes('/models')) return Promise.resolve(jsonResponse({ data: [{ id: 'openai/gpt-oss-120b' }] }));
+        return Promise.resolve(
+          jsonResponse({ choices: [{ message: { content: JSON.stringify({ actionItems: [], mainPoints: ['逾時後救回'], qa: [] }) } }] })
+        );
+      }
+      if (String(url).includes('/models?')) return Promise.resolve(jsonResponse(MODELS_RESPONSE));
+      // Gemini：永遠不回應，但要對 abort 有反應（真實 fetch 的行為）
+      return new Promise((_, reject) => {
+        const sig = init && init.signal;
+        if (sig) sig.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY');
+    await vi.advanceTimersByTimeAsync(200000);
+    const r = await p;
+    vi.useRealTimers();
+    expect(r.mainPoints).toEqual(['逾時後救回']);
+    localStorage.removeItem('groq_api_key');
+  });
+
+  it('連線失敗且沒有 Groq 金鑰 → 明確報錯，不無限等待', async () => {
+    vi.useFakeTimers();
+    localStorage.removeItem('groq_api_key');
+    const fetchMock = vi.fn((url, init) => {
+      if (String(url).includes('/models?')) return Promise.resolve(jsonResponse(MODELS_RESPONSE));
+      return new Promise((_, reject) => {
+        const sig = init && init.signal;
+        if (sig) sig.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })));
+      });
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    await vi.advanceTimersByTimeAsync(900000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/逾時|網路/);
+  });
+});
+
 describe('加強／掃詞的大批次與對半重試', () => {
   const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
   const segs300 = Array.from({ length: 300 }, (_, i) => ({ speaker: 's', text: `第 ${i} 句` }));
@@ -1276,7 +1325,10 @@ describe('重試時仍看得出跑到第幾段', () => {
       '辨識語者與逐字稿中…'
     );
     const retry = seen.filter((s) => s && s.includes('切換金鑰重試中'));
-    expect(retry[0]).toBe('切換金鑰重試中…');
+    // 這支測試保護的是「不得多出段號前綴」。後面的「（金鑰 2/2）」是刻意加的
+    // 進度資訊（連線掛住時用來判斷是否還在動），不屬於前綴。
+    expect(retry[0].startsWith('切換金鑰重試中…')).toBe(true);
+    expect(retry[0]).not.toMatch(/第\s*\d+\s*\/\s*\d+\s*[段支]/);
   });
 });
 
