@@ -689,6 +689,57 @@ describe('翻譯涵蓋學習筆記', () => {
   });
 });
 
+describe('加強／掃詞的大批次與對半重試', () => {
+  const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
+  const segs300 = Array.from({ length: 300 }, (_, i) => ({ speaker: 's', text: `第 ${i} 句` }));
+
+  it('300 句只分 2 批（240+60），不再是 4 批', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(wrap({ items: ['a'] })) // 第 1–240 句
+      .mockResolvedValueOnce(wrap({ items: ['b'] })) // 第 241–300 句
+      .mockResolvedValueOnce(wrap({ items: [{ text: 'a 潤', src: [1] }, { text: 'b 潤', src: [2] }] })); // 總潤飾
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection(segs300, 'mainPoints', 'KEY');
+    expect(fetchMock).toHaveBeenCalledTimes(4); // ListModels + 2 批 + 潤飾
+    expect(r.length).toBe(2);
+  });
+
+  it('單批輸出壞掉 → 對半重試，不整場失敗', async () => {
+    const bad = jsonResponse({ candidates: [{ content: { parts: [{ text: '這不是 JSON' }] } }] });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(bad) // 第 1–240 句 → 壞
+      .mockResolvedValueOnce(wrap({ items: ['前半'] })) // 1–120
+      .mockResolvedValueOnce(wrap({ items: ['後半'] })) // 121–240
+      .mockResolvedValueOnce(wrap({ items: ['尾段'] })) // 241–300
+      .mockResolvedValueOnce(wrap({ items: [{ text: '合併潤飾', src: [1, 2, 3] }] }));
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await enhanceSection(segs300, 'mainPoints', 'KEY');
+    expect(fetchMock).toHaveBeenCalledTimes(6); // ListModels + 壞批 + 兩個半批 + 尾批 + 潤飾
+    expect(r.length).toBeGreaterThan(0);
+  });
+
+  it('掃詞：單批壞掉對半撿回，縮到最小仍壞就略過該批不中斷', async () => {
+    const bad = jsonResponse({ candidates: [{ content: { parts: [{ text: '亂碼' }] } }] });
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValueOnce(bad) // 1–240 壞
+      .mockResolvedValueOnce(wrap({ items: [{ term: 'CoWoS', category: 'term', fix: '' }] })) // 1–120 好
+      .mockResolvedValueOnce(bad) // 121–240 壞 → 對半
+      .mockResolvedValueOnce(bad) // 121–180（=60 句，最小）仍壞 → 略過
+      .mockResolvedValueOnce(bad) // 181–240（=60 句，最小）仍壞 → 略過
+      .mockResolvedValueOnce(wrap({ items: [{ term: 'TSV', category: 'term', fix: '' }] })) // 241–300 好
+      .mockResolvedValueOnce(wrap({ groups: [] })); // 分組
+    vi.stubGlobal('fetch', fetchMock);
+    const r = await extractTerms(segs300, 'KEY');
+    expect(r.map((x) => x.t)).toEqual(['CoWoS', 'TSV']);
+  });
+});
+
 describe('enhanceNotesSection（學習筆記分區加強）', () => {
   const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
   // 160 段 → 每 80 段一批 → 兩批
@@ -1315,8 +1366,8 @@ describe('錯誤訊息與 400→429 的處理', () => {
 
 describe('專有名詞：同一實體的多種寫法歸組', () => {
   const wrap = (obj) => jsonResponse({ candidates: [{ content: { parts: [{ text: JSON.stringify(obj) }] } }] });
-  // 160 段 → 兩批；同一家公司在不同批被聽成不同寫法
-  const segs = Array.from({ length: 160 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
+  // 300 段 → 兩批（240+60）；同一家公司在不同批被聽成不同寫法
+  const segs = Array.from({ length: 300 }, (_, i) => ({ speaker: '講者', text: `第 ${i} 句` }));
 
   it('跨批次的不同寫法歸成一組：只留一筆，其餘放進 alts', async () => {
     const fetchMock = vi
