@@ -90,7 +90,8 @@ describe('groqTranscribeBlob', () => {
     expect(init.headers.Authorization).toBe('Bearer gsk_test');
     const form = init.body;
     expect(form.get('model')).toBe('whisper-large-v3-turbo');
-    expect(form.get('language')).toBe('zh');
+    // 不可寫死語言：英文錄音被 language=zh 當中文處理，「原文」就不原了（自動偵測）
+    expect(form.get('language')).toBe(null);
     expect(form.get('response_format')).toBe('verbose_json');
   });
 

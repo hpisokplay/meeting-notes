@@ -857,6 +857,9 @@ describe('逐字稿時間戳', () => {
     const body = fetchMock.mock.calls[0][1].body;
     expect(body).toContain('秒數');
     expect(body).toContain('音檔開頭');
+    // 回歸：英文會議曾被整場翻譯成中文——提示詞必須明寫「照錄、不可翻譯」
+    expect(body).toContain('不可翻譯');
+    expect(body).toContain('英文就寫英文');
   });
 
   it('模型沒給時間戳也不會壞掉（欄位就是不存在）', async () => {
