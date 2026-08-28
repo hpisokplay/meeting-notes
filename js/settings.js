@@ -47,3 +47,15 @@ export function getModelPref() {
 export function setModelPref(v) {
   localStorage.setItem(MP, v === 'lite' ? 'lite' : 'auto');
 }
+
+// 指定辨識型號：''＝自動（依品質排序、忙線自動跳過）。
+// 使用者指定的型號永遠排在候選清單第一位；它也忙線時仍會自動往下換，不會卡死。
+const ML = 'model_lock';
+export function getModelLock() {
+  return localStorage.getItem(ML) || '';
+}
+export function setModelLock(v) {
+  const m = (v || '').trim();
+  if (m) localStorage.setItem(ML, m);
+  else localStorage.removeItem(ML);
+}

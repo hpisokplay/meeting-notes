@@ -1187,6 +1187,33 @@ describe('型號忙線時換型號', () => {
     expect(isModelOverloaded(new Error('辨識失敗 (400)：格式不支援'))).toBe(false);
     expect(isModelOverloaded(null)).toBe(false);
   });
+
+  it('isModelOverloaded 必須認得 v89 之後的中文收場訊息（全形括號）', () => {
+    // 回歸：v89 把訊息改成「忙不過來（503 高負載）」後，半形 \(503\) 比對不到，
+    // 「忙線換模型」整條鏈默默失效——使用者發現「錯誤裡看不到有試 3.6」。
+    expect(isModelOverloaded(new Error('辨識第 1/2 段失敗：這個型號現在忙不過來（503 高負載）。'))).toBe(true);
+    const marked = new Error('任何訊息');
+    marked.geminiStatus = 503;
+    expect(isModelOverloaded(marked)).toBe(true);
+  });
+
+  it('使用者指定型號 → 排第一；它忙線時仍會往下跳', async () => {
+    localStorage.setItem('model_lock', 'gemini-2.5-flash');
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await pickModelForKeys(['K1'])).toBe('gemini-2.5-flash');
+    markModelBusy('gemini-2.5-flash');
+    expect(await pickModelForKeys(['K1'])).toBe('gemini-3.5-flash');
+    localStorage.removeItem('model_lock');
+  });
+
+  it('忙線記憶要寫進 localStorage（重開 App 也記得）', () => {
+    markModelBusy('gemini-3.5-flash');
+    const stored = JSON.parse(localStorage.getItem('model_busy_until'));
+    expect(typeof stored['gemini-3.5-flash']).toBe('number');
+    clearModelBusy();
+    expect(localStorage.getItem('model_busy_until')).toBe(null);
+  });
 });
 
 describe('思考型模型的多段回應（gemini 3.x）', () => {
