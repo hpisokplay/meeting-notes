@@ -1,10 +1,11 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation, markModelBusy, isModelBusy, clearModelBusy } from '../js/gemini.js';
 import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
   clearModelCache();
+  clearModelBusy();
   resetThinkingFlag();
   clearAbort();
   resetKeyRotation();
@@ -1097,6 +1098,54 @@ describe('Groq 備援的判斷與繁體轉換', () => {
     vi.stubGlobal('fetch', fetchMock);
     const out = await convertToTraditional(['句一'], ['K1']);
     expect(out).toEqual(['句一']);
+  });
+});
+
+describe('忙線記憶：撞過 503 的型號十分鐘內自動跳過', () => {
+  it('markModelBusy 之後，選型與換型都跳過它；過期自動解除', async () => {
+    markModelBusy('m-busy', 30);
+    expect(isModelBusy('m-busy')).toBe(true);
+    await new Promise((r) => setTimeout(r, 40));
+    expect(isModelBusy('m-busy')).toBe(false);
+  });
+
+  it('首選忙線 → pickModelForKeys 直接給下一名，不必先撞一次', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await pickModelForKeys(['K1'])).toBe('gemini-3.5-flash'); // 建立快取
+    markModelBusy('gemini-3.5-flash');
+    expect(await pickModelForKeys(['K1'])).toBe('gemini-3.1-pro'); // 跳過忙線的首選
+  });
+
+  it('nextModelForKeys 跳過忙線的候選', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    await pickModelForKeys(['K1']);
+    markModelBusy('gemini-3.1-pro');
+    // 3.5-flash 的下一名本是 3.1-pro（忙線）→ 跳到再下一名
+    expect(await nextModelForKeys(['K1'], 'gemini-3.5-flash')).toBe('gemini-2.5-flash');
+  });
+
+  it('503 打到第 2 輪就放棄並標記忙線，不再空等滿五輪', async () => {
+    vi.useFakeTimers();
+    localStorage.removeItem('groq_api_key');
+    const fetchMock = vi.fn((url) => {
+      if (String(url).includes('/models?')) return Promise.resolve(jsonResponse(MODELS_RESPONSE));
+      return Promise.resolve(errResponse(503, { error: { code: 503, message: 'This model is currently experiencing high demand.' } }));
+    });
+    vi.stubGlobal('fetch', fetchMock);
+    const p = regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    // 只需撐過第一輪的 8 秒等待；打滿五輪要 80 秒
+    await vi.advanceTimersByTimeAsync(15000);
+    const err = await p;
+    vi.useRealTimers();
+    expect(String(err.message)).toMatch(/忙不過來|忙線/);
+    const gen = fetchMock.mock.calls.filter(([u]) => String(u).includes('generateContent'));
+    expect(gen.length).toBe(2); // 第 1 輪 + 第 2 輪，各一次
+    expect(isModelBusy('gemini-3.5-flash')).toBe(true); // 已被標記，之後的選型會跳過
   });
 });
 
