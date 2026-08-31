@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation, markModelBusy, isModelBusy, clearModelBusy, markModelUnsupported, isModelUnsupported, clearModelUnsupported, isUnsupportedModelError } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation, markModelBusy, isModelBusy, clearModelBusy, markModelUnsupported, isModelUnsupported, clearModelUnsupported, isUnsupportedModelError, getModelChoices } from '../js/gemini.js';
 import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
@@ -1102,6 +1102,30 @@ describe('Groq 備援的判斷與繁體轉換', () => {
     vi.stubGlobal('fetch', fetchMock);
     const out = await convertToTraditional(['句一'], ['K1']);
     expect(out).toEqual(['句一']);
+  });
+});
+
+describe('專用型號一律不進候選（選了必定 400）', () => {
+  it('rankModels 排除 transcribe／speech／dialog／native-audio 等專用型號', () => {
+    const models = [
+      { name: 'models/gemini-3.7-flash', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3.7-flash-transcribe', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3-speech-to-text', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3-native-audio-dialog', supportedGenerationMethods: ['generateContent'] },
+      { name: 'models/gemini-3.6-flash', supportedGenerationMethods: ['generateContent'] },
+    ];
+    expect(rankModels(models, { preferLite: false })).toEqual(['gemini-3.7-flash', 'gemini-3.6-flash']);
+  });
+
+  it('getModelChoices 不列出已學到不支援的型號（不是標記，是不給選）', async () => {
+    const fetchMock = vi.fn().mockResolvedValue(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    const before = await getModelChoices(['K1']);
+    expect(before.map((c) => c.name)).toContain('gemini-3.1-pro');
+    markModelUnsupported('gemini-3.1-pro');
+    const after = await getModelChoices(['K1']);
+    expect(after.map((c) => c.name)).not.toContain('gemini-3.1-pro');
+    clearModelUnsupported();
   });
 });
 
