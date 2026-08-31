@@ -1,11 +1,12 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
-import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation, markModelBusy, isModelBusy, clearModelBusy } from '../js/gemini.js';
+import { transcribeRange, transcribeAndSummarize, pickModel, rankModels, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, pickModelForKeys, regenerateSummary, isTransientStatus, parseRetryDelayMs, translateMeeting, askMeeting, extractTerms, enhanceSection, uploadForJob, missingKeyEntries, pickUploadKeys, canUseWholeMode, generateNotes, enhanceNotesSection, requestAbort, clearAbort, clearModelCache, resetThinkingFlag, resetKeyRotation, markModelBusy, isModelBusy, clearModelBusy, markModelUnsupported, isModelUnsupported, clearModelUnsupported, isUnsupportedModelError } from '../js/gemini.js';
 import { recordCooldown, recordUse } from '../js/usage.js';
 
 beforeEach(() => {
   vi.restoreAllMocks();
   clearModelCache();
   clearModelBusy();
+  clearModelUnsupported();
   resetThinkingFlag();
   clearAbort();
   resetKeyRotation();
@@ -1101,6 +1102,46 @@ describe('Groq 備援的判斷與繁體轉換', () => {
     vi.stubGlobal('fetch', fetchMock);
     const out = await convertToTraditional(['句一'], ['K1']);
     expect(out).toEqual(['句一']);
+  });
+});
+
+describe('型號不支援 JSON 模式', () => {
+  it('400 JSON mode → 講型號能力，不可誤報成音檔損毀', async () => {
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE))
+      .mockResolvedValue(errResponse(400, { error: { code: 400, message: 'JSON mode is not enabled for this model', status: 'INVALID_ARGUMENT' } }));
+    vi.stubGlobal('fetch', fetchMock);
+    const err = await regenerateSummary([{ speaker: 's', text: 't' }], 'KEY').then(
+      () => new Error('不該成功'),
+      (e) => e
+    );
+    expect(String(err.message)).toMatch(/不支援結構化輸出/);
+    expect(String(err.message)).not.toMatch(/損毀|格式不支援或已損毀/);
+    expect(isUnsupportedModelError(err)).toBe(true);
+    expect(isModelUnsupported('gemini-3.5-flash')).toBe(true); // 已永久排除
+    clearModelUnsupported();
+  });
+
+  it('不支援的型號永遠不會再被選到（連退而求其次也不行）', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    expect(await pickModelForKeys(['K1'])).toBe('gemini-3.5-flash');
+    markModelUnsupported('gemini-3.5-flash');
+    clearModelCache();
+    const fetchMock2 = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock2);
+    expect(await pickModelForKeys(['K1'])).toBe('gemini-3.1-pro');
+    clearModelUnsupported();
+  });
+
+  it('nextModelForKeys 跳過不支援的型號', async () => {
+    const fetchMock = vi.fn().mockResolvedValueOnce(jsonResponse(MODELS_RESPONSE));
+    vi.stubGlobal('fetch', fetchMock);
+    await pickModelForKeys(['K1']);
+    markModelUnsupported('gemini-3.1-pro');
+    expect(await nextModelForKeys(['K1'], 'gemini-3.5-flash')).toBe('gemini-2.5-flash');
+    clearModelUnsupported();
   });
 });
 
