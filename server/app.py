@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 from urllib.parse import unquote
@@ -9,7 +10,7 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
-from .jobs import JobQueue
+from .jobs import JobQueue, build_jobs_router, load_worker_key
 from .storage import BadId, Store, read_json
 from .uploads import build_router as build_uploads_router
 
@@ -113,7 +114,7 @@ def build_router(store: Store) -> APIRouter:
 
 
 def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
-               start_threads: bool = True) -> FastAPI:
+               start_threads: bool = True, worker_key: str | None = None) -> FastAPI:
     app = FastAPI(title="DD會議紀錄")
     store = Store(Path(data_dir))
     app.state.store = store
@@ -127,6 +128,18 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
 
     app.include_router(build_router(store))
     app.include_router(build_uploads_router(store, lambda: app.state.jobs))
+    app.include_router(build_jobs_router(store, lambda: app.state.jobs,
+                                         worker_key if worker_key is not None else load_worker_key()))
+
+    if start_threads:
+        def _stale_loop():
+            while True:
+                time.sleep(60)
+                try:
+                    app.state.jobs.requeue_stale()
+                except Exception:
+                    pass
+        threading.Thread(target=_stale_loop, daemon=True, name="requeue-stale").start()
 
     mount_static(app)  # keep last: routers must be included before this line
     return app
