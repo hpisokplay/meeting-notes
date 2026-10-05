@@ -10,6 +10,7 @@ from urllib.parse import unquote
 from fastapi import APIRouter, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
+from .ai import AIThread, build_ai_router, on_ai_job_terminal
 from .jobs import JobQueue, build_jobs_router, load_worker_key
 from .storage import BadId, Store, read_json
 from .uploads import build_router as build_uploads_router
@@ -19,6 +20,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 
 STATIC_FILES = {"index.html", "sw.js", "manifest.webmanifest"}
 STATIC_DIRS = {"css", "js", "icons"}
+# owned by the server (job pipeline): a client PUT never changes them
+SERVER_OWNED = ("status", "progress", "jobId", "aiJobId", "audio", "error")
 
 
 def _guard(fn):
@@ -83,7 +86,18 @@ def build_router(store: Store) -> APIRouter:
     def put_meeting(mid: str, body: dict = Body(...)):
         if body.get("id") != mid:
             raise HTTPException(400, "會議 id 與網址不一致")
-        return _guard(lambda: store.save(body))
+
+        def save():
+            with store._lock(mid):  # same lock as store.update: no lost job-state write
+                stored = store.get(mid)
+                if stored is not None:
+                    for k in SERVER_OWNED:
+                        if k in stored:
+                            body[k] = stored[k]
+                        else:
+                            body.pop(k, None)
+                return store.save(body)
+        return _guard(save)
 
     @r.delete("/meetings/{mid}")
     def delete_meeting(mid: str):
@@ -119,7 +133,7 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
     store = Store(Path(data_dir))
     app.state.store = store
     app.state.jobs = JobQueue(store)
-    app.state.claude_cmd = claude_cmd
+    app.state.claude_cmd = list(claude_cmd) if claude_cmd else ["claude"]
     app.state.start_threads = start_threads
 
     @app.exception_handler(BadId)
@@ -130,6 +144,10 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
     app.include_router(build_uploads_router(store, lambda: app.state.jobs))
     app.include_router(build_jobs_router(store, lambda: app.state.jobs,
                                          worker_key if worker_key is not None else load_worker_key()))
+    app.include_router(build_ai_router(store, lambda: app.state.jobs))
+    # cancelled / permanently failed pipeline summary -> meeting back to "done"
+    if hasattr(app.state.jobs, "add_terminal_listener"):
+        app.state.jobs.add_terminal_listener(lambda job, state: on_ai_job_terminal(store, job, state))
 
     if start_threads:
         def _stale_loop():
@@ -140,6 +158,8 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
                 except Exception:
                     pass
         threading.Thread(target=_stale_loop, daemon=True, name="requeue-stale").start()
+        app.state.ai_thread = AIThread(store, app.state.jobs, app.state.claude_cmd)
+        app.state.ai_thread.start()
 
     mount_static(app)  # keep last: routers must be included before this line
     return app
