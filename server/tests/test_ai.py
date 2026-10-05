@@ -413,3 +413,150 @@ def test_http_cancel_unsticks_pipeline_summary(app_client):
     if not hasattr(app.state.jobs, "add_terminal_listener"):
         pytest.skip("JobQueue.add_terminal_listener not available yet (Task 3 fix pending)")
     assert app.state.store.get("m1")["status"] == "done"
+
+
+# ---------------------------------------------------------------- fix round 1
+from server.ai import ClaudeTransientError  # noqa: E402
+
+
+def _custom(monkeypatch, stdout="", stderr="", rc=1):
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "custom")
+    monkeypatch.setenv("FAKE_CLAUDE_STDOUT", stdout)
+    monkeypatch.setenv("FAKE_CLAUDE_STDERR", stderr)
+    monkeypatch.setenv("FAKE_CLAUDE_RC", str(rc))
+
+
+def test_limit_detection_ignores_numbers_and_meeting_text(monkeypatch):
+    _custom(monkeypatch, json.dumps({"type": "result", "subtype": "error_during_execution",
+                                     "is_error": True, "duration_ms": 14293, "num_turns": 429,
+                                     "result": "額度預算討論"}, ensure_ascii=False))
+    with pytest.raises(ClaudeError) as e:
+        run_claude("s", "u", {}, "sonnet", FAKE)
+    assert type(e.value) is ClaudeError
+
+
+@pytest.mark.parametrize("stdout,stderr,exc", [
+    ("", "API Error: 429 rate_limit_error", ClaudeLimitError),
+    (json.dumps({"is_error": True, "result": "Claude AI usage limit reached|1760000000"}), "", ClaudeLimitError),
+    ("", "API Error: 500 Internal server error", ClaudeTransientError),
+    ("", "API Error: Connection error.", ClaudeTransientError),
+    ("", "Error: fetch failed (ECONNRESET)", ClaudeTransientError),
+    (json.dumps({"is_error": True, "result": "Overloaded", "api_error_status": 529}), "", ClaudeTransientError),
+    (json.dumps({"is_error": True, "result": "x", "api_error_status": 503}), "", ClaudeTransientError),
+])
+def test_error_classification(monkeypatch, stdout, stderr, exc):
+    _custom(monkeypatch, stdout, stderr)
+    with pytest.raises(exc):
+        run_claude("s", "u", {}, "sonnet", FAKE)
+
+
+def test_parse_error_and_timeout_are_permanent(monkeypatch):
+    _custom(monkeypatch, json.dumps({"is_error": False, "result": "not json"}), "", 0)
+    with pytest.raises(ClaudeError) as e:
+        run_claude("s", "u", {}, "sonnet", FAKE)
+    assert type(e.value) is ClaudeError
+    monkeypatch.setenv("FAKE_CLAUDE_MODE", "sleep")
+    with pytest.raises(ClaudeError) as e:
+        run_claude("s", "u", {}, "sonnet", FAKE, timeout=1)
+    assert type(e.value) is ClaudeError
+
+
+def test_transient_error_retried_in_5_minutes_with_shared_cap(sj, monkeypatch):
+    store, jobs = sj
+    _custom(monkeypatch, "", "API Error: Connection error.")
+    jid = jobs.enqueue("ai", "m1", {"action": "summary"})
+    mk(store, status="summarizing", aiJobId=jid)
+    t0 = time.time()
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    j = jobs.get(jid)
+    assert j["state"] == "queued" and j["retries"] == 1
+    assert j["error"] == "Claude 暫時連不上，5 分鐘後自動重試"
+    assert t0 + 290 <= j["notBefore"] <= time.time() + 310
+    assert store.get("m1")["progress"]["msg"] == "Claude 暫時連不上，5 分鐘後自動重試"
+    p = jobs.dirs["queued"] / f"{jid}.json"
+    j.update(notBefore=None, retries=6)
+    p.write_text(json.dumps(j), encoding="utf-8")
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    j = jobs.get(jid)
+    assert j["state"] == "failed" and "暫時連不上" in j["error"] and "5 分鐘後" not in j["error"]
+
+
+def test_manual_summary_clears_error(sj):
+    store, jobs = sj
+    mk(store, error="Claude 用量已達上限")
+    run_job(store, jobs, "summary")
+    assert store.get("m1")["error"] is None
+
+
+def test_cancel_between_call_and_write_skips_write(sj, monkeypatch):
+    store, jobs = sj
+    mk(store)
+    jid = jobs.enqueue("ai", "m1", {"action": "enhance", "section": "qa"})
+    job = jobs.claim(["ai"], "nas-ai")
+    real_update = store.update
+
+    def cancel_then_update(mid, fn):  # the cancel lands right before the write-back
+        jobs.cancel(jid)
+        return real_update(mid, fn)
+    monkeypatch.setattr(store, "update", cancel_then_update)
+    handle_ai_job(store, job, FAKE, jobs)
+    monkeypatch.undo()
+    assert jobs.get(jid)["state"] == "cancelled"
+    m = store.get("m1")
+    assert m["summary"]["qa"] == ["問：舊 答：舊"] and "alt" not in m
+
+
+def test_notes_anchor_strips_time_and_speaker():
+    from server import prompts as P
+    assert "anchor 只放原句文字，不含時間與說話者" in P.NOTES_PROMPT
+    assert "anchor 只放原句文字，不含時間與說話者" in P.notes_enhance_prompt("outline")
+    r = ai.normalize_notes({"outline": [
+        {"title": "A", "anchor": "[01:02:05] 說話者 1: 我們談台積店的案子", "points": []},
+        {"title": "B", "anchor": "[00:00:09] Jeffrey：先看規格", "points": []},
+        {"title": "C", "anchor": "時間：下週", "points": []}]})
+    assert [o["anchor"] for o in r["outline"]] == ["我們談台積店的案子", "先看規格", "時間：下週"]
+
+
+def test_terms_scanned_in_batches_and_merged(sj, monkeypatch, tmp_path):
+    store, jobs = sj
+    monkeypatch.setattr(ai, "TERMS_BATCH_CHARS", 30)
+    log = tmp_path / "log.jsonl"
+    monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
+    mk(store, transcript=[{"speaker": "A", "text": "《甲公司|org》在談", "t": 1},
+                          {"speaker": "B", "text": "《甲公司|person》與《乙君|person》", "t": 2},
+                          {"speaker": "A", "text": "《丙產品|product》", "t": 3}])
+    run_job(store, jobs, "terms")
+    scans = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    assert sum("專有名詞」" in c["argv"][c["argv"].index("--system-prompt") + 1] for c in scans) == 3
+    items = store.get("m1")["terms"]["items"]
+    assert [(x["t"], x["cat"]) for x in items] == [("甲公司", "org"), ("乙君", "person"), ("丙產品", "product")]
+
+
+def test_translate_count_mismatch_retried_once(sj, monkeypatch, tmp_path):
+    store, jobs = sj
+    monkeypatch.setenv("FAKE_CLAUDE_COUNTER", str(tmp_path / "n"))
+    monkeypatch.setenv("FAKE_CLAUDE_TR_DROP", "1")
+    mk(store)
+    run_job(store, jobs, "translate", lang="ja")
+    tr = store.get("m1")["translations"]["ja"]["transcript"]
+    assert [s["text"] for s in tr] == ["[譯]我們談台積店的案子", "[譯]Jefry 會負責", "[譯]台積殿下週回覆"]
+    assert int((tmp_path / "n").read_text()) == 2  # first short answer was retried
+
+
+def test_translate_count_mismatch_pads_with_originals(sj, monkeypatch, tmp_path):
+    store, jobs = sj
+    monkeypatch.setenv("FAKE_CLAUDE_COUNTER", str(tmp_path / "n"))
+    monkeypatch.setenv("FAKE_CLAUDE_TR_DROP", "99")
+    mk(store)
+    run_job(store, jobs, "translate", lang="en")
+    tr = store.get("m1")["translations"]["en"]["transcript"]
+    assert [s["t"] for s in tr] == [3725, "01:02", 4000.4]  # timestamps never shift
+    assert tr[0]["text"] == "[譯]我們談台積店的案子" and tr[2] == TRANSCRIPT[2]
+
+
+def test_context_budget_per_model():
+    m = {"transcript": []}
+    assert ai.Ctx(m, None, None, "haiku").budget == 150_000
+    assert ai.Ctx(m, None, None, "claude-haiku-4-5").budget == 150_000
+    assert ai.Ctx(m, None, None, "sonnet").budget == 600_000
+    assert ai.Ctx(m, None, None, "opus").budget == 600_000

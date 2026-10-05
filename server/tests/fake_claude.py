@@ -7,6 +7,10 @@ Mode comes from env FAKE_CLAUDE_MODE:
   env             structured_output {"env": [names of env vars]}
   result_only     no structured_output; JSON in `result` (inside a ```json fence)
   sleep           sleep 60 s (timeout / cancel tests)
+  custom          FAKE_CLAUDE_STDOUT / FAKE_CLAUDE_STDERR / FAKE_CLAUDE_RC printed verbatim
+In auto mode, terms marked 《詞|cat》 in stdin are returned as the term-scan items, and
+FAKE_CLAUDE_TR_DROP=n (+ FAKE_CLAUDE_COUNTER=<file>) drops a segment in the first n
+transcript translation calls.
 FAKE_CLAUDE_LOG=<path> appends {"argv": [...], "stdin": "..."} as one JSON line per call.
 """
 import json
@@ -31,10 +35,28 @@ def prefix_strings(x, p):
     return x
 
 
+def bump_counter():
+    """FAKE_CLAUDE_COUNTER=<file>: returns how many times this was called before."""
+    p = os.environ.get("FAKE_CLAUDE_COUNTER")
+    if not p:
+        return 0
+    n = int(open(p).read() or 0) if os.path.exists(p) else 0
+    with open(p, "w") as f:
+        f.write(str(n + 1))
+    return n
+
+
 def auto(schema, system, stdin):
     props = set((schema.get("properties") or {}).keys())
     if "translator" in system:
-        return prefix_strings(json.loads(stdin), "[譯]")
+        out = prefix_strings(json.loads(stdin), "[譯]")
+        # FAKE_CLAUDE_TR_DROP=n: the first n segment batches come back one segment short
+        if "segments" in out and bump_counter() < int(os.environ.get("FAKE_CLAUDE_TR_DROP", "0")):
+            out["segments"] = out["segments"][:-1]
+        return out
+    marked = re.findall(r"《([^|》]+)\|([a-z]+)》", stdin)
+    if props == {"items"} and marked and "term" in schema["properties"]["items"]["items"].get("properties", {}):
+        return {"items": [{"term": t, "category": c, "fix": ""} for t, c in marked]}
     if props == {"actionItems", "mainPoints", "qa"}:
         return {"actionItems": ["新待辦 [DRI: 待指派]"], "mainPoints": ["新重點：說明"],
                 "qa": ["問：新問題？ 答：新答案。"]}
@@ -82,6 +104,10 @@ def main():
     if mode == "fail":
         sys.stderr.write("boom: something broke\n")
         return 2
+    if mode == "custom":  # FAKE_CLAUDE_STDOUT / FAKE_CLAUDE_STDERR / FAKE_CLAUDE_RC verbatim
+        out.write(os.environ.get("FAKE_CLAUDE_STDOUT", "").encode("utf-8"))
+        sys.stderr.write(os.environ.get("FAKE_CLAUDE_STDERR", ""))
+        return int(os.environ.get("FAKE_CLAUDE_RC", "1"))
     if mode == "env":
         res = {"env": sorted(os.environ.keys())}
     else:

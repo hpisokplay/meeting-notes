@@ -28,10 +28,21 @@ TIMEOUT_S = 30 * 60
 LIMIT_RETRY_S = 30 * 60
 MAX_LIMIT_RETRIES = 6
 LIMIT_MSG = "Claude 用量已達上限，30 分鐘後自動重試"
-LIMIT_RE = re.compile(r"usage limit|rate limit|429|limit reached|overloaded|額度", re.I)
+TRANSIENT_RETRY_S = 5 * 60
+TRANSIENT_MSG = "Claude 暫時連不上，5 分鐘後自動重試"
+# Both are matched ONLY against stderr, the `result` text and the subtype / api_error_status
+# fields (never the whole stdout JSON: "duration_ms":14293 etc. must not look like an error).
+LIMIT_RE = re.compile(r"usage limit|rate limit|\b429\b|limit reached|額度已用完|額度不足|用量已達上限", re.I)
+TRANSIENT_RE = re.compile(
+    r"api error:?\s*5\d\d\b|\b5\d\d\b[^\n]{0,40}(?:error|internal|unavailable|gateway)"
+    r"|internal server error|service unavailable|bad gateway|gateway timeout"
+    r"|connection error|econnreset|etimedout|econnrefused|fetch failed|socket hang up"
+    r"|overloaded|\b529\b", re.I)
 KEEP_ENV = {"CLAUDE_CODE_OAUTH_TOKEN", "CLAUDE_CONFIG_DIR"}
 
-MAX_CHARS = 600_000              # whole-transcript budget per call (spec §9)
+MAX_CHARS = 600_000              # whole-transcript budget per call (spec §9; sonnet/opus 1M ctx)
+HAIKU_MAX_CHARS = 150_000        # haiku: smaller context window
+TERMS_BATCH_CHARS = 60_000       # terms: batched scan for recall (legacy: 240 lines)
 ENHANCE_BATCH_CHARS = 60_000     # enhance: batched scan for completeness (legacy: 240 lines)
 NOTES_ENHANCE_BATCH_CHARS = 20_000  # notes_enhance (legacy: 80 lines)
 TRANSLATE_BATCH_CHARS = 12_000   # translated output must fit the output-token limit
@@ -50,6 +61,10 @@ class ClaudeError(Exception):
 
 class ClaudeLimitError(ClaudeError):
     """Usage / rate limit: retry later."""
+
+
+class ClaudeTransientError(ClaudeError):
+    """API 5xx / overloaded / network trouble: retry in 5 minutes."""
 
 
 class ClaudeAborted(ClaudeError):
@@ -73,6 +88,14 @@ def _kill_tree(proc: subprocess.Popen) -> None:
         pass
     try:
         proc.kill()
+    except Exception:
+        pass
+
+
+def _drain(proc: subprocess.Popen) -> None:
+    """Reap a killed process without ever blocking forever on a stuck pipe."""
+    try:
+        proc.communicate(timeout=10)
     except Exception:
         pass
 
@@ -109,11 +132,11 @@ def run_claude(system: str, user: str, schema: dict, model: str, cmd: list[str],
             first = False
             if abort is not None and abort():
                 _kill_tree(proc)
-                proc.communicate()
+                _drain(proc)
                 raise ClaudeAborted("已取消")
             if time.monotonic() > deadline:
                 _kill_tree(proc)
-                proc.communicate()
+                _drain(proc)
                 raise ClaudeError(f"Claude 逾時（超過 {int(timeout // 60) or 1} 分鐘）")
     stdout = out.decode("utf-8", errors="replace")
     stderr = err.decode("utf-8", errors="replace")
@@ -125,10 +148,18 @@ def run_claude(system: str, user: str, schema: dict, model: str, cmd: list[str],
         data = None
     failed = proc.returncode != 0 or data is None or bool(data.get("is_error"))
     if failed:
-        text = " ".join(x for x in ((data or {}).get("result") if data else None, stderr, stdout)
-                        if isinstance(x, str) and x)
+        parts = [stderr]
+        if data is not None:
+            parts += [data.get("result"), data.get("subtype"), data.get("api_error_status")]
+        else:
+            parts.append(stdout)  # not JSON at all: the raw text is the error message
+        text = " ".join(str(x) for x in parts
+                        if x not in (None, "") and not isinstance(x, (dict, list)))
         if LIMIT_RE.search(text):
             raise ClaudeLimitError(LIMIT_MSG)
+        status = (data or {}).get("api_error_status")
+        if TRANSIENT_RE.search(text) or (isinstance(status, int) and 500 <= status <= 599):
+            raise ClaudeTransientError(TRANSIENT_MSG)
         snippet = re.sub(r"\s+", " ", text).strip()[:300] or f"結束代碼 {proc.returncode}"
         raise ClaudeError(f"Claude 執行失敗：{snippet}")
     so = data.get("structured_output")
@@ -283,6 +314,14 @@ def _a(x) -> list:
     return x if isinstance(x, list) else []
 
 
+ANCHOR_PREFIX_RE = re.compile(r"^\[\d\d:\d\d:\d\d\]\s*[^:：]+[:：]\s*")
+
+
+def _clean_anchor(x) -> str:
+    """Anchors must be plain transcript text; prompt lines carry `[HH:MM:SS] 說話者: `."""
+    return ANCHOR_PREFIX_RE.sub("", _s(x)).strip()
+
+
 def normalize_notes(r) -> dict:
     o = r if isinstance(r, dict) else {}
     d = lambda x: x if isinstance(x, dict) else {}  # noqa: E731
@@ -310,7 +349,7 @@ def normalize_notes(r) -> dict:
         if f2["label"]:
             figures.append(f2)
     return {
-        "outline": [x for x in ({"title": _s(d(x).get("title")), "anchor": _s(d(x).get("anchor")),
+        "outline": [x for x in ({"title": _s(d(x).get("title")), "anchor": _clean_anchor(d(x).get("anchor")),
                                  "points": [p for p in map(_s, _a(d(x).get("points"))) if p]}
                                 for x in _a(o.get("outline"))) if x["title"]],
         "concepts": [x for x in ({"term": _s(d(x).get("term")), "plain": _s(d(x).get("plain")),
@@ -356,15 +395,16 @@ def _dedupe(xs):
 class Ctx:
     """What an action needs: the meeting, a Claude caller and a progress reporter."""
 
-    def __init__(self, meeting: dict, call, report):
+    def __init__(self, meeting: dict, call, report, model: str = "sonnet"):
         self.m = meeting
+        self.budget = HAIKU_MAX_CHARS if "haiku" in (model or "").lower() else MAX_CHARS
         self.call = call  # call(system, user, schema) -> dict
         self.report = report  # report(pct, msg)
         self.lines = transcript_lines(meeting.get("transcript"))
 
 
 def _summary(ctx: Ctx, payload):
-    chunks = chunk_lines(ctx.lines, MAX_CHARS)
+    chunks = chunk_lines(ctx.lines, ctx.budget)
     acc = {"actionItems": [], "mainPoints": [], "qa": []}
     for i, text in enumerate(chunks):
         ctx.report(5 + 90 * i // len(chunks), "Claude 摘要中…" if len(chunks) == 1
@@ -382,6 +422,7 @@ def _summary(ctx: Ctx, payload):
                 alt[f"summary:{k}"] = list(_a(old.get(k)))
         m["summary"] = summary
         m["translations"] = {}
+        m["error"] = None  # any successful summary clears an old (e.g. failed-summary) error
     return apply
 
 
@@ -417,7 +458,7 @@ def _enhance(ctx: Ctx, payload):
 
 
 def _notes(ctx: Ctx, payload):
-    chunks = chunk_lines(ctx.lines, MAX_CHARS)
+    chunks = chunk_lines(ctx.lines, ctx.budget)
     parts = []
     for i, text in enumerate(chunks):
         ctx.report(5 + 90 * i // len(chunks), "Claude 整理學習筆記中…" if len(chunks) == 1
@@ -459,7 +500,7 @@ def _notes_enhance(ctx: Ctx, payload):
 def _ask(ctx: Ctx, payload):
     q = payload["question"].strip()
     ctx.report(10, "Claude 思考回答中…")
-    text = pick_relevant(ctx.lines, q)
+    text = pick_relevant(ctx.lines, q, budget=ctx.budget)
     r = ctx.call(P.ASK_PROMPT, P.ask_user_message(ctx.m.get("summary"), text, q), P.ANSWER_SCHEMA)
     a = _s(r.get("answer"))
     if not a:
@@ -473,10 +514,11 @@ def _ask(ctx: Ctx, payload):
 
 
 def _terms(ctx: Ctx, payload):
-    chunks = chunk_lines(ctx.lines, MAX_CHARS)
-    found: dict[str, dict] = {}
+    # batched like enhance: one pass over a long transcript misses terms (recall)
+    chunks = chunk_lines(ctx.lines, min(TERMS_BATCH_CHARS, ctx.budget))
+    found: dict[str, dict] = {}  # dedupe by t; the first batch's category wins
     for i, text in enumerate(chunks):
-        ctx.report(5 + 70 * i // len(chunks), "Claude 挑出專有名詞中…")
+        ctx.report(5 + 70 * i // len(chunks), f"Claude 挑出專有名詞中…（{i + 1}/{len(chunks)}）")
         r = ctx.call(P.TERMS_PROMPT, text, P.TERMS_SCHEMA)
         for it in _a(r.get("items")):
             it = it if isinstance(it, dict) else {}
@@ -547,12 +589,18 @@ def _translate(ctx: Ctx, payload):
         ctx.report(15 + 80 * i // len(batches), f"Claude 翻譯逐字稿中…（{i + 1}/{len(batches)}）")
         src = {"segments": [{"speaker": str(x.get("speaker") or ""), "text": str(x.get("text") or "")}
                             for x in b]}
-        got = [x for x in _a(ctx.call(system, json.dumps(src, ensure_ascii=False),
-                                      P.TR_SEG_SCHEMA).get("segments")) if isinstance(x, dict)]
-        for j, g in enumerate(got):
-            seg = dict(b[j]) if j < len(b) else {}
-            seg["speaker"] = _s(g.get("speaker")) or seg.get("speaker") or ""
-            seg["text"] = g.get("text") if isinstance(g.get("text"), str) else ""
+        for _attempt in range(2):  # a different count would shift timestamps: retry once
+            got = [x for x in _a(ctx.call(system, json.dumps(src, ensure_ascii=False),
+                                          P.TR_SEG_SCHEMA).get("segments")) if isinstance(x, dict)]
+            if len(got) == len(b):
+                break
+        for j, orig in enumerate(b):  # pad (keep the original) / trim to exactly the batch length
+            seg = dict(orig)
+            if j < len(got):
+                g = got[j]
+                seg["speaker"] = _s(g.get("speaker")) or seg.get("speaker") or ""
+                if isinstance(g.get("text"), str):
+                    seg["text"] = g["text"]
             tr_segs.append(seg)
     out["transcript"] = tr_segs
 
@@ -653,11 +701,16 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
         if handler is None:
             raise ClaudeError(f"未知的 AI 動作：{action}")
         report(0, f"Claude {LABELS.get(action, '處理')}中…" if action in LABELS else "Claude 處理中…")
-        apply = handler(Ctx(m, call, report), payload)
+        apply = handler(Ctx(m, call, report, model), payload)
         if abort():
             raise ClaudeAborted("已取消")
 
         def write(mm):
+            # runs under the meeting lock: a cancel that landed after the Claude call returned
+            # must still win (raising here aborts store.update before anything is saved)
+            j = jobs.get(jid)
+            if j is None or j.get("state") != "running":
+                raise ClaudeAborted("已取消")
             apply(mm)
             if action == "summary" and _is_pipeline_summary(mm, jid):
                 mm["status"] = "done"
@@ -679,16 +732,23 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
                 report_limit(store, mid, jid)
         else:
             jobs.fail(jid, f"{e}（已重試 {MAX_LIMIT_RETRIES} 次仍失敗）".replace("，30 分鐘後自動重試", ""))
+    except ClaudeTransientError as e:  # shares the retries counter / cap with the limit retries
+        if (job.get("retries") or 0) < MAX_LIMIT_RETRIES:
+            jobs.fail(jid, TRANSIENT_MSG, retry_at=time.time() + TRANSIENT_RETRY_S)
+            if pipeline:
+                report_limit(store, mid, jid, TRANSIENT_MSG)
+        else:
+            jobs.fail(jid, f"{e}（已重試 {MAX_LIMIT_RETRIES} 次仍失敗）".replace("，5 分鐘後自動重試", ""))
     except Exception as e:  # ClaudeError and anything unexpected: permanent failure
         if not isinstance(e, ClaudeError):
             log.exception("ai job %s crashed", jid)
         jobs.fail(jid, str(e) or "AI 工作失敗")
 
 
-def report_limit(store: Store, mid: str, jid: str) -> None:
+def report_limit(store: Store, mid: str, jid: str, msg: str = LIMIT_MSG) -> None:
     def ap(m):
         if _is_pipeline_summary(m, jid):
-            m["progress"] = {"stage": "claude", "pct": 0, "msg": LIMIT_MSG,
+            m["progress"] = {"stage": "claude", "pct": 0, "msg": msg,
                              "engine": (m.get("progress") or {}).get("engine", "")}
     try:
         store.update(mid, ap)
