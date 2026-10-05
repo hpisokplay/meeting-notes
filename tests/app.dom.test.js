@@ -224,6 +224,66 @@ describe('app（整合，假 NAS）', () => {
     expect(document.querySelector('.card[data-id="q1"]').innerHTML).toContain('排隊中（等電腦轉錄器）');
   });
 
+  it('轉錄完成但摘要失敗（done + error）：詳情頁顯示錯誤與「重新產生摘要」', async () => {
+    nas.meetings['test-1'].error = '額度用完';
+    await go('#/m/test-1');
+    const html = document.getElementById('view').innerHTML;
+    expect(html).toContain('摘要失敗：額度用完');
+    expect(document.getElementById('reSummary')).toBeTruthy();
+    // 沒有錯誤的完成會議不掛橫幅
+    delete nas.meetings['test-1'].error;
+    await go('#/');
+    await go('#/m/test-1');
+    expect(document.getElementById('reSummary')).toBeNull();
+  });
+
+  it('摘要中按停止／取消並刪除：取消的是 AI 工作（aiJobId），不是已完成的轉錄工作', async () => {
+    const mk = () => ({
+      id: 's1',
+      title: '摘要中的會議',
+      createdAt: Date.now(),
+      status: 'summarizing',
+      jobId: 'jt-done',
+      aiJobId: 'ja-run',
+      progress: { stage: 'summarizing', pct: 0 },
+      audio: [{ name: 'x.m4a' }],
+      transcript: [{ speaker: 'A', text: '嗨', t: 0 }],
+    });
+    nas.meetings.s1 = mk();
+    api.cancelJob.mockClear();
+    await go('#/job/s1');
+    await tick(60);
+    document.getElementById('pgStop').click();
+    await tick(60);
+    expect(api.cancelJob).toHaveBeenCalledWith('ja-run');
+    expect(api.cancelJob).not.toHaveBeenCalledWith('jt-done');
+    api.cancelJob.mockClear();
+    nas.meetings.s1 = mk();
+    await go('#/');
+    await go('#/job/s1');
+    await tick(60);
+    document.getElementById('pgDel').click();
+    await tick(60);
+    expect(api.cancelJob).toHaveBeenCalledWith('ja-run');
+    expect(api.cancelJob).not.toHaveBeenCalledWith('jt-done');
+  });
+
+  it('進度頁顯示目前細階段（每階段進度條會重來）', async () => {
+    nas.meetings.g1 = {
+      id: 'g1',
+      title: 'GPU 會議',
+      createdAt: Date.now(),
+      status: 'transcribing',
+      jobId: 'jg',
+      progress: { stage: 'diar', pct: 0, engine: 'gpu' },
+      audio: [{ name: 'x.m4a' }],
+    };
+    await go('#/job/g1');
+    await tick(60);
+    expect(document.querySelector('.prog-label').textContent).toContain('轉錄中・分辨說話者（第 3/4 步）');
+    await go('#/');
+  });
+
   it('換頁不會讓輪詢越疊越多：清單每 5 秒只問一次 NAS', async () => {
     nas.meetings.p1 = { id: 'p1', title: '處理中', createdAt: Date.now(), status: 'transcribing', progress: { pct: 10 } };
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
@@ -312,6 +372,20 @@ describe('播放與狀態的純函式', () => {
     expect(appMod.seekTarget({ t: 12, fi: 1 }, audio)).toEqual({ part: 1, time: 12 });
     expect(appMod.seekTarget({ t: '01:05' }, [{}])).toEqual({ part: 0, time: 65 });
     expect(appMod.seekTarget({ t: 5 }, [])).toBeNull();
+  });
+
+  it('progressLabel／activeJobId：細階段文字與要取消的工作', async () => {
+    const { progressLabel, activeJobId } = await import('../js/app.js');
+    expect(progressLabel({ status: 'transcribing', progress: { stage: 'download' } })).toBe('轉錄中・下載錄音（第 1/4 步）');
+    expect(progressLabel({ status: 'transcribing', progress: { stage: 'asr' } })).toBe('轉錄中・語音轉文字（第 2/4 步）');
+    expect(progressLabel({ status: 'transcribing', progress: { stage: 'upload' } })).toBe('轉錄中・上傳結果（第 4/4 步）');
+    expect(progressLabel({ status: 'transcribing', progress: { stage: 'transcribe' } })).toBe('轉錄中・語音轉文字');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude' } })).toBe('摘要中');
+    expect(progressLabel({ status: 'queued', progress: { stage: 'queued' } })).toBe('排隊中（等電腦轉錄器）');
+    expect(progressLabel({ status: 'transcribing', progress: {} })).toBe('轉錄中');
+    expect(activeJobId({ status: 'summarizing', jobId: 't', aiJobId: 'a' })).toBe('a');
+    expect(activeJobId({ status: 'transcribing', jobId: 't', aiJobId: 'a' })).toBe('t');
+    expect(activeJobId({ status: 'queued' })).toBeNull();
   });
 
   it('statusText：失敗時附上伺服器錯誤', async () => {

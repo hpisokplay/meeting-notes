@@ -56,6 +56,33 @@ export function statusText(m) {
   if (st === 'failed') return m.error ? `${base}：${m.error}` : base;
   return base;
 }
+// 進度頁：伺服器回報的細階段（progress.stage）→ 中文。每個階段進度條會從 0 重新開始，
+// 所以要把「現在在第幾步、做什麼」寫出來，免得看起來像倒退。
+const PROGRESS_STAGE_TEXT = {
+  download: '下載錄音',
+  asr: '語音轉文字',
+  diar: '分辨說話者',
+  upload: '上傳結果',
+  transcribe: '語音轉文字',
+  claude: '摘要中',
+  summarizing: '摘要中',
+  queued: '排隊中（等電腦轉錄器）',
+  transcribing: '轉錄中',
+};
+const GPU_STEPS = ['download', 'asr', 'diar', 'upload'];
+export function progressLabel(m) {
+  const base = STAGE_TEXT[m && m.status] || (m && m.status) || '';
+  const stage = (m && m.progress && m.progress.stage) || '';
+  const sub = PROGRESS_STAGE_TEXT[stage];
+  if (!sub || sub === base) return base;
+  const step = GPU_STEPS.indexOf(stage);
+  return `${base}・${sub}${step >= 0 ? `（第 ${step + 1}/${GPU_STEPS.length} 步）` : ''}`;
+}
+// 停止／取消要取消「正在跑的那個工作」：摘要中是 AI 工作，其餘是轉錄工作
+export function activeJobId(m) {
+  if (!m) return null;
+  return (m.status === 'summarizing' ? m.aiJobId : m.jobId) || null;
+}
 export function isProcessing(m) {
   const st = m && m.status;
   return !!st && st !== 'done' && st !== 'failed';
@@ -982,7 +1009,7 @@ async function renderProgress(id) {
     document.getElementById('pgTitle').textContent = m.title || '';
     const p = m.progress || {};
     const pct = m.status === 'failed' ? 0 : Math.max(0, Math.min(100, Number(p.pct) || 0));
-    const stage = STAGE_TEXT[m.status] || m.status || '';
+    const stage = progressLabel(m);
     c.innerHTML = `
       ${m.status === 'failed' ? `<div class="err">❌ ${esc(statusText(m))}</div>` : `<div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div>
       <div class="prog-label">${esc(stage)}${p.pct != null ? ` ${Math.round(pct)}%` : ''}</div>`}
@@ -1004,13 +1031,17 @@ async function renderProgress(id) {
     const stop = document.getElementById('pgStop');
     if (stop)
       stop.onclick = async () => {
-        if (!m.jobId) {
+        const jid = activeJobId(m);
+        if (!jid) {
           toast('找不到這場的工作編號，請稍後再試');
           return;
         }
-        if (!confirm('停止這場轉錄？之後可以按「重新轉錄」再跑一次。')) return;
+        const ask = m.status === 'summarizing'
+          ? '停止這場摘要？逐字稿會保留，之後可以按「重新產生摘要」。'
+          : '停止這場轉錄？之後可以按「重新轉錄」再跑一次。';
+        if (!confirm(ask)) return;
         try {
-          await api.cancelJob(m.jobId);
+          await api.cancelJob(jid);
           toast('已停止');
           tick();
         } catch (e) {
@@ -1034,7 +1065,7 @@ async function renderProgress(id) {
     document.getElementById('pgDel').onclick = async () => {
       if (!confirm('取消並刪除這場會議？（會移到 NAS 的垃圾桶，不會真的消失）')) return;
       try {
-        if (isProcessing(m) && m.jobId) await api.cancelJob(m.jobId).catch(() => {});
+        if (isProcessing(m) && activeJobId(m)) await api.cancelJob(activeJobId(m)).catch(() => {});
         await api.deleteMeeting(id);
         await uncacheMeeting(id);
         toast('已取消並刪除');
@@ -1184,11 +1215,13 @@ async function renderDetail(id, preloaded) {
   const audioParts = Array.isArray(m.audio) ? m.audio : [];
   const hasTranscript = Array.isArray(m.transcript) && m.transcript.length > 0;
   // 還在處理（例如重新轉錄、摘要中）或失敗：頂端掛一條狀態
-  const stBanner = !m.status || m.status === 'done'
+  // 轉錄完成但摘要失敗：狀態是 done、error 有值 → 也要顯示錯誤與「重新產生摘要」
+  const summaryFailed = m.status === 'done' && !!m.error;
+  const stBanner = (!m.status || m.status === 'done') && !summaryFailed
     ? ''
     : isProcessing(m)
       ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(statusText(m))}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
-      : `<div class="warn st-warn"><div class="err">❌ ${esc(statusText(m))}</div>${hasTranscript ? '<button class="act-btn" id="reSummary" data-task="summary" style="margin-top:8px">🔄 重新產生摘要</button>' : ''}</div>`;
+      : `<div class="warn st-warn"><div class="err">❌ ${esc(summaryFailed ? `摘要失敗：${m.error}` : statusText(m))}</div>${hasTranscript ? '<button class="act-btn" id="reSummary" data-task="summary" style="margin-top:8px">🔄 重新產生摘要</button>' : ''}</div>`;
   const audioCard = audioParts.length
     ? `<div class="card" id="audioCard">
       <div class="section-title" style="margin-top:0"><span>🎧 錄音</span><button class="copy" id="retrBtn" type="button">🔁 重新轉錄</button></div>
