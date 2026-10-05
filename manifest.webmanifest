@@ -1,7 +1,9 @@
 {
   "name": "DD會議紀錄",
   "short_name": "DD會議紀錄",
+  "id": "./",
   "start_url": "./",
+  "description": "會議錄音轉逐字稿與摘要（NAS 版）",
   "scope": "./",
   "display": "standalone",
   "orientation": "portrait",
