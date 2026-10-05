@@ -11,7 +11,9 @@ from fastapi import APIRouter, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
 
 from .ai import AIThread, build_ai_router, on_ai_job_terminal
+from .importer import build_router as build_import_router
 from .jobs import JobQueue, build_jobs_router, load_worker_key
+from . import notify as tg_notify
 from .storage import BadId, Store, read_json
 from .uploads import build_router as build_uploads_router
 
@@ -145,9 +147,11 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
     app.include_router(build_jobs_router(store, lambda: app.state.jobs,
                                          worker_key if worker_key is not None else load_worker_key()))
     app.include_router(build_ai_router(store, lambda: app.state.jobs))
+    app.include_router(build_import_router(store))
     # cancelled / permanently failed pipeline summary -> meeting back to "done"
     if hasattr(app.state.jobs, "add_terminal_listener"):
         app.state.jobs.add_terminal_listener(lambda job, state: on_ai_job_terminal(store, job, state))
+        tg_notify.install(store, app.state.jobs)  # after on_ai_job_terminal: meeting is already done
 
     if start_threads:
         def _stale_loop():

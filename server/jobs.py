@@ -28,6 +28,7 @@ STATE_DIRS = {"queued": "queue", "running": "running", "done": "done",
 ACTIVE_STATES = ("queued", "running")
 MAX_STALE_REQUEUES = 3
 STALE_FAIL_MSG = "轉錄器多次中斷，請按「重新轉錄」再試一次"
+STALE_AI_FAIL_MSG = "AI 工作多次中斷，請再試一次"
 
 
 class _Skip(Exception):
@@ -54,11 +55,23 @@ class JobQueue:
         self.queue_dir = store.path("jobs", "queue")
         self.dirs = {s: store.path("jobs", d) for s, d in STATE_DIRS.items()}
         self._listeners: list = []
+        self._done_listeners: list = []
 
     def add_terminal_listener(self, fn) -> None:
         """fn(job, state) is called (outside the lock) after a job ends cancelled or failed
         (permanent failure only; a retry_at fail does not fire)."""
         self._listeners.append(fn)
+
+    def add_done_listener(self, fn) -> None:
+        """fn(job) is called (outside the lock) after finish() moved a job to done."""
+        self._done_listeners.append(fn)
+
+    def _notify_done(self, job) -> None:
+        for fn in list(self._done_listeners):
+            try:
+                fn(job)
+            except Exception:
+                log.exception("done listener failed")
 
     def _notify(self, job, state) -> None:
         for fn in list(self._listeners):
@@ -131,6 +144,14 @@ class JobQueue:
 
         check(job) may return True (claim it), False (leave it queued, try the next one) or a
         str (move the job to failed/ with that error, try the next one)."""
+        check_failed = []
+        try:
+            return self._claim(kinds, owner, check, check_failed)
+        finally:
+            for j in check_failed:
+                self._notify(j, "failed")
+
+    def _claim(self, kinds, owner, check, check_failed):
         with _LOCK:
             now = time.time()
             cands = []
@@ -148,7 +169,7 @@ class JobQueue:
                     verdict = check(job)
                     if isinstance(verdict, str):
                         job["error"] = verdict
-                        self._move(job, p, "failed")
+                        check_failed.append(self._move(job, p, "failed"))
                         continue
                     if not verdict:
                         continue
@@ -174,7 +195,9 @@ class JobQueue:
             if result is not None:
                 job["result"] = result
             job["error"] = None
-            return self._move(job, path, "done")
+            job = self._move(job, path, "done")
+        self._notify_done(job)
+        return job
 
     def fail(self, jid, error, retry_at: float | None = None):
         """retry_at -> back to queue hidden until then (retries+1); else -> failed/."""
@@ -216,8 +239,8 @@ class JobQueue:
                 last = max(job.get("heartbeat") or 0, job.get("claimedAt") or 0)
                 if last and now - last <= timeout_s:
                     continue
-                if job.get("kind") == "transcribe" and (job.get("retries") or 0) >= MAX_STALE_REQUEUES:
-                    job["error"] = STALE_FAIL_MSG
+                if job.get("kind") in ("transcribe", "ai") and (job.get("retries") or 0) >= MAX_STALE_REQUEUES:
+                    job["error"] = STALE_FAIL_MSG if job.get("kind") == "transcribe" else STALE_AI_FAIL_MSG
                     dead.append(self._move(job, p, "failed"))
                     continue
                 job.update(retries=(job.get("retries") or 0) + 1, owner=None, claimedAt=None,
@@ -230,7 +253,7 @@ class JobQueue:
                     status="queued", progress={"stage": "queued", "pct": 0, "msg": "", "engine": ""}),
                     statuses=("queued", "transcribing"))
         for job in dead:
-            update_meeting_if_job(self.store, job, lambda m: m.update(status="failed", error=STALE_FAIL_MSG),
+            update_meeting_if_job(self.store, job, lambda m: m.update(status="failed", error=job["error"]),
                                   statuses=("queued", "transcribing"))
             self._notify(job, "failed")
         return out
@@ -356,7 +379,7 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
         now = time.monotonic()
         if pct >= 100 or now - last_write.get(mid, -1e9) >= MEETING_WRITE_INTERVAL:
             last_write[mid] = now
-            for k in [k for k, t in last_write.items() if now - t > 3600]:
+            for k in [k for k, t in list(last_write.items()) if now - t > 3600]:
                 del last_write[k]
 
             def apply(m):

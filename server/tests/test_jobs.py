@@ -328,3 +328,41 @@ def test_badid_meeting_job_failed_not_abort(env):
     d = c.get("/api/worker/next", headers=H).json()
     assert d["job"]["id"] == good
     assert jobs.get(bad)["state"] == "failed" and jobs.get(bad)["error"] == "會議不存在"
+
+
+def test_claim_check_fail_notifies_listeners(tmp_path):
+    q = JobQueue(Store(tmp_path))
+    seen = []
+    q.add_terminal_listener(lambda j, s: seen.append((j["id"], s, j["error"])))
+    jid = q.enqueue("transcribe", "m1", {})
+    assert q.claim(["transcribe"], "w", check=lambda j: "會議不存在") is None
+    assert seen == [(jid, "failed", "會議不存在")]
+
+
+def test_stale_ai_job_capped_and_listener_notified(tmp_path):
+    q = JobQueue(Store(tmp_path))
+    seen = []
+    q.add_terminal_listener(lambda j, s: seen.append((j["id"], s)))
+    jid = q.enqueue("ai", "m1", {"action": "summary"})
+    old = time.time() - 700
+    for _ in range(3):
+        q.claim(["ai"], "w")
+        rewrite(q.dirs["running"] / f"{jid}.json", heartbeat=old, claimedAt=old)
+        assert q.requeue_stale() == [jid]
+    q.claim(["ai"], "w")
+    rewrite(q.dirs["running"] / f"{jid}.json", heartbeat=old, claimedAt=old)
+    assert q.requeue_stale() == []
+    assert q.get(jid)["state"] == "failed"
+    assert seen == [(jid, "failed")]
+
+
+def test_done_listener_fires_after_finish_only(tmp_path):
+    q = JobQueue(Store(tmp_path))
+    seen = []
+    q.add_done_listener(lambda j: seen.append(j["id"]))
+    q.add_done_listener(lambda j: 1 / 0)  # swallowed
+    a = q.enqueue("ai", "m", {})
+    q.claim(["ai"], "w")
+    assert q.finish(a)["state"] == "done"
+    assert q.finish(a) is None
+    assert seen == [a]

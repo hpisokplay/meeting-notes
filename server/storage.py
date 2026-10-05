@@ -100,10 +100,11 @@ class Store:
                     "status": m.get("status")} for m in self._all()]
             atomic_write_json(self.path("index.json"), idx)
 
-    def save(self, m: dict) -> dict:
+    def save(self, m: dict, touch: bool = True) -> dict:
         mid = m["id"]
         with self._lock(mid):
-            m["updatedAt"] = int(time.time() * 1000)
+            if touch or not m.get("updatedAt"):
+                m["updatedAt"] = int(time.time() * 1000)
             atomic_write_json(self._mpath(mid), m)
             self._write_derived(mid, m)
         try:
