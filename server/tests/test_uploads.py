@@ -2,7 +2,11 @@ import json
 import os
 import time
 
-from server.uploads import scan_inbox
+import pytest
+from fastapi import HTTPException
+
+from server import uploads as up
+from server.uploads import scan_inbox, _parse_range
 
 MB = 1024 * 1024
 CH = 8 * MB
@@ -120,6 +124,11 @@ def test_retranscribe(client, data_dir):
     m = client.post("/api/meetings", json={"uploads": [uid]}).json()
     store = client.app.state.store
     store.update(m["id"], lambda x: x.update(status="done", transcript=[{"speaker": "A", "text": "舊"}]))
+    assert client.post(f"/api/meetings/{m['id']}/retranscribe").status_code == 409  # already queued
+    jf = data_dir / "jobs" / "queue" / f"{m['jobId']}.json"
+    j = json.loads(jf.read_text(encoding="utf-8"))
+    j["state"] = "done"
+    jf.write_text(json.dumps(j), encoding="utf-8")
     r = client.post(f"/api/meetings/{m['id']}/retranscribe")
     assert r.status_code == 200
     n = r.json()
@@ -128,3 +137,89 @@ def test_retranscribe(client, data_dir):
     bare = store.new_id()
     store.save({"id": bare, "title": "x", "createdAt": 1, "transcript": []})
     assert client.post(f"/api/meetings/{bare}/retranscribe").status_code == 409
+
+
+def _no_orphans(data_dir):
+    assert not any((data_dir / "audio").iterdir())
+    assert not list((data_dir / "meetings").glob("*.json"))
+    assert not list((data_dir / "jobs" / "queue").glob("*.json"))
+
+
+def test_failed_assembly_leaves_nothing(client, data_dir, monkeypatch):
+    uid = _upload(client, "a.m4a", b"abcdef")
+    real = up.shutil.copyfileobj
+
+    def boom(*a, **k):
+        raise OSError("disk full")
+    monkeypatch.setattr(up.shutil, "copyfileobj", boom)
+    with pytest.raises(OSError):
+        client.post("/api/meetings", json={"uploads": [uid]})
+    monkeypatch.setattr(up.shutil, "copyfileobj", real)
+    _no_orphans(data_dir)
+    assert (data_dir / "uploads" / uid / "0.part").exists()  # client can retry
+    assert client.post("/api/meetings", json={"uploads": [uid]}).status_code == 200
+
+
+def test_failed_save_rolls_back_job_and_audio(client, data_dir, monkeypatch):
+    uid = _upload(client, "a.m4a", b"abcdef")
+    store = client.app.state.store
+
+    def boom(m):
+        raise OSError("save failed")
+    monkeypatch.setattr(store, "save", boom)
+    with pytest.raises(OSError):
+        client.post("/api/meetings", json={"uploads": [uid]})
+    _no_orphans(data_dir)
+
+
+def test_inbox_failure_keeps_file(client, data_dir, monkeypatch):
+    store, jobs = client.app.state.store, client.app.state.jobs
+    p = data_dir / "inbox" / "a.m4a"
+    p.write_bytes(b"hello")
+    old = time.time() - 60
+    os.utime(p, (old, old))
+
+    def boom(m):
+        raise OSError("save failed")
+    monkeypatch.setattr(store, "save", boom)
+    assert scan_inbox(store, jobs) == []
+    assert p.read_bytes() == b"hello"
+    _no_orphans(data_dir)
+
+
+def test_job_ids_unique_in_tight_loop(client, data_dir):
+    jobs = client.app.state.jobs
+    ids = [jobs.enqueue("transcribe", "m", {}) for _ in range(50)]
+    assert len(set(ids)) == 50
+    assert len(list((data_dir / "jobs" / "queue").glob("*.json"))) == 50
+
+
+def test_parse_range_cases():
+    assert _parse_range("bytes=0-9", 100) == (0, 9)
+    assert _parse_range("bytes=90-", 100) == (90, 99)
+    assert _parse_range("bytes=-10", 100) == (90, 99)
+    assert _parse_range("bytes=50-500", 100) == (50, 99)
+    for bad in ("bytes=100-", "bytes=-0", "bytes=9-3"):
+        with pytest.raises(HTTPException) as e:
+            _parse_range(bad, 100)
+        assert e.value.status_code == 416 and e.value.headers["Content-Range"] == "bytes */100"
+    for ignored in ("bytes=0-1,5-6", "items=0-1", "garbage", "bytes=-", None):
+        assert _parse_range(ignored, 100) is None
+
+
+def test_audio_416_head_and_ignored_range(client):
+    uid = _upload(client, "a.m4a", b"0123456789")
+    m = client.post("/api/meetings", json={"uploads": [uid]}).json()
+    url = f"/api/meetings/{m['id']}/audio/0"
+    r = client.get(url, headers={"Range": "bytes=20-"})
+    assert r.status_code == 416 and r.headers["content-range"] == "bytes */10"
+    r = client.get(url, headers={"Range": "bytes=0-1,3-4"})
+    assert r.status_code == 200 and len(r.content) == 10
+    r = client.head(url)
+    assert r.status_code == 200 and r.headers["content-length"] == "10" and r.content == b""
+
+
+def test_non_string_title_400(client):
+    uid = _upload(client, "a.m4a", b"abc")
+    assert client.post("/api/meetings", json={"title": 5, "uploads": [uid]}).status_code == 400
+    assert client.post("/api/meetings", json={"group": ["x"], "uploads": [uid]}).status_code == 400

@@ -1,10 +1,11 @@
 """Minimal file-based job queue. Task 3 extends this class (claim/progress/finish/fail)."""
 from __future__ import annotations
 
+import secrets
 import time
 from datetime import datetime
 
-from .storage import Store, atomic_write_json
+from .storage import Store, atomic_write_json, read_json
 
 
 class JobQueue:
@@ -13,7 +14,7 @@ class JobQueue:
         self.queue_dir = store.path("jobs", "queue")
 
     def _new_id(self, kind: str) -> str:
-        return datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + kind
+        return datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + secrets.token_hex(3) + "-" + kind
 
     def enqueue(self, kind: str, meeting_id: str, payload: dict) -> str:
         jid = self._new_id(kind)
@@ -23,3 +24,11 @@ class JobQueue:
                "error": None, "retries": 0, "notBefore": None}
         atomic_write_json(self.queue_dir / f"{jid}.json", job)
         return jid
+
+    def read(self, jid):
+        if not jid or "/" in jid or "\\" in jid or jid.startswith("."):
+            return None
+        try:
+            return read_json(self.queue_dir / f"{jid}.json")
+        except (OSError, ValueError):
+            return None

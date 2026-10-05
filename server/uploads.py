@@ -11,6 +11,7 @@ from pathlib import Path
 
 from fastapi import APIRouter, Body, HTTPException, Request
 from fastapi.responses import StreamingResponse
+from starlette.concurrency import run_in_threadpool
 
 from .storage import Store, atomic_write_json, read_json
 
@@ -81,49 +82,71 @@ def _expected_len(meta: dict, index: int) -> int:
 
 def create_meeting(store: Store, jobs, files: list, title=None, group=None) -> dict:
     """files: [{name, src}]; src is a path (moved into audio/<id>/) or a callable(dest_path)
-    that writes the destination file."""
+    that writes the destination file. On any failure everything created here is rolled back
+    (audio dir, queued job, saved meeting) and moved source files are put back."""
     mid = store.new_id()
     adir = store.path("audio", mid)
-    adir.mkdir(parents=True, exist_ok=True)
-    audio = []
-    for n, f in enumerate(files):
-        sname = safe_name(f["name"])
-        fname = f"{n}-{sname}"
-        dest = adir / fname
-        src = f["src"]
-        if callable(src):
-            src(dest)
-        else:
-            shutil.move(str(src), str(dest))
-        audio.append({"file": fname, "name": sname, "size": dest.stat().st_size,
-                      "durationSec": probe_duration(dest)})
-    now = int(time.time() * 1000)
-    if not title:
-        title = os.path.splitext(audio[0]["name"])[0] if audio else "新會議"
-    durs = [a["durationSec"] for a in audio]
-    m = {"id": mid, "title": title, "createdAt": now, "updatedAt": now, "group": group or None,
-         "status": "queued", "jobId": None,
-         "progress": {"stage": "queued", "pct": 0, "msg": "", "engine": ""},
-         "audio": audio, "transcript": [], "summary": None,
-         "durationSec": sum(durs) if durs and all(d is not None for d in durs) else None}
-    store.save(m)
-    jid = jobs.enqueue("transcribe", mid, {})
-    return store.update(mid, lambda x: x.update(jobId=jid))
+    moved: list = []  # (dest, original src)
+    jid = None
+    try:
+        adir.mkdir(parents=True, exist_ok=True)
+        audio = []
+        for n, f in enumerate(files):
+            sname = safe_name(f["name"])
+            fname = f"{n}-{sname}"
+            dest = adir / fname
+            src = f["src"]
+            if callable(src):
+                src(dest)
+            else:
+                shutil.move(str(src), str(dest))
+                moved.append((dest, Path(src)))
+            audio.append({"file": fname, "name": sname, "size": dest.stat().st_size,
+                          "durationSec": probe_duration(dest)})
+        now = int(time.time() * 1000)
+        if not title:
+            title = os.path.splitext(audio[0]["name"])[0] if audio else "新會議"
+        durs = [a["durationSec"] for a in audio]
+        jid = jobs.enqueue("transcribe", mid, {})
+        m = {"id": mid, "title": title, "createdAt": now, "updatedAt": now, "group": group or None,
+             "status": "queued", "jobId": jid,
+             "progress": {"stage": "queued", "pct": 0, "msg": "", "engine": ""},
+             "audio": audio, "transcript": [], "summary": None,
+             "durationSec": sum(durs) if durs and all(d is not None for d in durs) else None}
+        return store.save(m)
+    except BaseException:
+        if jid:
+            jobs.queue_dir.joinpath(f"{jid}.json").unlink(missing_ok=True)
+        if store.get(mid) is not None:
+            try:
+                store.trash(mid)  # never hard-delete a meeting json
+            except Exception:
+                pass
+        for dest, orig in moved:
+            try:
+                if dest.exists() and not orig.exists():
+                    shutil.move(str(dest), str(orig))
+            except OSError:
+                pass
+        shutil.rmtree(adir, ignore_errors=True)
+        raise
 
 
 def _assembler(store: Store, uid: str, meta: dict):
     def write(dest: Path):
         tmp = dest.with_name(dest.name + ".tmp")
-        with open(tmp, "wb") as out:
-            for i in range(meta["chunks"]):
-                with open(_udir(store, uid) / f"{i}.part", "rb") as part:
-                    shutil.copyfileobj(part, out, READ_SIZE)
-            out.flush()
-            os.fsync(out.fileno())
-        if tmp.stat().st_size != meta["size"]:
-            tmp.unlink()
-            raise HTTPException(409, "上傳的檔案大小不符，請重新上傳")
-        os.replace(tmp, dest)
+        try:
+            with open(tmp, "wb") as out:
+                for i in range(meta["chunks"]):
+                    with open(_udir(store, uid) / f"{i}.part", "rb") as part:
+                        shutil.copyfileobj(part, out, READ_SIZE)
+                out.flush()
+                os.fsync(out.fileno())
+            if tmp.stat().st_size != meta["size"]:
+                raise HTTPException(409, "上傳的檔案大小不符，請重新上傳")
+            os.replace(tmp, dest)
+        finally:
+            tmp.unlink(missing_ok=True)
     return write
 
 
@@ -137,23 +160,25 @@ def scan_inbox(store: Store, jobs) -> list:
             if now - p.stat().st_mtime < INBOX_SETTLE_SEC:
                 continue
             m = create_meeting(store, jobs, [{"name": p.name, "src": p}])
-        except OSError:
-            continue  # still locked / vanished; retry on next scan
+        except Exception:
+            continue  # create_meeting rolled back; file stays in inbox, retry next scan
         ids.append(m["id"])
     return ids
 
 
-def _parse_range(header: str, size: int):
+def _parse_range(header, size: int):
+    """Returns (start, end), or None to ignore the header (invalid / multi-range / unknown unit).
+    Raises 416 when a well-formed single range is unsatisfiable."""
     m = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
     if not m or (m.group(1) == "" and m.group(2) == ""):
-        raise HTTPException(416, "Range 無效")
+        return None
     if m.group(1) == "":
         start, end = max(size - int(m.group(2)), 0), size - 1
     else:
         start = int(m.group(1))
         end = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
     if start >= size or start > end:
-        raise HTTPException(416, "Range 超出範圍")
+        raise HTTPException(416, "Range 超出範圍", headers={"Content-Range": f"bytes */{size}"})
     return start, end
 
 
@@ -167,6 +192,18 @@ def _iter_file(path: Path, start: int, end: int):
                 break
             remaining -= len(chunk)
             yield chunk
+
+
+def _write_chunk(d: Path, index: int, data: bytes) -> None:
+    tmp = d / f"{index}.part.{uuid.uuid4().hex[:6]}.tmp"
+    try:
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, d / f"{index}.part")
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def build_router(store: Store, get_jobs) -> APIRouter:
@@ -197,25 +234,23 @@ def build_router(store: Store, get_jobs) -> APIRouter:
         if index < 0 or index >= meta["chunks"]:
             raise HTTPException(400, "分塊編號超出範圍")
         want = _expected_len(meta, index)
-        d = _udir(store, uid)
-        tmp = d / f"{index}.part.{uuid.uuid4().hex[:6]}.tmp"
-        got = 0
-        try:
-            with open(tmp, "wb") as f:
-                async for piece in request.stream():
-                    got += len(piece)
-                    if got > want:
-                        break
-                    f.write(piece)
-            if got != want:
-                raise HTTPException(400, f"分塊大小不符（應為 {want} 位元組）")
-            os.replace(tmp, d / f"{index}.part")
-        finally:
-            tmp.unlink(missing_ok=True)
+        body = bytearray()
+        async for piece in request.stream():
+            body += piece
+            if len(body) > want:
+                break
+        if len(body) != want:
+            raise HTTPException(400, f"分塊大小不符（應為 {want} 位元組）")
+        await run_in_threadpool(_write_chunk, _udir(store, uid), index, bytes(body))
         return {"received": _received(store, uid)}
 
     @r.post("/meetings")
     def create(body: dict = Body(...)):
+        title, group = body.get("title"), body.get("group")
+        if title is not None and not isinstance(title, str):
+            raise HTTPException(400, "標題必須是文字")
+        if group is not None and not isinstance(group, str):
+            raise HTTPException(400, "群組必須是文字")
         uids = body.get("uploads")
         if not isinstance(uids, list) or not uids:
             raise HTTPException(400, "請至少提供一個上傳檔案")
@@ -232,12 +267,12 @@ def build_router(store: Store, get_jobs) -> APIRouter:
         m = create_meeting(
             store, get_jobs(),
             [{"name": meta["name"], "src": _assembler(store, uid, meta)} for uid, meta in files],
-            title=(body.get("title") or "").strip() or None, group=body.get("group"))
+            title=(title or "").strip() or None, group=group)
         for uid, _ in files:
             shutil.rmtree(_udir(store, uid), ignore_errors=True)
         return m
 
-    @r.get("/meetings/{mid}/audio/{n}")
+    @r.api_route("/meetings/{mid}/audio/{n}", methods=["GET", "HEAD"])
     def get_audio(mid: str, n: int, request: Request):
         m = store.get(mid)
         if m is None:
@@ -251,9 +286,9 @@ def build_router(store: Store, get_jobs) -> APIRouter:
         size = path.stat().st_size
         mime = _MIME.get(path.suffix.lower(), "application/octet-stream")
         headers = {"Accept-Ranges": "bytes"}
-        rng = request.headers.get("range")
+        rng = _parse_range(request.headers.get("range"), size)
         if rng:
-            start, end = _parse_range(rng, size)
+            start, end = rng
             headers["Content-Range"] = f"bytes {start}-{end}/{size}"
             headers["Content-Length"] = str(end - start + 1)
             return StreamingResponse(_iter_file(path, start, end), status_code=206,
@@ -268,11 +303,22 @@ def build_router(store: Store, get_jobs) -> APIRouter:
             raise HTTPException(404, "找不到這場會議")
         if not m.get("audio"):
             raise HTTPException(409, "這場會議沒有錄音檔，無法重新轉錄")
-        jid = get_jobs().enqueue("transcribe", mid, {})
+        jobs = get_jobs()
+        made: list = []
 
         def apply(x):
+            cur = jobs.read(x.get("jobId")) if x.get("jobId") else None
+            if cur and cur.get("kind") == "transcribe" and cur.get("state") in ("queued", "running", "claimed"):
+                raise HTTPException(409, "已在轉錄中")
+            jid = jobs.enqueue("transcribe", mid, {})
+            made.append(jid)
             x.update(status="queued", jobId=jid,
                      progress={"stage": "queued", "pct": 0, "msg": "", "engine": ""})
-        return store.update(mid, apply)
+        try:
+            return store.update(mid, apply)
+        except BaseException:
+            for jid in made:
+                jobs.queue_dir.joinpath(f"{jid}.json").unlink(missing_ok=True)
+            raise
 
     return r
