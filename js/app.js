@@ -1,22 +1,12 @@
-import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref, getModelLock, setModelLock } from './settings.js';
-import { getKeyStatus } from './usage.js';
-import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, ABORT_MSG, getModelChoices, isModelBusy, isModelUnsupported, isUnsupportedModelError } from './gemini.js';
+import * as api from './api.js';
+import { cacheList, cachedList, cacheMeeting, cachedMeeting, uncacheMeeting } from './store.js';
 import * as wakeLock from './wakelock.js';
-import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
-import { splitAudioToChunks } from './audio.js';
-import { readM4aIndex } from './mp4.js';
-import { getGroqKey, setGroqKey, hasGroqKey, groqTranscribeRange, groqSummarize } from './groq.js';
+import { getGroups, addGroup, renameGroup, removeGroup, groupName, groupColor, loadGroups, pushGroups } from './groups.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord, splitQA } from './export.js';
-import * as sync from './sync.js';
-import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v98';
-
-// 套用辨識模型偏好（省額度模式 → Flash-Lite）
-setPreferLite(getModelPref() === 'lite');
+const APP_VERSION = 'v100';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -32,20 +22,68 @@ backBtn.onclick = () => (location.hash = '#/');
 const SPEAKER_PALETTE = ['#0a84ff', '#34c759', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
 
 function esc(s) {
-  // 含引號跳脫：避免把使用者/AI/雲端文字插進 HTML 屬性時被注入（attribute injection XSS）
+  // 含引號跳脫：避免把使用者/AI/伺服器文字插進 HTML 屬性時被注入（attribute injection XSS）
   return String(s == null ? '' : s).replace(
     /[&<>"']/g,
     (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
   );
-}
-function uid() {
-  return crypto.randomUUID ? crypto.randomUUID() : 'm' + Date.now() + Math.round(performance.now());
 }
 function setHeader(text, showBack) {
   titleEl.textContent = text;
   backBtn.hidden = !showBack;
   backBtn.onclick = () => (location.hash = '#/'); // 預設返回清單，個別頁面可覆寫
 }
+const errText = (e) => (e && e.message ? e.message : String(e));
+
+// ===== 處理狀態（伺服器的 meeting.status / meeting.progress）=====
+const STAGE_TEXT = {
+  uploading: '上傳中',
+  queued: '排隊中（等電腦轉錄器）',
+  transcribing: '轉錄中',
+  summarizing: '摘要中',
+  done: '完成',
+  failed: '失敗',
+};
+export const NAS_CPU_TEXT = 'NAS 備援轉錄（較慢、不分說話者）';
+// 狀態 → 給人看的一行字（失敗時附上伺服器錯誤原因）
+export function statusText(m) {
+  const st = (m && m.status) || 'done';
+  const base = STAGE_TEXT[st] || st;
+  if (st === 'failed') return m.error ? `${base}：${m.error}` : base;
+  return base;
+}
+export function isProcessing(m) {
+  const st = m && m.status;
+  return !!st && st !== 'done' && st !== 'failed';
+}
+
+// 時間戳 → 要播哪一支錄音的第幾秒。
+// 舊資料的多檔會議用 fi 標第幾支（t 是該支內秒數）；NAS 轉錄的 t 是整場絕對秒數，依各支長度換算。
+// 舊資料的 t 可能是 "MM:SS"／"H:MM:SS" 字串
+export function segSeconds(t) {
+  if (typeof t === 'number') return isFinite(t) ? Math.max(0, t) : 0;
+  const s = String(t == null ? '' : t).trim();
+  if (!s) return 0;
+  if (s.includes(':')) return s.split(':').reduce((acc, x) => acc * 60 + (Number(x) || 0), 0);
+  return Math.max(0, Number(s) || 0);
+}
+export function seekTarget(seg, audio) {
+  const parts = Array.isArray(audio) ? audio : [];
+  const t = segSeconds(seg && seg.t);
+  if (!parts.length) return null;
+  if (seg && seg.fi != null) {
+    const p = Math.min(parts.length - 1, Math.max(0, +seg.fi || 0));
+    return { part: p, time: t };
+  }
+  let start = 0;
+  for (let i = 0; i < parts.length; i++) {
+    const d = Number(parts[i] && parts[i].durationSec) || 0;
+    if (!d || t < start + d || i === parts.length - 1) return { part: i, time: Math.max(0, t - start) };
+    start += d;
+  }
+  return { part: 0, time: t };
+}
+
 // 找出「這條摘要最可能出自哪一段逐字稿」：用字元二字組（bigram）重疊評分，免 API、即時
 // 秒數 → 顯示字串。單檔錄音用 h:mm:ss；多檔則標明是第幾支，方便回去找那個檔案。
 export function timeLabel(seg) {
@@ -215,12 +253,6 @@ export function bestSentence(text, segText) {
   return bestScore >= 0.25 ? best : '';
 }
 
-// 逐字稿指紋：段數 + 各段語者/文字長度，用來偵測「翻譯期間原文是否被改動」
-function transcriptFingerprint(transcript) {
-  const t = transcript || [];
-  return t.length + ':' + t.map((s) => (s.speaker || '').length + '.' + (s.text || '').length).join(',');
-}
-
 function speakerColors(segments) {
   const map = {};
   let i = 0;
@@ -231,11 +263,6 @@ function speakerColors(segments) {
     }
   });
   return map;
-}
-
-// ---- 雲端同步 ----
-function defaultSyncConfig() {
-  return sync.getSyncConfig() || { token: '', owner: '', repo: '', path: 'meetings.json' };
 }
 function toast(msg) {
   let t = document.getElementById('toast');
@@ -250,16 +277,15 @@ function toast(msg) {
   t._h = setTimeout(() => t.classList.remove('show'), 2600);
 }
 
-// ===== 會議詳情頁的長時間工作（加強／掃描／問答）=====
-// 這些工作 await 期間，使用者可能切到設定等其他頁再回來 → 畫面重繪、按鈕狀態被重置。
-// 工作本身其實還在跑（Promise 不會因為重繪而中斷），但畫面上看不出來，
-// 使用者會誤以為它停了而再點一次 → 重複燒額度、兩份結果互相覆寫。
-// 解法同辨識任務：狀態存在畫面之外，重繪後再畫回去。
-const detailTasks = new Map(); // `${meetingId}|${taskKey}` → { label }
+// ===== 會議詳情頁的 AI 工作（加強／掃詞／問答／翻譯／筆記）=====
+// AI 全部在 NAS 上跑：前端送出 runAI → 輪詢 waitJob → 重新抓會議 → 重繪。
+// 等待期間使用者可能切到別頁再回來 → 畫面重繪、按鈕狀態被重置；工作其實還在跑。
+// 所以工作狀態存在畫面之外，重繪後再畫回去（按鈕上顯示進度、點一下可取消）。
+const detailTasks = new Map(); // `${meetingId}|${taskKey}` → { label, jobId }
 const taskId = (meetingId, key) => `${meetingId}|${key}`;
 
 function currentDetailId() {
-  return location.hash.startsWith('#/m/') ? location.hash.slice(4) : '';
+  return location.hash.startsWith('#/m/') ? decodeURIComponent(location.hash.slice(4)) : '';
 }
 // 把執行中的工作狀態畫回按鈕（畫面可能剛重繪過）
 function paintDetailTasks() {
@@ -268,21 +294,27 @@ function paintDetailTasks() {
   let busy = false;
   let runningBtn = null;
   document.querySelectorAll('[data-task]').forEach((b) => {
-    const t = detailTasks.get(taskId(id, b.dataset.task));
+    const k = taskId(id, b.dataset.task);
+    const t = detailTasks.get(k);
     if (t) {
       busy = true;
       runningBtn = b;
       if (!b.dataset.origLabel) {
         b.dataset.origLabel = b.textContent;
         b._origOnclick = b.onclick;
-        // 額度受限時的等待可能長達半分鐘以上，一定要留一條取消的路
-        b.onclick = () => {
-          if (jobRunning) {
-            toast('辨識進行中，先到辨識頁停止，或等這項工作自己結束');
+        // AI 排隊（Claude 一次一件）可能要等一陣子，一定要留一條取消的路
+        b.onclick = async () => {
+          const cur = detailTasks.get(k);
+          if (!cur || !cur.jobId) {
+            toast('正在送出，請稍候…');
             return;
           }
-          requestAbort();
-          toast('正在取消…（最多等目前這一步結束）');
+          try {
+            await api.cancelJob(cur.jobId);
+            toast('正在取消…');
+          } catch (e) {
+            toast('取消失敗：' + errText(e));
+          }
         };
       }
       b.textContent = `⏳ ${t.label}（點此取消）`;
@@ -304,26 +336,26 @@ function detailBusy() {
   for (const k of detailTasks.keys()) if (k.startsWith(id + '|')) return true;
   return false;
 }
-// 執行一項會議詳情工作；fn 收到 setMsg 用來回報進度
-async function runDetailTask(meetingId, key, initialLabel, fn) {
+
+// 在 NAS 跑一項 AI 工作並等它結束；回傳伺服器寫回結果後的最新會議（已存進快取）
+async function runServerAI(meetingId, key, initialLabel, action, params, onMsg) {
   const k = taskId(meetingId, key);
-  detailTasks.set(k, { label: initialLabel });
+  const t = { label: initialLabel, jobId: null };
+  detailTasks.set(k, t);
   paintDetailTasks();
-  // 上一次取消留下的中止旗標要先清掉，否則新工作一開始就被擋。
-  // 辨識進行中不清（旗標屬於辨識任務，不能替它解除）。
-  if (!jobRunning) clearAbort();
   try {
-    return await fn((msg) => {
-      const t = detailTasks.get(k);
-      if (t && msg) {
+    t.jobId = await api.runAI(meetingId, action, params || {});
+    await api.waitJob(t.jobId, (p) => {
+      const msg = p && (p.msg || (p.pct != null ? `${initialLabel.replace(/…$/, '')} ${p.pct}%` : ''));
+      if (msg && msg !== t.label) {
         t.label = msg;
         paintDetailTasks();
+        if (onMsg) onMsg(msg);
       }
     });
-  } catch (e) {
-    // 使用者按了取消：把辨識用的中止訊息換成中性的「已取消」，避免嚇到人
-    if (e && e.message === ABORT_MSG) throw new Error('已取消');
-    throw e;
+    const fresh = await api.getMeeting(meetingId);
+    await cacheMeeting(fresh);
+    return fresh;
   } finally {
     detailTasks.delete(k);
     paintDetailTasks();
@@ -383,68 +415,73 @@ function pickExportSections(kind) {
   });
 }
 
-// 辨識中防止誤關頁面
-let transcribing = false;
+// 上傳中防止誤關頁面（關了也能續傳，但要重選檔案）
 window.addEventListener('beforeunload', (e) => {
-  if (transcribing) {
+  if (upload && upload.phase !== 'error') {
     e.preventDefault();
-    e.returnValue = '辨識還在進行中，離開會中斷，確定要離開嗎？';
+    e.returnValue = '錄音還在上傳，離開會中斷（之後重選同樣的檔案可續傳），確定要離開嗎？';
     return e.returnValue;
   }
 });
 
-let syncing = false;
-let pendingSync = false;
-async function syncNow(silent) {
-  if (!sync.isEnabled()) return;
-  // 同步進行中又有新變更 → 標記 pending，等這輪結束後自動再跑一次（不丟失變更）
-  if (syncing) {
-    pendingSync = true;
+// ===== 連線狀態 =====
+// 連不上 NAS 時顯示快取的資料，並在上方掛一條提示
+function setOffline(on) {
+  let b = document.getElementById('offline-banner');
+  if (!on) {
+    if (b) b.remove();
     return;
   }
-  syncing = true;
+  if (b) return;
+  b = document.createElement('div');
+  b.id = 'offline-banner';
+  b.className = 'offline-banner';
+  b.textContent = '⚠️ 連不上 NAS，目前顯示的是這台裝置上次存的資料（無法修改）';
+  // 放在頂欄與內容之間（body 是上下排列的 App 外殼）
+  if (view.parentNode) view.parentNode.insertBefore(b, view);
+  else document.body.appendChild(b);
+}
+function noteFetchError(e) {
+  if (e && e.offline) setOffline(true);
+}
+
+// 會議清單：伺服器成功就更新快取；失敗回 null（呼叫端沿用快取）
+async function fetchList() {
   try {
-    if (!silent) toast('雲端同步中…');
-    const localState = async () => ({
-      meetings: await list(),
-      deleted: getTombstones(),
-      deletedAt: getTombstoneTimes(),
-      groups: getGroups(),
-      groupsDeleted: getGroupTombstones(),
-      groupsDeletedAt: getGroupTombstoneTimes(),
-    });
-    const applyGroups = (merged) => {
-      setGroups(merged.groups || []);
-      setGroupTombstones(merged.groupsDeleted || []);
-      setGroupTombstoneTimes(merged.groupsDeletedAt || {});
-    };
-    let remote = await sync.pull();
-    let merged = mergeState(await localState(), remote.doc);
-    await applyMerged(merged, sync.mergeMeeting);
-    applyGroups(merged);
-    try {
-      await sync.push(merged, remote.sha);
-    } catch (e) {
-      if (e.message === 'CONFLICT') {
-        remote = await sync.pull();
-        merged = mergeState(await localState(), remote.doc);
-        await applyMerged(merged, sync.mergeMeeting);
-        applyGroups(merged);
-        await sync.push(merged, remote.sha);
-      } else {
-        throw e;
-      }
-    }
-    toast('雲端已同步 ✓');
+    const l = await api.listMeetings();
+    setOffline(false);
+    await cacheList(l);
+    return l.slice().sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
   } catch (e) {
-    toast('同步失敗：' + (e && e.message ? e.message : e));
-  } finally {
-    syncing = false;
-    // 這輪同步期間若有新變更被標記 → 自動再跑一次，確保不遺漏
-    if (pendingSync) {
-      pendingSync = false;
-      syncNow(true);
-    }
+    noteFetchError(e);
+    return null;
+  }
+}
+// 完整會議：伺服器優先，連不上用快取；都沒有回 null
+async function loadMeeting(id) {
+  try {
+    const m = await api.getMeeting(id);
+    setOffline(false);
+    await cacheMeeting(m);
+    return m;
+  } catch (e) {
+    noteFetchError(e);
+    if (e && e.status === 404) return null;
+    return await cachedMeeting(id);
+  }
+}
+async function refreshGroups() {
+  try {
+    await loadGroups();
+  } catch (e) {
+    noteFetchError(e);
+  }
+}
+async function savePushGroups() {
+  try {
+    await pushGroups();
+  } catch (e) {
+    toast('分類存到 NAS 失敗：' + errText(e));
   }
 }
 
@@ -456,7 +493,7 @@ function pickGroup(current) {
     const gs = getGroups();
     ov.innerHTML = `<div class="sheet">
       <div class="sheet-title">設定分類</div>
-      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${g.id}"><span class="g-dot" style="background:${groupColor(g.id)}"></span>${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
+      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${esc(g.id)}"><span class="g-dot" style="background:${groupColor(g.id)}"></span>${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
       <button class="sheet-btn" data-g="__new">➕ 新增群組</button>
       ${current ? '<button class="sheet-btn" data-g="__none">🚫 移出分類</button>' : ''}
       <button class="sheet-btn cancel" data-g="__cancel">取消</button>
@@ -470,7 +507,7 @@ function pickGroup(current) {
       if (e.target === ov) done(undefined);
     };
     ov.querySelectorAll('.sheet-btn').forEach((b) => {
-      b.onclick = () => {
+      b.onclick = async () => {
         const g = b.dataset.g;
         if (g === '__cancel') return done(undefined);
         if (g === '__none') return done(null);
@@ -478,6 +515,7 @@ function pickGroup(current) {
           const name = prompt('新群組名稱：');
           if (!name || !name.trim()) return done(undefined);
           const ng = addGroup(name);
+          if (ng) await savePushGroups();
           return done(ng ? ng.id : undefined);
         }
         done(g);
@@ -486,85 +524,147 @@ function pickGroup(current) {
   });
 }
 
+// 清單卡片上的處理狀態徽章（完成的不顯示）
+function statusBadge(m) {
+  const st = m && m.status;
+  if (!st || st === 'done') return '';
+  const p = m.progress || {};
+  const pct = isProcessing(m) && p.pct != null ? ` ${Math.round(p.pct)}%` : '';
+  const label = st === 'failed' ? STAGE_TEXT.failed : (STAGE_TEXT[st] || st) + pct;
+  return `<span class="st-badge st-${esc(st)}">${esc(label)}</span>`;
+}
+// 處理中／失敗的會議點進去看進度頁；完成的看詳情
+const meetingHref = (m) => (m.status && m.status !== 'done' ? '#/job/' : '#/m/') + encodeURIComponent(m.id);
+
 // groupId：undefined = 全部；'__none' = 未分類；其他 = 該群組
 async function renderList(groupId) {
-  const all = await list();
-  const gs = getGroups();
-  const known = new Set(gs.map((g) => g.id));
-  const meetings =
-    groupId === '__none'
+  const route = location.hash;
+  const title = groupId === '__none' ? '🗂 未分類' : groupId ? `📂 ${groupName(groupId) || '分類'}` : 'DD會議紀錄';
+  setHeader(title, !!groupId);
+  if (groupId) backBtn.onclick = () => (location.hash = '#/groups');
+  view.innerHTML = `<input type="search" id="search" class="search" placeholder="🔍 搜尋標題或內容" autocomplete="off" />
+    <div id="listBody"></div>`;
+  const body = document.getElementById('listBody');
+  const si = document.getElementById('search');
+  let all = await cachedList();
+  const full = new Map(); // id → 完整會議（搜尋逐字稿用）
+
+  const filtered = () => {
+    const known = new Set(getGroups().map((g) => g.id));
+    return groupId === '__none'
       ? all.filter((m) => !m.group || !known.has(m.group))
       : groupId
         ? all.filter((m) => m.group === groupId)
         : all;
-  const title = groupId === '__none' ? '🗂 未分類' : groupId ? `📂 ${groupName(groupId) || '分類'}` : 'DD會議紀錄';
-  setHeader(title, !!groupId);
-  if (groupId) backBtn.onclick = () => (location.hash = '#/groups');
-  if (!meetings.length) {
-    view.innerHTML = `<div class="empty">${groupId ? '這個分類還沒有會議<br>到「清單」點會議卡片上的分類標籤加入' : '還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔'}</div>`;
-    return;
-  }
+  };
   const cardHtml = (m) => {
+    const known = new Set(getGroups().map((g) => g.id));
     const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
     const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
     const gn = m.group && known.has(m.group) ? groupName(m.group) : '';
     const gc = gn ? groupColor(m.group) : '';
-    return `<div class="card tap" data-id="${m.id}">
+    return `<div class="card tap" data-id="${esc(m.id)}">
         <div class="card-top"><h3>${esc(m.title)}</h3><button class="grp-chip${gn ? ' has' : ''}" type="button"${gn ? ` style="color:${gc};border-color:${gc};background:color-mix(in srgb, ${gc} 14%, transparent)"` : ''}><span class="g-dot" style="background:${gc || 'var(--muted)'}"></span>${esc(gn || '未分類')}</button></div>
-        <div class="meta">${formatDate(m.createdAt)}</div>
+        <div class="meta">${formatDate(m.createdAt)} ${statusBadge(m)}</div>
         <div class="snippet">${esc(snip)}</div>
       </div>`;
   };
-  view.innerHTML = `<input type="search" id="search" class="search" placeholder="🔍 搜尋標題或內容" autocomplete="off" />
-    <div id="listBody"></div>`;
-  const body = document.getElementById('listBody');
-  const draw = (q) => {
-    const filtered = meetings.filter((m) => matchMeeting(m, q));
-    body.innerHTML = filtered.length
-      ? filtered.map(cardHtml).join('')
-      : '<div class="empty">找不到符合的會議</div>';
+  // 搜尋要比對逐字稿，但清單不含逐字稿 → 用完整會議（快取或向 NAS 補抓）
+  let fetchingFull = false;
+  const ensureFull = async () => {
+    if (fetchingFull) return;
+    fetchingFull = true;
+    try {
+      for (const m of all) {
+        if (location.hash !== route) return;
+        if (full.has(m.id)) continue;
+        let fm = await cachedMeeting(m.id);
+        if (!fm || (m.updatedAt && (fm.updatedAt || 0) < m.updatedAt)) {
+          try {
+            fm = await api.getMeeting(m.id);
+            await cacheMeeting(fm);
+          } catch (_) {}
+        }
+        if (fm) full.set(m.id, fm);
+      }
+    } finally {
+      fetchingFull = false;
+    }
+    if (location.hash === route && si.value.trim()) draw();
+  };
+  const searchable = (m) => {
+    const fm = full.get(m.id);
+    return fm ? { ...m, transcript: fm.transcript, summary: fm.summary || m.summary } : m;
+  };
+  const draw = () => {
+    const q = si.value;
+    const ms = filtered();
+    if (!ms.length && !q.trim()) {
+      body.innerHTML = `<div class="empty">${groupId ? '這個分類還沒有會議<br>到「清單」點會議卡片上的分類標籤加入' : '還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔'}</div>`;
+      return;
+    }
+    const shown = ms.filter((m) => matchMeeting(searchable(m), q));
+    body.innerHTML = shown.length ? shown.map(cardHtml).join('') : '<div class="empty">找不到符合的會議</div>';
     body.querySelectorAll('.card').forEach((c) => {
-      c.onclick = () => (location.hash = '#/m/' + c.dataset.id);
+      const m = all.find((x) => x.id === c.dataset.id);
+      c.onclick = () => (location.hash = m ? meetingHref(m) : '#/m/' + encodeURIComponent(c.dataset.id));
       const chip = c.querySelector('.grp-chip');
       if (chip)
         chip.onclick = async (e) => {
           e.stopPropagation();
-          const m = meetings.find((x) => x.id === c.dataset.id);
           if (!m) return;
           const r = await pickGroup(m.group);
           if (r === undefined) return;
-          const fresh = (await get(m.id)) || m;
-          if (r === null) delete fresh.group;
-          else fresh.group = r;
-          const now = Date.now();
-          fresh.updatedAt = now;
-          fresh.editedAt = now; // 分類是真實編輯
-          await save(fresh);
-          syncNow();
-          router();
+          try {
+            const fresh = await api.getMeeting(m.id); // 整份存檔 → 先拿最新完整版
+            if (r === null) fresh.group = null;
+            else fresh.group = r;
+            fresh.editedAt = Date.now(); // 分類是真實編輯
+            await cacheMeeting(await api.saveMeeting(fresh));
+            m.group = fresh.group;
+            await cacheList(all);
+            draw();
+          } catch (err) {
+            alert('改分類失敗：' + errText(err));
+          }
         };
     });
   };
-  draw('');
-  const si = document.getElementById('search');
-  si.oninput = () => draw(si.value);
+  draw();
+  si.oninput = () => {
+    draw();
+    if (si.value.trim()) ensureFull();
+  };
+  // 先秒開快取，再向 NAS 更新；有會議還在處理就每 5 秒刷新狀態
+  const refresh = async () => {
+    if (location.hash !== route) return;
+    const fresh = await fetchList();
+    if (location.hash !== route) return;
+    if (fresh) {
+      all = fresh;
+      draw();
+    }
+    if (all.some(isProcessing)) setTimeout(refresh, 5000);
+  };
+  refresh();
 }
 
 // 分類頁：群組清單（新增／改名／刪除／點入看該組會議）
 async function renderGroups() {
-  const meetings = await list();
   setHeader('分類', false);
-  const gs = getGroups();
-  const known = new Set(gs.map((g) => g.id));
-  const count = (gid) => meetings.filter((m) => m.group === gid).length;
-  const unCount = meetings.filter((m) => !m.group || !known.has(m.group)).length;
-  view.innerHTML = `
+  const route = location.hash;
+  const paint = (meetings) => {
+    const gs = getGroups();
+    const known = new Set(gs.map((g) => g.id));
+    const count = (gid) => meetings.filter((m) => m.group === gid).length;
+    const unCount = meetings.filter((m) => !m.group || !known.has(m.group)).length;
+    view.innerHTML = `
     <button class="big" id="addGroupBtn">➕ 新增群組</button>
     <div id="groupList" style="margin-top:12px">
       ${gs
         .map((g) => {
           const gc = groupColor(g.id);
-          return `<div class="card tap group-card" data-g="${g.id}" style="border-left:5px solid ${gc}">
+          return `<div class="card tap group-card" data-g="${esc(g.id)}" style="border-left:5px solid ${gc}">
             <div class="card-top">
               <h3><span class="g-ico" style="background:color-mix(in srgb, ${gc} 20%, transparent);color:${gc}">📁</span>${esc(g.name)}</h3>
               <span class="grp-ops"><button class="grp-op g-edit" type="button" title="改名">✎</button><button class="grp-op g-del" type="button" title="刪除">🗑</button></span></div>
@@ -575,118 +675,200 @@ async function renderGroups() {
       ${unCount ? `<div class="card tap group-card" data-g="__none" style="border-left:5px solid var(--muted)"><div class="card-top"><h3><span class="g-ico" style="background:color-mix(in srgb, var(--muted) 20%, transparent)">🗂</span>未分類</h3></div><div class="meta">${unCount} 場會議</div></div>` : ''}
       ${!gs.length && !unCount ? '<div class="empty">還沒有群組<br>點上方「＋ 新增群組」建立</div>' : ''}
     </div>`;
-  document.getElementById('addGroupBtn').onclick = () => {
-    const name = prompt('新群組名稱：');
-    if (name && name.trim()) {
-      addGroup(name);
-      syncNow(true);
-      renderGroups();
-    }
+    document.getElementById('addGroupBtn').onclick = async () => {
+      const name = prompt('新群組名稱：');
+      if (name && name.trim()) {
+        addGroup(name);
+        await savePushGroups();
+        paint(meetings);
+      }
+    };
+    view.querySelectorAll('#groupList .card').forEach((c) => {
+      c.onclick = () => (location.hash = '#/g/' + c.dataset.g);
+      const ed = c.querySelector('.g-edit');
+      const del = c.querySelector('.g-del');
+      if (ed)
+        ed.onclick = async (e) => {
+          e.stopPropagation();
+          const g = gs.find((x) => x.id === c.dataset.g);
+          const nn = prompt('群組改名：', g ? g.name : '');
+          if (nn && nn.trim()) {
+            renameGroup(c.dataset.g, nn);
+            await savePushGroups();
+            paint(meetings);
+          }
+        };
+      if (del)
+        del.onclick = async (e) => {
+          e.stopPropagation();
+          const n = count(c.dataset.g);
+          if (!confirm(`刪除這個群組？${n ? `裡面的 ${n} 場會議不會被刪，會變成「未分類」。` : ''}`)) return;
+          removeGroup(c.dataset.g);
+          await savePushGroups();
+          paint(meetings);
+        };
+    });
   };
-  view.querySelectorAll('#groupList .card').forEach((c) => {
-    c.onclick = () => (location.hash = '#/g/' + c.dataset.g);
-    const ed = c.querySelector('.g-edit');
-    const del = c.querySelector('.g-del');
-    if (ed)
-      ed.onclick = (e) => {
-        e.stopPropagation();
-        const g = gs.find((x) => x.id === c.dataset.g);
-        const nn = prompt('群組改名：', g ? g.name : '');
-        if (nn && nn.trim()) {
-          renameGroup(c.dataset.g, nn);
-          syncNow(true);
-          renderGroups();
-        }
-      };
-    if (del)
-      del.onclick = async (e) => {
-        e.stopPropagation();
-        const n = count(c.dataset.g);
-        if (!confirm(`刪除這個群組？${n ? `裡面的 ${n} 場會議不會被刪，會變成「未分類」。` : ''}`)) return;
-        removeGroup(c.dataset.g);
-        syncNow(true);
-        renderGroups();
-      };
-  });
+  const cached = await cachedList();
+  if (location.hash !== route) return;
+  paint(cached);
+  await refreshGroups();
+  const fresh = await fetchList();
+  if (location.hash === route) paint(fresh || (await cachedList()));
 }
 
-async function onExport() {
-  const json = await exportAll({ groups: getGroups(), groupsDeleted: getGroupTombstones(), groupsDeletedAt: getGroupTombstoneTimes() });
-  const blob = new Blob([json], { type: 'application/json' });
-  const a = document.createElement('a');
-  a.href = URL.createObjectURL(blob);
-  a.download = `meetings-backup-${formatDate(Date.now()).replace(/[: ]/g, '-')}.json`;
-  document.body.appendChild(a);
-  a.click();
-  a.remove();
-  URL.revokeObjectURL(a.href);
+// ===== 上傳（分塊、可續傳）=====
+// 上傳狀態存在畫面之外：使用者中途切到別頁再回來，還接得上進度。
+let upload = null; // { files:[{name,size,sent}], total, startAt, phase:'uploading'|'creating'|'error', error, ac, retry }
+const fmtMB = (b) => (b / 1048576).toFixed(b >= 1048576 * 100 ? 0 : 1) + ' MB';
+const mmss = (sec) => {
+  const s = Math.max(0, Math.round(sec));
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, '0');
+  return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
+};
+export const sortByName = (files) =>
+  files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+
+function paintUpload() {
+  const c = document.getElementById('upprog');
+  if (!c || !upload) return;
+  const sent = upload.files.reduce((a, f) => a + f.sent, 0);
+  const pct = upload.total ? Math.floor((sent / upload.total) * 100) : 100;
+  const label =
+    upload.phase === 'creating'
+      ? '上傳完成，建立會議中…'
+      : upload.phase === 'error'
+        ? '上傳中斷'
+        : `上傳中 ${pct}%（${fmtMB(sent)} / ${fmtMB(upload.total)}）`;
+  c.innerHTML = `
+    <div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div>
+    <div class="prog-label">${esc(label)}</div>
+    <div class="up-files">${upload.files
+      .map((f) => {
+        const fp = f.size ? Math.floor((f.sent / f.size) * 100) : 100;
+        return `<div class="up-file"><span class="up-name">${esc(f.name)}</span><span class="up-pct">${fp}%</span></div>`;
+      })
+      .join('')}</div>
+    <div class="prog-time">已經過 ${mmss((Date.now() - upload.startAt) / 1000)}</div>
+    ${upload.phase === 'error' ? `<div class="err" style="margin-top:8px">❌ ${esc(upload.error)}</div>` : ''}`;
+  const ops = document.getElementById('upops');
+  if (ops && ops.dataset.phase !== upload.phase) {
+    ops.dataset.phase = upload.phase;
+    ops.innerHTML =
+      upload.phase === 'error'
+        ? `<button class="big" id="upRetry">從中斷處繼續上傳</button><button class="big secondary" id="upDrop" style="margin-top:8px">放棄這次上傳</button>`
+        : `<button class="big danger" id="upStop">■ 取消上傳</button>`;
+    const r = document.getElementById('upRetry');
+    if (r) r.onclick = () => upload && upload.retry && upload.retry();
+    const d = document.getElementById('upDrop');
+    if (d)
+      d.onclick = () => {
+        upload = null;
+        refreshBanner();
+        renderNew();
+      };
+    const s = document.getElementById('upStop');
+    if (s)
+      s.onclick = () => {
+        if (!confirm('取消上傳？已傳的部分會留在 NAS 一陣子，重選同樣的檔案可以接著傳。')) return;
+        if (upload && upload.ac) upload.ac.abort();
+      };
+  }
 }
 
-// 匯入備份：解析 JSON → 用現成的 mergeState 與本機合併（天然去重，不覆蓋較新的資料）
-async function importBackup(file) {
-  const text = await file.text();
-  let doc;
+async function uploadAndCreate(files, title, group) {
+  const list = sortByName(files);
+  const ac = new AbortController();
+  upload = {
+    files: list.map((f) => ({ name: f.name, size: f.size, sent: 0 })),
+    total: list.reduce((a, f) => a + f.size, 0),
+    startAt: Date.now(),
+    phase: 'uploading',
+    error: '',
+    ac,
+    retry: () => uploadAndCreate(files, title, group),
+  };
+  const me = upload;
+  if (location.hash === '#/new') renderNew();
+  refreshBanner();
+  // 上傳期間螢幕恆亮：畫面一暗頁面就被系統暫停，上傳隨即中斷
+  await wakeLock.start();
+  const ticker = setInterval(() => {
+    paintUpload();
+    refreshBanner();
+  }, 1000);
   try {
-    doc = JSON.parse(text);
-  } catch (_) {
-    throw new Error('這不是有效的備份檔（JSON 解析失敗）');
+    const ids = [];
+    for (let i = 0; i < list.length; i++) {
+      ids.push(
+        await api.uploadFile(
+          list[i],
+          (p) => {
+            me.files[i].sent = p.sent;
+            paintUpload();
+          },
+          ac.signal
+        )
+      );
+    }
+    me.phase = 'creating';
+    paintUpload();
+    const m = await api.createMeeting({ title, group: group || null, uploads: ids });
+    await cacheMeeting(m);
+    if (upload === me) upload = null;
+    location.hash = '#/job/' + encodeURIComponent(m.id);
+  } catch (e) {
+    if (upload !== me) return;
+    if (ac.signal.aborted || (e && e.name === 'AbortError')) {
+      upload = null;
+      toast('已取消上傳');
+      if (location.hash === '#/new') renderNew();
+    } else {
+      me.phase = 'error';
+      me.error = errText(e);
+      paintUpload();
+    }
+  } finally {
+    clearInterval(ticker);
+    await wakeLock.stop();
+    refreshBanner();
   }
-  if (!doc || !Array.isArray(doc.meetings)) {
-    throw new Error('備份檔格式不符（找不到 meetings）');
-  }
-  const local = {
-    meetings: await list(),
-    deleted: getTombstones(),
-    deletedAt: getTombstoneTimes(),
-    groups: getGroups(),
-    groupsDeleted: getGroupTombstones(),
-    groupsDeletedAt: getGroupTombstoneTimes(),
-  };
-  const merged = mergeState(local, {
-    meetings: doc.meetings || [],
-    deleted: doc.deleted || [],
-    deletedAt: doc.deletedAt || {},
-    groups: doc.groups || [],
-    groupsDeleted: doc.groupsDeleted || [],
-    groupsDeletedAt: doc.groupsDeletedAt || {},
-  });
-  await applyMerged(merged, sync.mergeMeeting);
-  setGroups(merged.groups || []);
-  setGroupTombstones(merged.groupsDeleted || []);
-  setGroupTombstoneTimes(merged.groupsDeletedAt || {});
-  syncNow(true);
-  return merged.meetings.length;
 }
 
 function renderNew() {
   setHeader('新增會議', true);
-  // 辨識中不讓使用者走進「選檔→開始→被擋下」的死巷，直接指回進度頁
-  if (jobRunning && jobState) {
+  if (upload) {
     view.innerHTML = `<div class="card">
-      <div class="warn">已有一場辨識正在進行中，完成後才能開始新的一場。</div>
-      <button class="big" id="toJob">查看目前進度</button>
-      <div class="hint" style="margin-top:6px">若它卡住了，可在進度頁按「停止辨識」。</div>
+      <div class="warn">錄音正在上傳到 NAS。可以在 App 內切到別頁，<b>但不要切出 App 或鎖螢幕</b>；中斷了也沒關係，重選同樣的檔案會從中斷處接著傳。</div>
+      ${wakeLock.isSupported() ? '<div class="hint" style="margin-top:8px">🔆 上傳期間會維持螢幕恆亮。</div>' : ''}
+      <div class="progress" id="upprog"></div>
+      <div id="upops"></div>
+      <div class="hint" style="margin-top:6px">上傳完成後就可以關掉 App，轉錄與摘要在電腦／NAS 上進行。</div>
     </div>`;
-    document.getElementById('toJob').onclick = () => (location.hash = '#/job');
+    paintUpload();
     return;
   }
-  if (!hasApiKey()) {
-    view.innerHTML = `<div class="card">請先到右上角 ⚙︎ 設定，填入你的 Gemini API 金鑰。
-      <button class="big" id="toSettings">前往設定</button></div>`;
-    document.getElementById('toSettings').onclick = () => (location.hash = '#/settings');
-    return;
-  }
+  const gs = getGroups();
   view.innerHTML = `
     <div class="card">
-      <p style="margin-top:0">選擇會議錄音檔（mp3 / m4a / wav 等）</p>
+      <p style="margin-top:0">選擇會議錄音檔（mp3 / m4a / wav 等，可以很大、很長）</p>
       <label for="audio" class="file-pick" id="filePick">
         <span class="fp-icon">📁</span>
         <span class="fp-main">點此選擇錄音檔（可多選）</span>
         <span class="fp-name" id="fileName">尚未選擇檔案</span>
       </label>
-      <input type="file" id="audio" accept="audio/*,.m4a,.mp3,.wav,.aac,.caf,.aiff" multiple hidden />
-      <button class="big" id="go">開始辨識</button>
-      <div class="warn">長會議可以<b>分成 2~4 支較短的錄音一次選取</b>（每支建議 1 小時內），App 會依<b>檔名順序</b>接成一份逐字稿——免費層更順、更不會卡。過程請保持螢幕開啟、勿切換 App。</div>
+      <input type="file" id="audio" accept="audio/*,video/*,.m4a,.mp3,.wav,.aac,.caf,.aiff,.mp4,.mov" multiple hidden />
+      <p style="margin-bottom:6px"><b>標題</b></p>
+      <input type="text" id="newTitle" placeholder="（預設用檔名）" />
+      <p style="margin-bottom:6px"><b>分類</b></p>
+      <select id="newGroup" style="width:100%">
+        <option value="">未分類</option>
+        ${gs.map((g) => `<option value="${esc(g.id)}">${esc(g.name)}</option>`).join('')}
+      </select>
+      <button class="big" id="go">上傳並開始轉錄</button>
+      <div class="warn">多支檔案會依<b>檔名順序</b>接成一份逐字稿。上傳時請保持螢幕開啟、勿切出 App；萬一中斷，<b>重選同樣的檔案</b>會從中斷處續傳。上傳完就能關掉 App，轉錄在電腦顯示卡上跑。</div>
       <details class="hint" style="margin-top:12px">
         <summary style="cursor:pointer;font-weight:600">📌 錄音在「語音備忘錄」裡？點這看怎麼匯入</summary>
         <div style="margin-top:8px">
@@ -696,738 +878,227 @@ function renderNew() {
           3. 回這裡按上面的欄位 → <b>選擇檔案</b> → 找到那個 .m4a 選取
         </div>
       </details>
-      <div class="progress" id="prog" hidden></div>
     </div>`;
-  const prog = document.getElementById('prog');
-  const goBtn = document.getElementById('go');
-
+  const titleInp = document.getElementById('newTitle');
   document.getElementById('audio').onchange = (e) => {
-    const fs = Array.from(e.target.files || []);
+    const fs = sortByName(Array.from(e.target.files || []));
     const nameEl = document.getElementById('fileName');
     if (!fs.length) {
       nameEl.textContent = '尚未選擇檔案';
     } else if (fs.length === 1) {
-      nameEl.textContent = fs[0].name;
+      nameEl.textContent = `${fs[0].name}（${fmtMB(fs[0].size)}）`;
     } else {
-      const sorted = fs.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
-      nameEl.textContent = `已選 ${fs.length} 支（依此順序接合）：\n` + sorted.map((f, i) => `${i + 1}. ${f.name}`).join('\n');
+      nameEl.textContent = `已選 ${fs.length} 支（依此順序接合）：\n` + fs.map((f, i) => `${i + 1}. ${f.name}（${fmtMB(f.size)}）`).join('\n');
     }
+    if (fs.length) titleInp.placeholder = defaultTitle(fs[0].name, Date.now());
     document.getElementById('filePick').classList.toggle('picked', !!fs.length);
   };
-
-  goBtn.onclick = async () => {
+  document.getElementById('go').onclick = async () => {
     const fs = Array.from(document.getElementById('audio').files || []);
     if (!fs.length) {
       alert('請先選擇音檔');
       return;
     }
-    await startNewTranscription(fs);
+    const title = titleInp.value.trim() || defaultTitle(sortByName(fs)[0].name, Date.now());
+    await uploadAndCreate(fs, title, document.getElementById('newGroup').value || null);
   };
 }
 
-// ===== 可續傳的辨識任務 =====
-const WINDOW_SEC = 40 * 60; // 每段最長 40 分鐘（減少呼叫次數與 token 用量）
-let jobRunning = false;
-// 進度狀態獨立於畫面：使用者中途切到其他頁再回來（或按常駐橫幅）時，
-// 進度頁才能接上「正在跑的那個任務」並顯示當下進度，而不是空白畫面。
-let jobState = null; // { pct, label, keyName, startAt, job }
-let jobView = null; // 目前掛載中的進度 UI 控制器（切走時設回 null）
-
-function mmssApp(sec) {
-  const s = Math.max(0, Math.round(sec));
-  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-}
-function buildWindows(durationSec) {
-  if (!durationSec) return [{ start: 0, end: 0, whole: true, segments: null }];
-  const n = Math.max(1, Math.ceil(durationSec / WINDOW_SEC));
-  const arr = [];
-  for (let i = 0; i < n; i++) {
-    arr.push({ start: i * WINDOW_SEC, end: Math.min(durationSec, (i + 1) * WINDOW_SEC), whole: false, segments: null });
-  }
-  return arr;
-}
-async function persistJob(job) {
-  const clean = { ...job };
-  // 原始音檔（單檔 _file / 多檔 _files）都是暫存的大物件，絕不寫進 IndexedDB
-  // （否則多檔長錄音會把數百 MB File 反覆序列化進 DB，iOS 上極慢甚至爆配額）
-  delete clean._file;
-  delete clean._files;
-  await saveJob(clean);
-}
-
-// 把目前的 jobState 畫到畫面上（畫面不存在就什麼都不做）。
-// 進度資料存在 jobState，畫面只是它的顯示器 → 離開再回來也能接上正在跑的任務。
-function paintJob() {
-  if (!jobState) return;
-  const c = document.getElementById('jobprog');
-  if (!c) return;
-  if (c.dataset.ready !== '1') {
-    c.innerHTML = `
-      <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
-      <div class="prog-label" id="pl">準備中…</div>
-      <div class="prog-key" id="pk" hidden></div>
-      <div class="prog-key" id="pm" hidden></div>
-      <div class="prog-time" id="pt">已等待 0:00</div>`;
-    c.dataset.ready = '1';
-  }
-  const s = Math.floor((Date.now() - jobState.startAt) / 1000);
-  const pf = c.querySelector('#pf');
-  if (pf) pf.style.width = jobState.pct + '%';
-  const pl = c.querySelector('#pl');
-  if (pl) pl.textContent = jobState.label;
-  const pt = c.querySelector('#pt');
-  if (pt) pt.textContent = `已等待 ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-  const pk = c.querySelector('#pk');
-  if (pk) {
-    if (jobState.keyName) {
-      pk.textContent = '🔑 目前使用：' + jobState.keyName;
-      pk.hidden = false;
-    } else {
-      pk.hidden = true;
-    }
-  }
-  // 辨識型號是「Google 有什麼就挑最新的」自動決定的，不寫死在程式裡。
-  // 不顯示出來的話，同一份程式在不同時間跑出不同結果會完全無從察覺。
-  const pm = c.querySelector('#pm');
-  if (pm) {
-    const model = jobState.job && jobState.job.model;
-    if (model) {
-      pm.textContent = '🤖 辨識型號：' + model;
-      pm.hidden = false;
-    } else {
-      pm.hidden = true;
-    }
-  }
-}
-
-// 進度條 UI（回傳控制器）。狀態寫入 jobState，畫面由 paintJob 負責。
-function createProgress(job, estSec) {
-  jobState = { pct: 0, label: '準備中…', keyName: '', startAt: Date.now(), job };
-  let easeTimer = null;
-  paintJob();
-  const setBar = (p) => {
-    jobState.pct = Math.max(jobState.pct, Math.min(100, p));
-    paintJob();
-  };
-  const setLabel = (t) => {
-    jobState.label = t;
-    paintJob();
-    refreshResumeBanner();
-  };
-  const timeTimer = setInterval(paintJob, 1000);
-  const stopEase = () => {
-    if (easeTimer) {
-      clearInterval(easeTimer);
-      easeTimer = null;
-    }
-  };
-  const easeTo = (target, sec) => {
-    stopEase();
-    const from = jobState.pct;
-    const es = Date.now();
-    easeTimer = setInterval(() => {
-      const el = (Date.now() - es) / 1000;
-      setBar(from + (target - from) * Math.min(1, el / Math.max(5, sec)));
-      if (jobState.pct >= target - 0.5) stopEase();
-    }, 400);
-  };
-  const setKey = (name) => {
-    jobState.keyName = name || '';
-    paintJob();
-  };
-  const onProgress = (info) => {
-    if (!info) return;
-    if (info.pct != null) {
-      stopEase();
-      setBar(info.pct);
-    }
-    if (info.message) setLabel(info.message);
-    if (info.keyName !== undefined) setKey(info.keyName);
-  };
-  const stop = () => {
-    stopEase();
-    clearInterval(timeTimer);
-  };
-  return { onProgress, setBar, setLabel, easeTo, stopEase, stop };
-}
-
-// 補傳缺席的金鑰：某把金鑰上次上傳失敗（或事後才新增）時，它不在這段的上傳名單裡，
-// 整場就只能用剩下那把跑；撞到額度上限時無鑰可換，只能乾等。辨識前先補回來。
-// split 模式的分段 blob 未保留（要重新解碼整檔），成本太高，故略過。
-async function topUpMissingKeys(job, ui) {
-  const entries = getApiKeyEntries();
-  if (entries.length < 2 || !job.chunks || !job.chunks.length) return;
-  try {
-    if (job.multiFile && job._files) {
-      for (let i = 0; i < job.chunks.length; i++) {
-        const c = job.chunks[i];
-        if (!c.uploads || !c.uploads.length || c.segments) continue;
-        const missing = missingKeyEntries(c.uploads, entries);
-        if (!missing.length || !job._files[i]) continue;
-        ui.setLabel(`補傳第 ${i + 1} 支給 ${missing.map((k) => k.name || '金鑰').join('、')}…`);
-        const r = await uploadBlobToKeys(job._files[i], missing, ui.onProgress, { exact: true });
-        c.uploads = c.uploads.concat(r.uploads);
-      }
-    } else if (job.mode === 'whole' && job._file) {
-      const first = job.chunks[0];
-      if (!first.uploads || !first.uploads.length) return;
-      const missing = missingKeyEntries(first.uploads, entries);
-      if (!missing.length) return;
-      ui.setLabel(`補傳音檔給 ${missing.map((k) => k.name || '金鑰').join('、')}…`);
-      const r = await uploadBlobToKeys(job._file, missing, ui.onProgress, { exact: true });
-      job.chunks.forEach((c) => {
-        if (!c.segments) c.uploads = (c.uploads || []).concat(r.uploads);
-      });
-    } else {
-      return;
-    }
-    await persistJob(job);
-  } catch (e) {
-    if (isAborted()) throw e;
-    // 補傳失敗不該中斷任務——原本那把金鑰仍可繼續跑，只是無法輪替
-  }
-}
-
-// Groq 備援：Gemini 卡死時用 Whisper 把「這一段」辨識完。
-// 回傳 segments；條件不足（沒設 Groq 金鑰／原始音檔已不在／不是 m4a）回傳 null。
-// 需要原始檔案是因為 Groq 收的是音訊位元組——Gemini 那邊只有雲端 fileUri，Groq 用不了。
-// 多檔模式（使用者自己分段錄好）：每段對應一支檔案，用該支檔案整檔辨識。
-let groqIndexCache = null; // { file, index }：同一場多段共用同一份 MP4 索引
-async function groqFallbackForChunk(job, c, ui, idx, total) {
-  if (!hasGroqKey()) return null;
-  const file = job.multiFile ? job._files && job._files[idx - 1] : job._file;
-  if (!file) return null;
-  try {
-    if (!groqIndexCache || groqIndexCache.file !== file) {
-      groqIndexCache = { file, index: await readM4aIndex(file) };
-    }
-  } catch (_) {
-    return null; // 不是 m4a／索引讀不出來 → 這條備援走不了
-  }
-  ui.setLabel(`Gemini 卡住，第 ${idx}/${total} 段改用 Groq（Whisper）辨識…`);
-  const raw = await groqTranscribeRange(
-    file,
-    groqIndexCache.index,
-    c.start || 0,
-    c.end || groqIndexCache.index.durationSec,
-    getGroqKey(),
-    (s) => ui.setLabel(`第 ${idx}/${total} 段：${s}`)
-  );
-  if (!raw.length) return null;
-  // Whisper 中文常輸出簡體 → 用 Gemini 純文字便宜地轉繁體（失敗就保留原文，不中斷）
-  ui.setLabel(`第 ${idx}/${total} 段辨識完成，轉繁體中…`);
-  const texts = await convertToTraditional(raw.map((s) => s.text), getApiKeyEntries(), ui.onProgress);
-  return raw.map((s, j) => ({ ...s, text: texts[j] || s.text }));
-}
-
-async function processJob(job) {
-  const est = Math.max(30, Math.round((job.durationSec || 0) * 0.5) + 25);
-  clearAbort(); // 上一場若被停止過，這裡要先解除，否則新任務一開始就被擋掉
-  const ui = createProgress(job, est);
-  transcribing = true;
-  jobRunning = true;
-  refreshResumeBanner();
-  // 螢幕恆亮：畫面一暗頁面就被系統暫停、運算中斷。
-  // 系統會在切到背景時自動收走這把鎖，wakelock 模組負責回前景時重新申請。
-  await wakeLock.start();
-  const prepared = () => job.chunks && job.chunks.length && job.chunks.every((c) => c.uploads && c.uploads.length);
-  try {
-    // 1) 準備（上傳；單檔會嘗試切割）——只在尚未備妥時做，需要原始檔（一次前景完成）
-    if (!prepared()) {
-      const entries = getApiKeyEntries();
-      ui.setBar(4);
-      ui.setLabel('選擇型號中…');
-      job.model = job.model || (await pickModelForKeys(entries));
-
-      if (job.multiFile) {
-        // 多檔模式：使用者自己分段錄好，每支檔案 = 一段（不需在手機上切割）
-        if (!job._files) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
-        job.mode = 'multi';
-        const m = job.chunks.length;
-        for (let i = 0; i < m; i++) {
-          if (job.chunks[i].uploads && job.chunks[i].uploads.length) continue;
-          ui.setBar(6 + (i / m) * 30);
-          ui.setLabel(`上傳第 ${i + 1}/${m} 支（${job._files[i].name}）…`);
-          const r = await uploadBlobToKeys(job._files[i], entries, ui.onProgress);
-          job.chunks[i].uploads = r.uploads;
-          job.chunks[i].mime = r.mime;
-        }
-      } else {
-        if (!job._file) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
-        // 嘗試把單一音檔切成小段（每段 30 分鐘），大幅降低每次請求 token
-        let blobs = null;
-        let splitErr = null;
-        try {
-          ui.setLabel('切割音檔中…');
-          const r = await splitAudioToChunks(job._file, 30 * 60, (i, n) => ui.setLabel(`切割音檔中…（${i}/${n} 段）`));
-          blobs = r.chunks;
-          job.durationSec = r.durationSec || job.durationSec;
-        } catch (e) {
-          blobs = null;
-          splitErr = e; // 記下原因；長錄音切不動時要據此給出可執行的建議
-          try {
-            console.error('[split] 切割音檔失敗', e);
-          } catch (_) {}
-        }
-        if (blobs && blobs.length) {
-          job.mode = 'split';
-          job.chunks = blobs.map((c) => ({ start: c.start, end: c.end, uploads: null, mime: 'audio/wav', segments: null }));
-          for (let i = 0; i < blobs.length; i++) {
-            ui.setBar(8 + (i / blobs.length) * 28);
-            ui.setLabel(`上傳第 ${i + 1}/${blobs.length} 段…`);
-            const r = await uploadBlobToKeys(blobs[i].blob, entries, ui.onProgress);
-            job.chunks[i].uploads = r.uploads;
-            job.chunks[i].mime = r.mime;
-            blobs[i].blob = null; // 釋放記憶體
-          }
-        } else if (!canUseWholeMode(job.durationSec)) {
-          // 切割失敗且錄音很長：整檔模式每次請求都要送完整音檔，免費層必定卡在 429 跑不完。
-          // 與其進入一個贏不了的重試迴圈，不如直接講清楚該怎麼做。
-          const mins = Math.round((job.durationSec || 0) / 60);
-          const reason = splitErr
-            ? `${splitErr.name || 'Error'}: ${splitErr.message || String(splitErr)}`
-            : '瀏覽器未回報原因';
-          const f = job._file;
-          const fileInfo = f
-            ? `${f.name || '未命名'}／${f.type || '格式不明'}／${(f.size / 1048576).toFixed(1)}MB`
-            : '檔案資訊不明';
-          throw new Error(
-            `這段錄音約 ${mins} 分鐘，瀏覽器切割音檔失敗，無法分段送出。
-` +
-            `請把錄音分成 2～4 段（每段建議 1 小時內），在「新增會議」一次選取多支檔案，App 會依檔名順序自動接成一份逐字稿。
-` +
-            `（技術原因：無法切割時只能整檔送出，${mins} 分鐘每次請求約 ${Math.round((job.durationSec || 0) * 32 / 1000)}k token，免費層額度吃不下。）
-` +
-            `切割失敗的原因：${reason}
-` +
-            `檔案：${fileInfo}`
-          );
-        } else {
-          // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
-          job.mode = 'whole';
-          const up = await uploadForJob(job._file, entries, ui.onProgress);
-          job.model = up.model;
-          job.chunks = buildWindows(job.durationSec).map((w) => ({ start: w.start, end: w.end, whole: w.whole, uploads: up.uploads, mime: up.mime, segments: null }));
-        }
-      }
-      await persistJob(job); // 全部上傳完成後才可續傳
-    }
-
-    await topUpMissingKeys(job, ui);
-
-    // 續傳的場次帶著當初存的型號。若它正在忙線記憶中、或使用者已在設定指定型號，
-    // 改用現在的最佳選擇——否則續傳永遠重撞同一面牆。
-    if (isModelBusy(job.model) || getModelLock()) {
-      try {
-        const fresher = await pickModelForKeys(getApiKeyEntries());
-        if (fresher && fresher !== job.model) {
-          job.model = fresher;
-          await persistJob(job);
-          paintJob();
-        }
-      } catch (_) {}
-    }
-
-    // 2) 逐段辨識（每段完成即存檔）
-    const n = job.chunks.length;
-    // 收集先前各段已出現的說話者，提示後續段落沿用相同標籤（改善跨段語者一致性）
-    const collectSeen = () => {
-      const seen = [];
-      for (const ch of job.chunks) {
-        for (const s of ch.segments || []) if (s.speaker && !seen.includes(s.speaker)) seen.push(s.speaker);
-      }
-      return seen;
-    };
-    for (let i = 0; i < n; i++) {
-      if (job.chunks[i].segments) continue;
-      const c = job.chunks[i];
-      const base = 40 + (i / n) * 52;
-      const next = 40 + ((i + 1) / n) * 52;
-      ui.setBar(base);
-      ui.easeTo(next, est / n);
-      let label = '辨識語者與逐字稿中…';
-      if (n > 1) label = job.mode === 'multi' ? `辨識第 ${i + 1}/${n} 支…` : `辨識第 ${i + 1}/${n} 段（${mmssApp(c.start)}–${mmssApp(c.end)}）…`;
-      const whole = job.mode === 'whole' ? !!c.whole : true;
-      const seen = collectSeen();
-      const run = () =>
-        transcribeRange(c.uploads, c.mime || job.mime, job.model, c.start || 0, c.end || 0, whole, ui.onProgress, label, seen.length ? seen : null);
-      try {
-        c.segments = await run();
-      } catch (e) {
-        if (isAborted()) throw e;
-        // 第一層補救：型號忙線（503）→ 沿著排名清單一路往下換（3.7 → 3.6 →
-        // 3.6-lite → 2.5…），不是只換一次。已知忙線的型號會被自動跳過
-        // （postJsonRotating 撞到 503 時已標記 10 分鐘忙線）。
-        // 換金鑰救不了——每把金鑰打的都是同一個型號。
-        let err = e;
-        // 型號不支援 JSON 模式：換型號重試（該型號已被永久排除，不會再被挑到）。
-        // 使用者若在設定指定了這個型號，一併解除，否則每次都會選回它。
-        while (err && isUnsupportedModelError(err)) {
-          if (getModelLock() && isModelUnsupported(getModelLock())) setModelLock('');
-          const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
-          if (!alt) break;
-          ui.setLabel(`${job.model} 不支援結構化輸出，改用 ${alt} 重試…`);
-          job.model = alt;
-          await persistJob(job);
-          paintJob();
-          try {
-            c.segments = await run();
-            err = null;
-          } catch (e2) {
-            if (isAborted()) throw e2;
-            err = e2;
-          }
-        }
-        while (err && isModelOverloaded(err)) {
-          const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
-          if (!alt) break; // 整條清單都忙 → 交給下面的 Groq 備援
-          ui.setLabel(`${job.model} 忙線中，改用 ${alt} 重試…`);
-          job.model = alt;
-          await persistJob(job);
-          paintJob();
-          try {
-            c.segments = await run();
-            err = null;
-          } catch (e2) {
-            if (isAborted()) throw e2;
-            err = e2;
-          }
-        }
-        // 第二層補救：額度見底、所有型號都忙、或內容被安全過濾器擋（PROHIBITED_CONTENT）
-        // → Groq（Whisper）接手這一段。Groq 額度獨立、也沒有內容過濾器。
-        // 代價：這一段分不出說話者（統一標「說話者」）。
-        if (err) {
-          if (!(isModelOverloaded(err) || isQuotaStall(err) || isContentBlocked(err))) throw err;
-          const segs = await groqFallbackForChunk(job, c, ui, i + 1, n);
-          if (segs) {
-            c.segments = segs;
-          } else if (isContentBlocked(err)) {
-            // Groq 走不了（沒金鑰/沒原檔/不是 m4a）→ 換型號再試一次：
-            // 過濾器是跟著型號走的，舊型號常常不會誤判同一段內容。
-            const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
-            if (!alt) {
-              throw new Error(
-                err.message +
-                  '\n這段被 Gemini 的內容過濾器擋下（會議內容常被誤判）。到設定頁填入 Groq 備援金鑰後按「繼續」，這種段落會自動改用 Whisper 辨識。'
-              );
-            }
-            ui.setLabel(`內容被 ${job.model} 的過濾器擋下，改用 ${alt} 重試…`);
-            job.model = alt;
-            await persistJob(job);
-            paintJob();
-            c.segments = await run();
-          } else {
-            throw err; // 條件不足（沒金鑰/沒原檔/不是 m4a）→ 維持原本的錯誤
-          }
-        }
-      }
-      ui.stopEase();
-      await persistJob(job);
-      ui.setBar(next);
-    }
-    // 3) 摘要（重點/待辦/Q&A 很重要 → 固定用品質模型，不受省額度影響）
-    ui.setLabel('整理摘要中…');
-    ui.easeTo(99, 20);
-    // 時間戳換算：模型回的 t 是「相對於該次上傳的那個音檔開頭」的秒數。
-    // - multi（使用者自己分好幾支）：記下是第幾支（fi），t 維持該支內的秒數
-    // - split／whole（同一個檔案切段或整檔時間窗）：加上該段的起始偏移 → 變成整場的絕對秒數
-    const allSegs = job.chunks.reduce((acc, c, ci) => {
-      const segs = (c.segments || []).map((sg) => {
-        if (sg.t == null) return sg;
-        return job.mode === 'multi' ? { ...sg, fi: ci } : { ...sg, t: sg.t + (c.start || 0) };
-      });
-      return acc.concat(segs);
-    }, []);
-    const summaryModel = await pickModelForKeys(getApiKeyEntries(), { preferLite: false });
-    let summary;
-    try {
-      summary = await summarize(allSegs, getApiKeyEntries(), summaryModel, ui.onProgress);
-    } catch (e) {
-      // 逐字稿已經全部到手，不能讓摘要一步毀掉整場 →
-      // Gemini 額度見底／忙線／被過濾器擋時，改用 Groq 的 Llama 整理摘要。
-      if (isAborted() || !hasGroqKey() || !(isQuotaStall(e) || isModelOverloaded(e) || isContentBlocked(e))) throw e;
-      ui.setLabel('Gemini 卡住，改用 Groq（Llama）整理摘要…');
-      summary = await groqSummarize(allSegs, getGroqKey(), (s) => ui.setLabel(s));
-    }
-    ui.stopEase();
-    ui.setBar(100);
-    ui.setLabel('完成！');
-    // 4) 存成會議、清除任務
-    const meeting = {
-      id: uid(), title: job.title, createdAt: job.createdAt, updatedAt: Date.now(),
-      transcript: allSegs, summary,
-      durationSec: job.durationSec || 0,
-      audioMode: job.mode || 'whole',
-      audioParts: (job.chunks || []).map((c) => ({ start: c.start || 0, end: c.end || 0, name: c.name || '' })),
-    };
-    await save(meeting);
-    await clearJob(job.id);
-    jobRunning = false;
-    transcribing = false;
-    jobState = null;
-    ui.stop();
-    location.hash = '#/m/' + meeting.id;
-    syncNow();
-  } catch (e) {
-    ui.stop();
-    jobRunning = false;
-    transcribing = false;
-    jobState = null;
-    const stopped = isAborted();
-    if (stopped) {
-      // 使用者主動停止：進度已保存，回清單並用橫幅提示可繼續
-      toast('已停止辨識，進度已保留');
-      location.hash = '#/';
-      router();
-      refreshResumeBanner();
-      return;
-    }
-    const canResume = prepared();
-    const c = document.getElementById('jobprog');
-    if (c) {
-      c.dataset.ready = '';
-      c.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
-        <div class="hint" style="margin-top:6px">${canResume ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案再試。'}</div>
-        <button class="big" id="retryJob">${canResume ? '繼續辨識' : '返回'}</button>
-        <button class="big danger" id="cancelJob" style="margin-top:8px">取消並刪除這場任務</button>`;
-      const rb = document.getElementById('retryJob');
-      if (rb) rb.onclick = () => (prepared() ? openJobProgress(job) : (location.hash = '#/new'));
-      const cb = document.getElementById('cancelJob');
-      if (cb) cb.onclick = () => cancelActiveJob(job);
-    }
-    refreshResumeBanner();
-  } finally {
-    await wakeLock.stop();
-  }
-}
-
-// 畫出進度頁的殼（不啟動任務）。renderJob 與 openJobProgress 共用。
-function paintJobShell() {
-  setHeader('辨識中', true);
-  view.innerHTML = `
-    <div class="card">
-      <div class="warn">辨識進行中。你可以<b>在 App 內</b>切到清單、設定等其他畫面去忙別的，它會<b>繼續跑</b>，隨時點畫面上方的橫幅就能回到這裡；只有<b>切出 App</b>（回主畫面或切到別的 App）才會中斷，回來會從這裡接續（iPhone 無法讓網頁在背景繼續運算）。</div>
-      ${
-        wakeLock.isSupported()
-          ? '<div class="hint" style="margin-top:8px">🔆 辨識期間會<b>維持螢幕恆亮</b>，放著不動也不會因為變暗而中斷。</div>'
-          : '<div class="warn" style="margin-top:8px">⚠️ 這台裝置不支援自動恆亮。螢幕變暗會中斷辨識，請先到<b>設定 → 螢幕顯示與亮度 → 自動鎖定</b>改成<b>永不</b>，或期間偶爾點一下螢幕。</div>'
-      }
-      <div class="progress" id="jobprog"></div>
-      <div class="hint" id="jobkeys" style="margin-top:8px"></div>
-      <button class="big danger" id="stopJob" style="margin-top:14px">■ 停止辨識</button>
-      <div class="hint" style="margin-top:6px">停止後已完成的段落會保留，之後可從中斷處繼續。</div>
-    </div>`;
-  paintJob();
-  // 本場實際能輪替的金鑰：音檔綁專案，只有「這場開始前就上傳過」的金鑰才用得到。
-  // 中途新增的金鑰不會生效——不講清楚的話，使用者會以為某把金鑰壞了。
-  const job = jobState && jobState.job;
-  const upKeys = job && job.chunks && job.chunks[0] && job.chunks[0].uploads;
-  const kEl = document.getElementById('jobkeys');
-  if (kEl && upKeys && upKeys.length) {
-    const total = getApiKeyEntries().length;
-    const names = upKeys.map((u) => u.name || '未命名').join('、');
-    kEl.innerHTML =
-      `🔑 本場可輪替：<b>${esc(names)}</b>（${upKeys.length} 把）` +
-      (total > upKeys.length
-        ? `　<span style="color:var(--muted)">其餘 ${total - upKeys.length} 把沒有這場的音檔，本場不會用到；下一場才會納入。</span>`
-        : '');
-  }
-  const sb = document.getElementById('stopJob');
-  if (sb) sb.onclick = stopRunningJob;
-}
-
-// 回到「正在跑」的任務畫面（不重新啟動，只是重新掛上顯示器）
-function renderJob() {
-  if (!jobRunning || !jobState) {
-    location.hash = '#/';
-    return;
-  }
-  paintJobShell();
-}
-
-// 停止進行中的辨識：立即中斷（連等待重試的睡眠也會被打斷），進度保留可續傳
-function stopRunningJob() {
-  if (!jobRunning) return;
-  if (!confirm('確定停止這場辨識嗎？\n已完成的段落會保留，之後可從中斷處繼續。')) return;
-  const sb = document.getElementById('stopJob');
-  if (sb) {
-    sb.disabled = true;
-    sb.textContent = '停止中…';
-  }
-  requestAbort();
-}
-
-async function openJobProgress(job) {
+// 常駐橫幅：上傳中離開上傳頁時，任何頁面都能一鍵回去
+function refreshBanner() {
   const existing = document.getElementById('resume-banner');
-  if (existing) existing.remove();
-  if (location.hash !== '#/job') location.hash = '#/job'; // 讓「辨識中」有自己的網址，離開後回得來
-  paintJobShell();
-  await processJob(job);
-}
-
-async function startNewTranscription(files) {
-  // 防止辨識中又開第二個任務（兩者共用 job id 'active' 會互相覆寫、燒雙倍額度）
-  if (jobRunning) {
-    // 舊版只跳一句「請先返回查看進度」，但當時根本沒有返回的路 → 死路一條
-    if (confirm('已有一場辨識正在進行中。\n要前往查看它的進度嗎？（可在那裡停止它）')) {
-      location.hash = '#/job';
-    }
+  if (!upload || location.hash === '#/new') {
+    if (existing) existing.remove();
     return;
   }
-  const active = await getActiveJob();
-  if (active && !active.done) {
-    if (!confirm('偵測到尚有未完成的辨識任務。要「捨棄」它並開始新的嗎？\n（按取消可回上一頁從中斷處繼續）')) {
-      return;
-    }
-    await clearJob(active.id);
-  }
-  const list = (Array.isArray(files) ? files.slice() : [files]).sort((a, b) =>
-    a.name.localeCompare(b.name, undefined, { numeric: true })
-  );
-  const now = Date.now();
-  let job;
-  if (list.length > 1) {
-    // 多檔模式：使用者自己分段錄好的多支檔案，依檔名順序接成一份
-    const durs = await Promise.all(list.map(getAudioDuration));
-    job = {
-      id: 'active',
-      _files: list,
-      multiFile: true,
-      title: defaultTitle(list[0].name, now),
-      createdAt: now,
-      durationSec: durs.reduce((a, b) => a + (b || 0), 0),
-      chunks: list.map((f) => ({ name: f.name, uploads: null, mime: null, segments: null })),
-      mode: 'multi',
-      model: null,
-      mime: null,
-      done: false,
-    };
-  } else {
-    const file = list[0];
-    job = {
-      id: 'active',
-      _file: file,
-      title: defaultTitle(file.name, now),
-      createdAt: now,
-      durationSec: await getAudioDuration(file),
-      chunks: null,
-      mode: null,
-      model: null,
-      mime: null,
-      done: false,
-    };
-  }
-  await openJobProgress(job);
-}
-
-// 取消並刪除進行中/卡住的辨識任務（無論有沒有可續傳的進度）
-async function cancelActiveJob(job) {
-  if (!confirm('確定取消並刪除這場辨識任務？已辨識的進度會一併清除，之後要重新選檔。')) return;
-  if (jobRunning) requestAbort(); // 正在跑的話先中斷，否則它會繼續燒額度
-  try {
-    const active = job || (await getActiveJob());
-    if (active) await clearJob(active.id || 'active');
-  } catch (_) {}
-  jobRunning = false;
-  transcribing = false;
-  jobState = null;
-  const banner = document.getElementById('resume-banner');
-  if (banner) banner.remove();
-  toast('已取消辨識任務');
-  location.hash = '#/';
-  router();
-}
-
-async function refreshResumeBanner() {
-  const existing = document.getElementById('resume-banner');
-  // 辨識進行中：全程顯示常駐橫幅，任何頁面都能一鍵回到進度頁。
-  // （舊版在 jobRunning 時直接隱藏橫幅 → 跑到一半離開就完全沒有入口回去。）
-  if (jobRunning && jobState) {
-    if (location.hash === '#/job') {
-      if (existing) existing.remove();
-      return;
-    }
-    const text = `⏳ 辨識進行中（${jobState.label}）· 點此查看`;
-    if (existing) {
-      const s = existing.querySelector('#resumeGo');
-      if (s) s.textContent = text;
-      return;
-    }
-    const b = document.createElement('div');
-    b.id = 'resume-banner';
-    b.className = 'install-banner';
-    b.innerHTML = `<span id="resumeGo"></span>`;
-    b.querySelector('#resumeGo').textContent = text;
-    b.onclick = () => (location.hash = '#/job');
-    document.body.appendChild(b);
+  const sent = upload.files.reduce((a, f) => a + f.sent, 0);
+  const pct = upload.total ? Math.floor((sent / upload.total) * 100) : 100;
+  const text = upload.phase === 'error' ? '⚠️ 上傳中斷 · 點此繼續' : `⬆️ 上傳中 ${pct}% · 點此查看`;
+  if (existing) {
+    existing.querySelector('#resumeGo').textContent = text;
     return;
   }
-  if (existing) existing.remove();
-  const job = await getActiveJob();
-  if (!job || !job.chunks || !job.chunks.length || !job.chunks.every((c) => c.uploads && c.uploads.length)) return;
-  const doneCount = job.chunks.filter((c) => c.segments).length;
   const b = document.createElement('div');
   b.id = 'resume-banner';
   b.className = 'install-banner';
-  b.innerHTML = `<span id="resumeGo">⏳ 有一場辨識未完成（${doneCount}/${job.chunks.length} 段），點此繼續</span><span class="x" id="resumeX" title="取消刪除">×</span>`;
-  b.querySelector('#resumeGo').onclick = () => {
-    b.remove();
-    openJobProgress(job);
-  };
-  b.querySelector('#resumeX').onclick = (e) => {
-    e.stopPropagation();
-    cancelActiveJob(job);
-  };
+  b.innerHTML = `<span id="resumeGo"></span>`;
+  b.querySelector('#resumeGo').textContent = text;
+  b.onclick = () => (location.hash = '#/new');
   document.body.appendChild(b);
 }
 
-// 讀取音檔長度（秒），用於估算辨識時間；失敗回傳 0
-function getAudioDuration(file) {
-  return new Promise((resolve) => {
-    try {
-      const a = document.createElement('audio');
-      a.preload = 'metadata';
-      const url = URL.createObjectURL(file);
-      let settled = false;
-      const done = (d) => {
-        if (settled) return;
-        settled = true;
-        URL.revokeObjectURL(url);
-        resolve(d);
+// ===== 處理進度頁（轉錄／摘要在 NAS 與電腦上跑，這裡每 3 秒問一次）=====
+async function renderProgress(id) {
+  setHeader('處理進度', true);
+  const route = location.hash;
+  view.innerHTML = `
+    <div class="card">
+      <h3 id="pgTitle" style="margin:0 0 8px"></h3>
+      <div class="progress" id="jobprog"><div class="spinner"></div></div>
+      <div id="jobops"></div>
+      <div class="hint" style="margin-top:8px">轉錄在電腦顯示卡上跑，可以關掉 App，好了再回來看（有開 TG 通知會傳訊息給你）。</div>
+    </div>`;
+  let m = null;
+  let opsKey = '';
+  const paint = () => {
+    const c = document.getElementById('jobprog');
+    if (!c || !m) return;
+    document.getElementById('pgTitle').textContent = m.title || '';
+    const p = m.progress || {};
+    const pct = m.status === 'failed' ? 0 : Math.max(0, Math.min(100, Number(p.pct) || 0));
+    const stage = STAGE_TEXT[m.status] || m.status || '';
+    c.innerHTML = `
+      ${m.status === 'failed' ? `<div class="err">❌ ${esc(statusText(m))}</div>` : `<div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div>
+      <div class="prog-label">${esc(stage)}${p.pct != null ? ` ${Math.round(pct)}%` : ''}</div>`}
+      ${p.msg && m.status !== 'failed' ? `<div class="prog-time">${esc(p.msg)}</div>` : ''}
+      ${p.engine === 'nas-cpu' ? `<div class="prog-key">🖥️ ${esc(NAS_CPU_TEXT)}</div>` : ''}
+      ${m.createdAt ? `<div class="prog-time">已耗時 ${mmss((Date.now() - m.createdAt) / 1000)}</div>` : ''}`;
+    const hasAudio = Array.isArray(m.audio) && m.audio.length > 0;
+    const hasTr = Array.isArray(m.transcript) && m.transcript.length > 0;
+    const key = `${m.status}|${hasAudio}|${hasTr}`;
+    if (key === opsKey) return;
+    opsKey = key;
+    const ops = document.getElementById('jobops');
+    const processing = isProcessing(m);
+    ops.innerHTML =
+      (processing ? `<button class="big danger" id="pgStop" style="margin-top:14px">■ 停止</button>` : '') +
+      (!processing && hasAudio ? `<button class="big" id="pgRetr" style="margin-top:14px">🔁 重新轉錄</button>` : '') +
+      (hasTr ? `<button class="big secondary" id="pgOpen" style="margin-top:8px">先看逐字稿</button>` : '') +
+      `<button class="big danger" id="pgDel" style="margin-top:8px">取消並刪除</button>`;
+    const stop = document.getElementById('pgStop');
+    if (stop)
+      stop.onclick = async () => {
+        if (!m.jobId) {
+          toast('找不到這場的工作編號，請稍後再試');
+          return;
+        }
+        if (!confirm('停止這場轉錄？之後可以按「重新轉錄」再跑一次。')) return;
+        try {
+          await api.cancelJob(m.jobId);
+          toast('已停止');
+          tick();
+        } catch (e) {
+          alert('停止失敗：' + errText(e));
+        }
       };
-      a.onloadedmetadata = () => done(isFinite(a.duration) ? a.duration : 0);
-      a.onerror = () => done(0);
-      a.src = url;
-      setTimeout(() => done(0), 4000);
-    } catch (_) {
-      resolve(0);
+    const retr = document.getElementById('pgRetr');
+    if (retr)
+      retr.onclick = async () => {
+        try {
+          await api.retranscribe(id);
+          toast('已重新排入轉錄');
+          opsKey = '';
+          tick();
+        } catch (e) {
+          alert('重新轉錄失敗：' + errText(e));
+        }
+      };
+    const open = document.getElementById('pgOpen');
+    if (open) open.onclick = () => (location.hash = '#/m/' + encodeURIComponent(id));
+    document.getElementById('pgDel').onclick = async () => {
+      if (!confirm('取消並刪除這場會議？（會移到 NAS 的垃圾桶，不會真的消失）')) return;
+      try {
+        if (isProcessing(m) && m.jobId) await api.cancelJob(m.jobId).catch(() => {});
+        await api.deleteMeeting(id);
+        await uncacheMeeting(id);
+        toast('已取消並刪除');
+        location.hash = '#/';
+      } catch (e) {
+        alert('刪除失敗：' + errText(e));
+      }
+    };
+  };
+  let timer = null;
+  const tick = async () => {
+    clearTimeout(timer);
+    if (location.hash !== route) return;
+    let fresh = null;
+    try {
+      fresh = await api.getMeeting(id);
+      setOffline(false);
+      await cacheMeeting(fresh);
+    } catch (e) {
+      noteFetchError(e);
+      if (e && e.status === 404) {
+        toast('這場會議已不存在');
+        location.hash = '#/';
+        return;
+      }
+      fresh = m || (await cachedMeeting(id));
     }
-  });
+    if (location.hash !== route) return;
+    if (fresh) {
+      m = fresh;
+      if (!m.status || m.status === 'done') {
+        location.hash = '#/m/' + encodeURIComponent(id);
+        return;
+      }
+      paint();
+    }
+    if (!m || isProcessing(m)) timer = setTimeout(tick, 3000);
+  };
+  // 已耗時每秒更新
+  const clock = setInterval(() => {
+    if (location.hash !== route) clearInterval(clock);
+    else if (m && isProcessing(m)) paint();
+  }, 1000);
+  tick();
 }
 
-async function renderDetail(id) {
-  let m = await get(id);
+async function renderDetail(id, preloaded) {
+  // 先秒開快取，再向 NAS 拿最新版；有變就重畫
+  let m = preloaded || null;
   if (!m) {
+    const cached = await cachedMeeting(id);
+    if (cached) {
+      m = cached;
+      api
+        .getMeeting(id)
+        .then(async (fresh) => {
+          setOffline(false);
+          await cacheMeeting(fresh);
+          const changed = fresh.updatedAt !== cached.updatedAt || fresh.status !== cached.status;
+          if (changed && currentDetailId() === id && !detailBusy()) renderDetail(id, fresh);
+        })
+        .catch((e) => {
+          noteFetchError(e);
+          if (e && e.status === 404 && currentDetailId() === id) {
+            uncacheMeeting(id);
+            toast('這場會議已不在 NAS 上');
+            location.hash = '#/';
+          }
+        });
+    } else {
+      m = await loadMeeting(id);
+    }
+  }
+  if (!m) {
+    toast('找不到這場會議');
     location.hash = '#/';
     return;
   }
+  if (currentDetailId() !== id) return; // 讀取期間使用者已離開
   setHeader('會議詳情', true);
   let lang = 'orig';
 
-  // 統一存檔：存前先從 DB 重讀最新版，把本次變更套在最新資料上再存
-  // → 避免畫面重繪或另一個 async handler 用「舊的 m」整份覆寫（stale closure 競態）。
-  // opts.edit=true 代表真實內容編輯（逐字稿/摘要/標題/分類），會 bump editedAt；
-  // 翻譯、問答等衍生資料不傳 edit → 只動 updatedAt，合併時不會蓋掉別台的真實編輯。
+  // 統一存檔：存前先向 NAS 重讀最新版，把本次變更套在最新資料上再整份寫回
+  // → 避免用「舊的 m」整份覆寫掉伺服器剛寫進來的 AI 結果（stale closure 競態）。
+  // opts.edit=true 代表真實內容編輯（逐字稿/摘要/標題/分類），會 bump editedAt。
+  // 失敗（連不上 NAS 等）時跳提示並回傳 null，畫面維持原狀。
   const persist = async (mutate, opts = {}) => {
-    const fresh = (await get(id)) || m;
-    mutate(fresh);
-    const now = Date.now();
-    fresh.updatedAt = now;
-    if (opts.edit) fresh.editedAt = now;
-    await save(fresh);
-    m = fresh;
-    if (opts.sync !== false) syncNow();
-    return fresh;
+    try {
+      const fresh = await api.getMeeting(id);
+      mutate(fresh);
+      if (opts.edit) fresh.editedAt = Date.now();
+      const saved = await api.saveMeeting(fresh);
+      await cacheMeeting(saved);
+      m = saved;
+      return saved;
+    } catch (e) {
+      noteFetchError(e);
+      alert('存檔失敗：' + errText(e));
+      return null;
+    }
   };
 
   // del：編輯模式下附上刪除鈕；此時不掛 data-jump，避免點刪除誤觸「跳到出處」
@@ -1465,10 +1136,33 @@ async function renderDetail(id) {
     return Object.assign({}, m, { transcript: c.transcript, summary: c.summary, notes: c.notes || null });
   };
 
+  const audioParts = Array.isArray(m.audio) ? m.audio : [];
+  const hasTranscript = Array.isArray(m.transcript) && m.transcript.length > 0;
+  // 還在處理（例如重新轉錄、摘要中）或失敗：頂端掛一條狀態
+  const stBanner = !m.status || m.status === 'done'
+    ? ''
+    : isProcessing(m)
+      ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(statusText(m))}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
+      : `<div class="warn st-warn"><div class="err">❌ ${esc(statusText(m))}</div>${hasTranscript ? '<button class="act-btn" id="reSummary" data-task="summary" style="margin-top:8px">🔄 重新產生摘要</button>' : ''}</div>`;
+  const audioCard = audioParts.length
+    ? `<div class="card" id="audioCard">
+      <div class="section-title" style="margin-top:0"><span>🎧 錄音</span><button class="copy" id="retrBtn" type="button">🔁 重新轉錄</button></div>
+      ${audioParts
+        .map(
+          (a, n) =>
+            `<div class="audio-part" data-part="${n}">${audioParts.length > 1 ? `<div class="meta">第 ${n + 1} 支：${esc((a && (a.name || a.file)) || '')}</div>` : ''}` +
+            `<audio controls preload="none" src="${esc(api.audioUrl(id, n))}"></audio><button class="audio-x" type="button" title="收起">✕</button></div>`
+        )
+        .join('')}
+      <div class="hint">點逐字稿裡的<b>時間標記</b>可以從那裡開始播放。</div>
+    </div>`
+    : '';
+
   view.innerHTML = `
     <div class="card">
       <input type="text" id="titleInput" value="${esc(m.title)}" />
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
+      ${stBanner}
       <div class="lang-toggle" id="langToggle">
         <button data-l="orig" class="active">原文</button>
         <button data-l="zh">中文</button>
@@ -1486,6 +1180,7 @@ async function renderDetail(id) {
       </div>
       <div class="act-grid" id="enhGrid"></div>
     </div>
+    ${audioCard}
     <div id="detailBody"></div>
     <div class="card" id="termsCard">
       <div class="section-title sec-head" data-sec="terms" style="margin-top:0"><span class="sec-t">📝 專有名詞訂正</span><span class="sec-right"><span class="chev" id="termsChev">▾</span></span></div>
@@ -1501,6 +1196,75 @@ async function renderDetail(id) {
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
   const bodyEl = document.getElementById('detailBody');
+
+  // ===== 錄音播放 =====
+  // 點時間標記：找出是第幾支、第幾秒，該支浮到畫面下方播放（不用捲回頂端找播放器）
+  const seekTo = (seg) => {
+    const tgt = seekTarget(seg, audioParts);
+    if (!tgt) return;
+    const wraps = view.querySelectorAll('#audioCard .audio-part');
+    wraps.forEach((w, n) => {
+      const a = w.querySelector('audio');
+      if (n !== tgt.part) {
+        w.classList.remove('floating');
+        if (a) a.pause();
+      }
+    });
+    const w = wraps[tgt.part];
+    const a = w && w.querySelector('audio');
+    if (!a) return;
+    w.classList.add('floating');
+    const go = () => {
+      try {
+        a.currentTime = tgt.time;
+      } catch (_) {}
+      const pr = a.play && a.play();
+      if (pr && pr.catch) pr.catch(() => {});
+    };
+    if (a.readyState >= 1) go();
+    else {
+      a.addEventListener('loadedmetadata', go, { once: true });
+      a.preload = 'metadata';
+      if (a.load) a.load();
+    }
+  };
+  view.querySelectorAll('#audioCard .audio-x').forEach((b) => {
+    b.onclick = () => {
+      const w = b.closest('.audio-part');
+      w.classList.remove('floating');
+      const a = w.querySelector('audio');
+      if (a) a.pause();
+    };
+  });
+  const retrBtn = document.getElementById('retrBtn');
+  if (retrBtn)
+    retrBtn.onclick = async () => {
+      if (isProcessing(m)) {
+        location.hash = '#/job/' + encodeURIComponent(id);
+        return;
+      }
+      if (!confirm('用電腦重新轉錄這場錄音？完成後會取代目前的逐字稿與摘要（手動改過的字會被覆蓋）。')) return;
+      try {
+        await api.retranscribe(id);
+        location.hash = '#/job/' + encodeURIComponent(id);
+      } catch (e) {
+        alert('重新轉錄失敗：' + errText(e));
+      }
+    };
+  const stB = document.getElementById('stBanner');
+  if (stB) stB.onclick = () => (location.hash = '#/job/' + encodeURIComponent(id));
+  const reSum = document.getElementById('reSummary');
+  if (reSum)
+    reSum.onclick = async () => {
+      if (detailBusy()) return;
+      try {
+        const fresh = await runServerAI(id, 'summary', '摘要中…', 'summary');
+        renderDetail(id, fresh);
+        toast('摘要完成 ✓');
+      } catch (e) {
+        alert('摘要失敗：' + errText(e));
+      }
+    };
 
   // ===== 摘要模式：會議摘要（原有三區）／學習筆記（研討會、上課用的五區）=====
   // 每場會議各自記住上次看的模式：研討會下次進來就直接是學習筆記。
@@ -1654,7 +1418,9 @@ async function renderDetail(id) {
           const key = `${seg.fi == null ? '' : seg.fi}:${Math.floor(seg.t / 60)}`;
           if (key !== lastMark) {
             lastMark = key;
-            mark = `<div class="time-mark">${esc(timeLabel(seg))}</div>`;
+            mark = audioParts.length
+              ? `<div class="time-mark seekable" data-seek="${i}" title="從這裡播放">▶ ${esc(timeLabel(seg))}</div>`
+              : `<div class="time-mark">${esc(timeLabel(seg))}</div>`;
           }
         }
         return (
@@ -1846,6 +1612,14 @@ async function renderDetail(id) {
       upd();
     });
 
+    bodyEl.querySelectorAll('[data-seek]').forEach((el) => {
+      el.onclick = (e) => {
+        e.stopPropagation();
+        const seg = (c.transcript || [])[+el.dataset.seek];
+        if (seg) seekTo(seg);
+      };
+    });
+
     const gn = document.getElementById('genNotes');
     if (gn) gn.onclick = () => doGenNotes();
     const rgn = document.getElementById('regenNotes');
@@ -1907,11 +1681,6 @@ async function renderDetail(id) {
     document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === l));
     if (l !== 'orig' && !contentFor(l)) {
       lang = l;
-      if (!hasApiKey()) {
-        bodyEl.innerHTML = `<div class="card"><div class="err">請先到右上角 ⚙︎ 設定，填入你的 Gemini API 金鑰，才能翻譯。<br>（金鑰是每台裝置各自設定的）</div><button class="big secondary" id="backZh" style="margin-top:10px">返回原文</button></div>`;
-        document.getElementById('backZh').onclick = () => setLang('orig');
-        return;
-      }
       if (detailBusy()) {
         toast('已有一項作業進行中，請等它完成');
         setLang('orig');
@@ -1919,30 +1688,11 @@ async function renderDetail(id) {
       }
       drawBody(l); // 顯示「翻譯中…」
       try {
-        const fp = transcriptFingerprint(m.transcript); // 翻譯前記錄逐字稿指紋
-        const tr = await runDetailTask(id, 'tr:' + l, '翻譯中…', (setMsg) =>
-          translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
-            notes: m.notes || null,
-            onProgress: (info) => {
-              setMsg(info && info.message);
-              const el = document.getElementById('tprogmsg');
-              if (el && info && info.message) el.textContent = info.message;
-            },
-          })
-        );
-        // 翻譯期間若原文被改過（指紋不符）→ 丟棄這份翻譯，不落盤（避免存下對不上的翻譯）
-        const cur = await get(id);
-        if (cur && transcriptFingerprint(cur.transcript) !== fp) {
-          if (lang === l) {
-            setLang('orig');
-            toast('原文已變更，請重新翻譯');
-          }
-          return;
-        }
-        await persist((fresh) => {
-          fresh.translations = fresh.translations || {};
-          fresh.translations[l] = tr;
+        m = await runServerAI(id, 'tr:' + l, '翻譯中…', 'translate', { lang: l }, (msg) => {
+          const el = document.getElementById('tprogmsg');
+          if (el) el.textContent = msg;
         });
+        if (!contentFor(l)) throw new Error('NAS 沒有寫回這個語言的譯文');
         if (lang === l) drawBody(l);
       } catch (e) {
         if (lang !== l) return; // 使用者已切走
@@ -2061,7 +1811,7 @@ async function renderDetail(id) {
         <button class="act-btn" id="addTerm">＋ 手動新增</button>
       </div>
       ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
-      ${pendingCount ? `<button class="big" id="applyTerms" style="margin-top:12px">✅ 套用全部訂正（${pendingCount}）</button><div class="hint" style="margin-top:6px">按下後才會一次改動逐字稿、會議摘要與學習筆記，並同步雲端。</div>` : ''}`;
+      ${pendingCount ? `<button class="big" id="applyTerms" style="margin-top:12px">✅ 套用全部訂正（${pendingCount}）</button><div class="hint" style="margin-top:6px">按下後才會一次改動逐字稿、會議摘要與學習筆記，並存回 NAS。</div>` : ''}`;
     document.getElementById('rescanTerms').onclick = (e) => doScanTerms(e.target);
     document.getElementById('addTerm').onclick = () => openTermEditor(-1);
     termsBody.querySelectorAll('.term-row').forEach((r) => {
@@ -2110,7 +1860,7 @@ async function renderDetail(id) {
       const oldV = idx >= 0 ? curOld : (box.querySelector('#tOld').value || '').trim();
       const newV = (newInp.value || '').trim();
       if (!oldV) { alert('請填入辨識錯的字'); return; }
-      // 暫存草稿（存本機、不同步、不動全文）；設回目前寫法等於取消該筆草稿
+      // 暫存草稿（存回 NAS，但不動全文）；設回目前寫法等於取消該筆草稿
       await persist((fresh) => {
         fresh.terms = fresh.terms || { items: [] };
         fresh.terms.items = fresh.terms.items || [];
@@ -2132,12 +1882,12 @@ async function renderDetail(id) {
         } else if (newV && newV !== oldV) {
           fresh.terms.items.push({ t: oldV, cat: 'term', fix: '', draft: newV });
         }
-      }, { sync: false });
+      });
       drawTerms();
     };
   };
 
-  // 一次套用所有「待套用」的草稿：單次全文替換 + 單次同步 + 單次重繪
+  // 一次套用所有「待套用」的草稿：單次全文替換 + 單次存檔 + 單次重繪
   const applyAllTerms = async () => {
     const pend = ((m.terms && m.terms.items) || []).filter(termPending);
     if (!pend.length) return;
@@ -2158,38 +1908,32 @@ async function renderDetail(id) {
   };
 
   const doScanTerms = async (btn) => {
-    if (!hasApiKey()) { alert('請先到 ⚙︎ 設定填入 Gemini 金鑰'); return; }
     if (!(m.transcript && m.transcript.length)) { alert('這場沒有逐字稿，無法挑詞'); return; }
     if (detailBusy()) { toast('已有一項作業進行中，請等它完成'); return; }
+    // 已套用過的訂正要留著：伺服器重掃若沒保留，就補回去（前面）
+    const prevApplied = ((m.terms && m.terms.items) || []).filter((x) => x && x.applied);
     try {
-      const found = await runDetailTask(id, 'terms', '掃描中…', (setMsg) =>
-        extractTerms(m.transcript, getApiKeyEntries(), {
-          onProgress: (info) => setMsg(info && info.message),
-        })
-      );
-      // 保留已訂正過的詞，合併新挑到的
-      await persist((fresh) => {
-        const prevApplied = ((fresh.terms && fresh.terms.items) || []).filter((x) => x.applied);
-        const seen = new Set(prevApplied.map((x) => x.t));
-        const merged = prevApplied.slice();
-        for (const f of found) if (!seen.has(f.t)) { merged.push(f); seen.add(f.t); }
-        fresh.terms = { scannedAt: Date.now(), items: merged };
-      });
+      m = await runServerAI(id, 'terms', '掃描中…', 'terms');
+      const items = (m.terms && m.terms.items) || [];
+      const lost = prevApplied.filter((x) => !items.some((y) => y && y.t === x.t && y.applied));
+      if (lost.length) {
+        await persist((f) => {
+          f.terms = f.terms || { items: [] };
+          const cur = (f.terms.items || []).filter((y) => !lost.some((x) => x.t === y.t));
+          f.terms.items = lost.concat(cur);
+        });
+      }
       drawTerms();
-      const n = (m.terms.items || []).filter((x) => !x.applied).length;
+      const n = ((m.terms && m.terms.items) || []).filter((x) => x && !x.applied).length;
       toast(n ? `挑出 ${n} 個待訂正的詞` : '沒有挑到需要訂正的詞');
     } catch (e) {
-      alert('挑詞失敗：' + (e && e.message ? e.message : e));
+      alert('挑詞失敗：' + errText(e));
     }
   };
   drawTerms();
 
   // 加強某一區塊（分段掃整份逐字稿抓完整清單）
   const doEnhance = async (section, btn) => {
-    if (!hasApiKey()) {
-      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
-      return;
-    }
     if (!(m.transcript && m.transcript.length)) {
       alert('這場沒有逐字稿，無法加強');
       return;
@@ -2199,25 +1943,16 @@ async function renderDetail(id) {
       toast('已有一項作業進行中，請等它完成');
       return;
     }
-    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變）。`)) return;
+    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變，舊版會留著可以換回來）。`)) return;
     try {
       const before = ((m.summary || {})[section] || []).length;
-      const items = await runDetailTask(id, 'enh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
-        enhanceSection(m.transcript, section, getApiKeyEntries(), {
-          onProgress: (info) => setMsg(info && info.message),
-        })
-      );
-      await persist((fresh) => {
-        fresh.summary = fresh.summary || {};
-        backupSection(fresh, 'summary', section); // 留下加強前的版本，之後可來回切換
-        fresh.summary[section] = items;
-        fresh.translations = {}; // 內容改了 → 清掉舊翻譯
-      }, { edit: true });
-      renderDetail(id);
-      const skipped = items.dropped || 0;
-      toast(`已加強${nameMap[section]}：${before} 筆 → ${items.length} 筆${skipped ? `（另略過 ${skipped} 則議程性問答）` : ''}`);
+      // 伺服器會先把目前版備份到 alt，再寫入新版 → 之後可用「換版／合併」
+      const fresh = await runServerAI(id, 'enh:' + section, `加強${nameMap[section]}中…`, 'enhance', { section });
+      renderDetail(id, fresh);
+      const after = ((fresh.summary || {})[section] || []).length;
+      toast(`已加強${nameMap[section]}：${before} 筆 → ${after} 筆`);
     } catch (e) {
-      alert('加強失敗：' + (e && e.message ? e.message : e));
+      alert('加強失敗：' + errText(e));
     }
   };
   function wireEnhButtons() {
@@ -2291,10 +2026,6 @@ async function renderDetail(id) {
     const inp = document.getElementById('chatInput');
     const q = inp.value.trim();
     if (!q) return;
-    if (!hasApiKey()) {
-      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
-      return;
-    }
     if (!(m.transcript && m.transcript.length)) {
       alert('這場沒有逐字稿，無法問答');
       return;
@@ -2304,20 +2035,12 @@ async function renderDetail(id) {
       return;
     }
     try {
-      const a = await runDetailTask(id, 'ask', '思考中…', (setMsg) =>
-        askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
-          onProgress: (info) => setMsg(info && info.message),
-        })
-      );
-      await persist((fresh) => {
-        fresh.chat = fresh.chat || [];
-        fresh.chat.push({ q, a, at: Date.now() });
-      });
+      m = await runServerAI(id, 'ask', '思考中…', 'ask', { question: q });
       inp.value = '';
       drawChat();
       chatLogEl.lastElementChild && chatLogEl.lastElementChild.scrollIntoView({ block: 'nearest' });
     } catch (e) {
-      alert('問答失敗：' + (e && e.message ? e.message : e));
+      alert('問答失敗：' + errText(e));
     }
   };
 
@@ -2328,19 +2051,18 @@ async function renderDetail(id) {
     }, { edit: true });
   };
   document.getElementById('del').onclick = async () => {
-    if (confirm('確定刪除這場會議記錄？此動作無法復原。')) {
-      await remove(id);
+    if (!confirm('確定刪除這場會議記錄？（會移到 NAS 的垃圾桶，需要時可以找回）')) return;
+    try {
+      await api.deleteMeeting(id);
+      await uncacheMeeting(id);
       location.hash = '#/';
-      syncNow();
+    } catch (e) {
+      alert('刪除失敗：' + errText(e));
     }
   };
 
   // 產生學習筆記（按需，不自動跑）
   const doGenNotes = async () => {
-    if (!hasApiKey()) {
-      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
-      return;
-    }
     if (!(m.transcript && m.transcript.length)) {
       alert('這場沒有逐字稿，無法產生學習筆記');
       return;
@@ -2351,26 +2073,18 @@ async function renderDetail(id) {
     }
     if (m.notes && !confirm('重新產生學習筆記？會取代目前這份。')) return;
     try {
-      const notes = await runDetailTask(id, 'notes', '整理學習筆記中…', (setMsg) =>
-        generateNotes(m.transcript, getApiKeyEntries(), { onProgress: (info) => setMsg(info && info.message) })
-      );
-      await persist((fresh) => {
-        fresh.notes = { ...notes, generatedAt: Date.now() };
-      });
-      renderDetail(id);
-      toast(`學習筆記完成（${notes.outline.length} 節、${notes.concepts.length} 個概念、${notes.tables.length} 張表）`);
+      const fresh = await runServerAI(id, 'notes', '整理學習筆記中…', 'notes');
+      renderDetail(id, fresh);
+      const n = fresh.notes || {};
+      toast(`學習筆記完成（${(n.outline || []).length} 節、${(n.concepts || []).length} 個概念、${(n.tables || []).length} 張表）`);
     } catch (e) {
-      alert('產生學習筆記失敗：' + (e && e.message ? e.message : e));
+      alert('產生學習筆記失敗：' + errText(e));
     }
   };
 
-  // 加強學習筆記的某一區（分批掃過整份逐字稿，補上一次生成漏掉的）
+  // 加強學習筆記的某一區（伺服器分批掃過整份逐字稿，補上一次生成漏掉的；舊版備份到 alt）
   const doEnhanceNotes = async (section) => {
     const nameMap = { outline: '章節大綱', concepts: '重要概念', tables: '對照表', figures: '關鍵數據', quiz: '自我測驗' };
-    if (!hasApiKey()) {
-      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
-      return;
-    }
     if (!(m.transcript && m.transcript.length)) {
       alert('這場沒有逐字稿，無法加強');
       return;
@@ -2379,23 +2093,15 @@ async function renderDetail(id) {
       toast('已有一項作業進行中，請等它完成');
       return;
     }
-    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區（其他區不變）。`)) return;
+    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區（其他區不變，舊版會留著可以換回來）。`)) return;
     try {
       const before = ((m.notes || {})[section] || []).length;
-      const items = await runDetailTask(id, 'nenh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
-        enhanceNotesSection(m.transcript, section, getApiKeyEntries(), { onProgress: (info) => setMsg(info && info.message) })
-      );
-      await persist((fresh) => {
-        fresh.notes = fresh.notes || { outline: [], concepts: [], tables: [], figures: [], quiz: [] };
-        backupSection(fresh, 'notes', section); // 留下加強前的版本，之後可來回切換
-        fresh.notes[section] = items;
-        fresh.translations = {}; // 內容改了 → 清掉舊翻譯
-      }, { edit: true });
-      renderDetail(id);
+      const fresh = await runServerAI(id, 'nenh:' + section, `加強${nameMap[section]}中…`, 'notes_enhance', { section });
+      renderDetail(id, fresh);
       // 標出加強前後的筆數：沒有變化時使用者才知道是「本來就抓完了」而不是按鈕沒作用
-      toast(`已加強${nameMap[section]}：${before} 筆 → ${items.length} 筆`);
+      toast(`已加強${nameMap[section]}：${before} 筆 → ${((fresh.notes || {})[section] || []).length} 筆`);
     } catch (e) {
-      alert('加強失敗：' + (e && e.message ? e.message : e));
+      alert('加強失敗：' + errText(e));
     }
   };
 
@@ -2435,118 +2141,137 @@ async function renderDetail(id) {
   paintDetailTasks();
 }
 
+// 「幾分鐘前」：轉錄器最後一次輪詢時間（秒或毫秒或 ISO 字串都吃）
+export function agoText(ts, now = Date.now()) {
+  if (ts == null || ts === '') return '從未連線';
+  let ms = typeof ts === 'number' ? ts : Date.parse(ts);
+  if (!isFinite(ms)) return '不明';
+  if (ms < 1e12) ms *= 1000; // 秒 → 毫秒
+  const s = Math.max(0, Math.round((now - ms) / 1000));
+  if (s < 60) return `${s} 秒前`;
+  if (s < 3600) return `${Math.floor(s / 60)} 分鐘前`;
+  if (s < 86400) return `${Math.floor(s / 3600)} 小時前`;
+  return `${Math.floor(s / 86400)} 天前`;
+}
+
 function renderSettings() {
   setHeader('設定', true);
-  const cfg = defaultSyncConfig();
-  const enabled = sync.isEnabled();
   // 這支 App 的網址（去掉 #hash 與 ?query）——PWA 從主畫面開啟時看不到網址列，
   // 需要換裝置或分享給別人時，這裡是唯一拿得到網址的地方。
   const appUrl = location.origin + location.pathname;
   view.innerHTML = `
     <div class="card">
+      <p style="margin-top:0"><b>🖥️ NAS 狀態</b></p>
+      <div id="nasStatus" class="usage-list"><div class="meta">讀取中…</div></div>
+      <button class="big secondary" id="statusRefresh" style="margin-top:8px">重新整理</button>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>⚙️ 處理設定</b>（存在 NAS，所有裝置共用）</p>
+      <p style="margin-bottom:6px"><b>Claude 型號</b>（摘要、加強、筆記、問答、掃詞、翻譯）</p>
+      <select id="claudeModel" style="width:100%" disabled>
+        <option value="sonnet">Sonnet（預設，品質與速度平衡）</option>
+        <option value="opus">Opus（最好，較慢、較吃額度）</option>
+        <option value="haiku">Haiku（最快，品質較低）</option>
+      </select>
+      <label class="set-row"><input type="checkbox" id="fallbackEnabled" disabled /> <span>NAS 備援轉錄（電腦沒開時，NAS 自己慢慢轉；不分說話者）</span></label>
+      <div class="set-row"><span>等電腦幾分鐘沒接手才啟動備援：</span><input type="number" id="fallbackMinutes" min="1" max="1440" style="width:80px" disabled /> 分鐘</div>
+      <label class="set-row"><input type="checkbox" id="tgNotify" disabled /> <span>Telegram 通知（轉好時傳訊息給你）</span></label>
+      <div class="hint" id="setHint"></div>
+    </div>
+    <div class="card">
       <p style="margin-top:0"><b>🔗 這個 App 的網址</b></p>
       <input type="text" id="appUrl" value="${esc(appUrl)}" readonly />
       <button class="big secondary" id="copyUrl" style="margin-top:8px">複製網址</button>
-      <div class="hint">
-        用這個網址可在電腦或其他手機開啟同一個 App（PWA 從主畫面開啟時看不到網址列，所以放在這裡）。<br>
-        會議記錄<b>不會</b>跟著網址走：每台裝置各自存在本機，要跨裝置看到同一份記錄，需開啟下方的 GitHub 雲端同步。
-      </div>
-    </div>
-    <div class="card">
-      <p style="margin-top:0"><b>Gemini API 金鑰</b></p>
-      <div id="keyList"></div>
-      <button class="big secondary" id="addKey">➕ 新增一把金鑰</button>
-      <button class="big" id="saveKey" style="margin-top:8px">儲存</button>
-      <div id="usageBox"></div>
-      <div class="hint">
-        金鑰只存在這支手機（不會上傳到任何伺服器）。到 <a href="https://aistudio.google.com/apikey" target="_blank" rel="noopener">aistudio.google.com</a> → API Keys 複製免費金鑰。<br>
-        <b>多把金鑰</b>：每格填一把、可自己命名，撞到用量上限時會自動換下一把。⚠️ 每把要建在<b>不同專案</b>才有各自的額度（長錄音會各上傳一份音檔）。<br>
-        <b>用量</b>為本機統計（今日在這支手機呼叫幾次），非 Google 官方剩餘額度。
-      </div>
-    </div>
-    <div class="card">
-      <p style="margin-top:0"><b>🛟 Groq 備援金鑰（選填）</b></p>
-      <input type="password" id="groqKey" placeholder="貼上 Groq API 金鑰（gsk_ 開頭）" value="${esc(getGroqKey())}" autocomplete="off" autocapitalize="off" spellcheck="false" />
-      <button class="big" id="saveGroqKey" style="margin-top:8px">儲存</button>
-      <div class="hint">
-        <b>不填也能用。</b>填了之後，當 Gemini 額度用盡或型號忙線導致某一段辨識卡死時，App 會自動改用 Groq（Whisper 模型）把那一段跑完——Groq 的免費額度（每天 8 小時音訊）與 Gemini 完全獨立。<br>
-        到 <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a> 免費申請。<br>
-        ⚠️ 代價：Groq 跑的段落<b>分不出說話者</b>（統一標「說話者」），且只支援 m4a／mp4 錄音檔。文字會自動轉繁體。
-      </div>
-    </div>
-    <div class="card">
-      <p style="margin-top:0"><b>🎚️ 辨識模型</b></p>
-      <div class="lang-toggle" id="modelToggle">
-        <button data-mp="auto" class="${getModelPref() === 'lite' ? '' : 'active'}">自動（品質優先）</button>
-        <button data-mp="lite" class="${getModelPref() === 'lite' ? 'active' : ''}">省額度（較不會卡）</button>
-      </div>
-      <div class="hint">
-        免費層一直撞到「用量上限（429）」跑不動時，切到<b>省額度</b>：改用 <b>Flash-Lite</b> 模型，免費層每分鐘額度大很多（約 4 倍），長錄音較不會卡；代價是辨識品質略降一點。可隨時切回。
-      </div>
-      <p style="margin-bottom:6px"><b>指定型號</b></p>
-      <select id="modelLock" style="width:100%">
-        <option value="">自動（依品質排序，忙線自動跳過）</option>
-      </select>
-      <div class="hint">
-        最新型號（如 3.7）剛推出時常因全球搶用而 503 塞車。想避開就在這裡指定一個舊一點的型號；
-        清單旁標「（忙線中）」代表它最近 10 分鐘內撞過 503。指定的型號也塞車時，仍會自動往下換，不會卡死。
-      </div>
-    </div>
-    <div class="card">
-      <p style="margin-top:0"><b>☁️ GitHub 雲端同步（跨裝置記憶）</b>
-        <span class="meta">${
-          !enabled
-            ? '｜狀態：未開啟（只存本機）'
-            : sync.isTokenInvalid()
-              ? '｜<b style="color:var(--danger)">狀態：權杖失效，請更新</b>'
-              : '｜狀態：已開啟'
-        }</span></p>
-      ${
-        enabled && sync.isTokenInvalid()
-          ? `<div class="warn" style="margin-bottom:10px">${esc(sync.TOKEN_401_MSG)}</div>`
-          : ''
-      }
-      <input type="password" id="ghToken" placeholder="貼上你的 GitHub 權杖（token）" value="${esc(cfg.token || '')}" autocomplete="off" />
-      <input type="text" id="ghRepo" placeholder="你的帳號/你的資料庫repo（例：myname/my-notes-data）" value="${cfg.owner && cfg.repo ? esc(cfg.owner + '/' + cfg.repo) : ''}" style="margin-top:8px" />
-      <button class="big" id="saveSync">儲存並同步</button>
-      <button class="big secondary" id="syncBtn" style="margin-top:8px">立即同步</button>
-      <button class="big secondary" id="clearSync" style="margin-top:8px">關閉同步（僅存本機）</button>
-      <div class="hint">
-        <b>不填也能用</b>（記錄只存這支手機）。要跨裝置才需要設定，全部用<b>你自己的</b> GitHub：<br>
-        1. 在 GitHub 建一個<b>私人 repo</b>（例如 <code>my-notes-data</code>），把「你的帳號/repo名」填在上面欄位。<br>
-        2. 到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> → Repository access 選那個 repo → Permissions 的 <b>Contents</b> 設 <b>Read and write</b> → 產生後貼到上面。<b>Expiration 建議設一年</b>，否則到期後同步會突然停止。<br>
-        權杖與記錄都只存你自己的裝置與你自己的 repo。
-      </div>
+      <div class="hint">在電腦或其他手機（要先連上 Tailscale）用這個網址開啟，看到的是同一份 NAS 上的會議記錄。</div>
     </div>
     <div class="card">
       <p style="margin-top:0"><b>💾 備份 / 還原</b></p>
-      <button class="big secondary" id="exportBtn">⬆️ 匯出備份檔</button>
+      <a class="big secondary btn-link" id="exportBtn" href="${esc(api.exportAllUrl())}" download>⬆️ 匯出備份檔</a>
       <button class="big secondary" id="importBtn" style="margin-top:8px">⬇️ 匯入備份檔</button>
       <input type="file" id="importFile" accept="application/json,.json" hidden />
       <div class="hint">
-        匯出會把<b>全部會議 + 分類群組</b>存成一個 JSON 檔。換手機或重灌時，用「匯入備份檔」還原——匯入會與現有資料<b>智慧合併</b>（不會覆蓋較新的內容、不會產生重複）。
+        匯出會把 NAS 上<b>全部會議 + 分類</b>存成一個 JSON 檔（與舊版備份格式相同）。匯入舊版備份會與 NAS 上的資料<b>合併</b>，不會刪掉任何現有會議。
       </div>
     </div>
     <div class="card">
       <p style="margin-top:0"><b>ℹ️ 關於／更新</b></p>
-      <div class="meta" style="margin-bottom:10px">目前版本：${APP_VERSION}</div>
+      <div class="meta" style="margin-bottom:10px">目前版本：${APP_VERSION}<span id="srvVer"></span></div>
       <button class="big secondary" id="forceUpdateBtn">🔄 檢查並載入最新版</button>
       <div class="hint">若畫面沒更新到最新，按這顆會清除快取並重新載入最新版。</div>
     </div>`;
-  // 金鑰清單（可命名、可新增/刪除）
-  const keyList = document.getElementById('keyList');
-  const addRow = (entry) => {
-    const div = document.createElement('div');
-    div.className = 'key-row';
-    div.innerHTML = `
-      <input type="text" class="key-name" placeholder="名稱（如：私人）" value="${esc((entry && entry.name) || '')}" autocomplete="off" />
-      <input type="password" class="key-val" placeholder="貼上金鑰" value="${esc((entry && entry.key) || '')}" autocomplete="off" autocapitalize="off" spellcheck="false" />
-      <button class="key-del" type="button" title="刪除">✕</button>`;
-    div.querySelector('.key-del').onclick = () => div.remove();
-    keyList.appendChild(div);
+
+  const drawStatus = async () => {
+    const box = document.getElementById('nasStatus');
+    try {
+      const s = await api.getStatus();
+      setOffline(false);
+      if (!document.body.contains(box)) return;
+      const w = s.worker || {};
+      const row = (k, v) => `<div class="usage-row"><span class="u-name">${k}</span><span class="u-stat">${v}</span></div>`;
+      box.innerHTML =
+        row('轉錄器（電腦）', w.online ? '<b style="color:#1f9d55">● 線上</b>' : '<b style="color:var(--danger)">● 離線</b>') +
+        row('最後連線', esc(agoText(w.lastSeen))) +
+        row('佇列', `${esc(s.queue != null ? (typeof s.queue === 'object' ? JSON.stringify(s.queue) : s.queue) : 0)} 件`) +
+        row('Claude 型號', esc(s.claudeModel || '—')) +
+        (s.diskFreeGB != null ? row('NAS 剩餘空間', `${esc(Math.round(s.diskFreeGB))} GB`) : '');
+      const sv = document.getElementById('srvVer');
+      if (sv && s.version) sv.textContent = `（伺服器 ${s.version}）`;
+    } catch (e) {
+      noteFetchError(e);
+      if (document.body.contains(box)) box.innerHTML = `<div class="err">讀不到 NAS 狀態：${esc(errText(e))}</div>`;
+    }
   };
-  const existingEntries = getApiKeyEntries();
-  (existingEntries.length ? existingEntries : [{ name: '', key: '' }]).forEach(addRow);
+  drawStatus();
+  document.getElementById('statusRefresh').onclick = drawStatus;
+
+  // 伺服器設定：讀到才開放修改；每次改動立即寫回
+  const els = {
+    claudeModel: document.getElementById('claudeModel'),
+    fallbackEnabled: document.getElementById('fallbackEnabled'),
+    fallbackMinutes: document.getElementById('fallbackMinutes'),
+    tgNotify: document.getElementById('tgNotify'),
+  };
+  const setHint = document.getElementById('setHint');
+  let settings = null;
+  (async () => {
+    try {
+      settings = await api.getSettings();
+      els.claudeModel.value = settings.claudeModel || 'sonnet';
+      els.fallbackEnabled.checked = !!settings.fallbackEnabled;
+      els.fallbackMinutes.value = settings.fallbackMinutes != null ? settings.fallbackMinutes : 20;
+      els.tgNotify.checked = !!settings.tgNotify;
+      Object.values(els).forEach((x) => (x.disabled = false));
+      els.fallbackMinutes.disabled = !els.fallbackEnabled.checked;
+    } catch (e) {
+      noteFetchError(e);
+      setHint.textContent = '讀不到伺服器設定：' + errText(e);
+    }
+  })();
+  const saveSet = async () => {
+    if (!settings) return;
+    const mins = Math.max(1, Math.min(1440, parseInt(els.fallbackMinutes.value, 10) || 20));
+    els.fallbackMinutes.value = mins;
+    els.fallbackMinutes.disabled = !els.fallbackEnabled.checked;
+    const next = {
+      ...settings,
+      claudeModel: els.claudeModel.value,
+      fallbackEnabled: els.fallbackEnabled.checked,
+      fallbackMinutes: mins,
+      tgNotify: els.tgNotify.checked,
+    };
+    try {
+      const r = await api.saveSettings(next);
+      settings = r && typeof r === 'object' ? { ...next, ...r } : next;
+      toast('設定已存到 NAS ✓');
+    } catch (e) {
+      alert('設定儲存失敗：' + errText(e));
+    }
+  };
+  els.claudeModel.onchange = saveSet;
+  els.fallbackEnabled.onchange = saveSet;
+  els.fallbackMinutes.onchange = saveSet;
+  els.tgNotify.onchange = saveSet;
+
   document.getElementById('copyUrl').onclick = async (e) => {
     const b = e.target;
     try {
@@ -2561,133 +2286,33 @@ function renderSettings() {
     }
     setTimeout(() => (b.textContent = '複製網址'), 1800);
   };
-  document.getElementById('addKey').onclick = () => addRow({ name: '', key: '' });
-  document.getElementById('saveGroqKey').onclick = () => {
-    setGroqKey(document.getElementById('groqKey').value);
-    toast(hasGroqKey() ? '已儲存 Groq 金鑰' : '已清除 Groq 金鑰');
-  };
-  // 指定型號下拉：清單要問 Google 才有，載入前先放目前鎖定的值避免閃跳
-  const lockSel = document.getElementById('modelLock');
-  if (lockSel) {
-    const curLock = getModelLock();
-    if (curLock) {
-      const opt = document.createElement('option');
-      opt.value = curLock;
-      opt.textContent = curLock;
-      lockSel.appendChild(opt);
-      lockSel.value = curLock;
-    }
-    if (hasApiKey()) {
-      getModelChoices(getApiKeyEntries())
-        .then((choices) => {
-          if (!document.body.contains(lockSel) || !choices.length) return;
-          lockSel.innerHTML = '<option value="">自動（依品質排序，忙線自動跳過）</option>';
-          for (const c of choices) {
-            const opt = document.createElement('option');
-            opt.value = c.name;
-            opt.textContent = c.name + (c.busy ? '（忙線中）' : '');
-            lockSel.appendChild(opt);
-          }
-          // 先前鎖定的型號已被排除（專用型號或撞過不支援）→ 自動改回自動，
-          // 否則畫面顯示一個選單裡不存在的值，使用者也不知道它已失效。
-          const lock = getModelLock();
-          if (lock && !choices.some((c) => c.name === lock)) {
-            setModelLock('');
-            toast(`型號 ${lock} 不適用，已改回自動選擇`);
-          }
-          lockSel.value = getModelLock() || '';
-        })
-        .catch(() => {}); // 拿不到清單就維持現狀，不擋設定頁
-    }
-    lockSel.onchange = () => {
-      setModelLock(lockSel.value);
-      toast(lockSel.value ? `辨識固定優先使用 ${lockSel.value}` : '已改回自動選擇');
-    };
-  }
-  document.getElementById('saveKey').onclick = () => {
-    const rows = Array.from(keyList.querySelectorAll('.key-row')).map((r) => ({
-      name: r.querySelector('.key-name').value,
-      key: r.querySelector('.key-val').value,
-    }));
-    setApiKeyEntries(rows);
-    toast(`已儲存 ${getApiKeys().length} 把金鑰`);
-    drawUsage();
-  };
-
-  // 本機用量顯示（今日次數 + 冷卻狀態），每秒更新冷卻倒數；離開設定頁自動停止
-  const usageBox = document.getElementById('usageBox');
-  const drawUsage = () => {
-    if (!document.body.contains(usageBox)) return false;
-    const entries = getApiKeyEntries();
-    if (!entries.length) {
-      usageBox.innerHTML = '';
-      return true;
-    }
-    usageBox.innerHTML =
-      '<div class="usage-list">' +
-      entries
-        .map((e, i) => {
-          const st = getKeyStatus(e.key);
-          const name = e.name || `金鑰${i + 1}`;
-          const status = st.cooling ? `<span class="u-cool">冷卻中 ${st.cooling}s</span>` : '<span class="u-stat">可用</span>';
-          return `<div class="usage-row"><span class="u-name">${esc(name)}</span><span><span class="u-stat">今日 ${st.count} 次 ｜ </span>${status}</span></div>`;
-        })
-        .join('') +
-      '</div>';
-    return true;
-  };
-  drawUsage();
-  const usageTimer = setInterval(() => {
-    if (!drawUsage()) clearInterval(usageTimer);
-  }, 1000);
-
-  // 辨識模型偏好切換
-  document.querySelectorAll('#modelToggle button').forEach((b) => {
-    b.onclick = () => {
-      const mp = b.dataset.mp;
-      setModelPref(mp);
-      setPreferLite(mp === 'lite');
-      document.querySelectorAll('#modelToggle button').forEach((x) => x.classList.toggle('active', x.dataset.mp === mp));
-      toast(mp === 'lite' ? '已切換到省額度（Flash-Lite）' : '已切換到自動（品質優先）');
-    };
-  });
-
-  document.getElementById('saveSync').onclick = async () => {
-    const token = document.getElementById('ghToken').value.trim();
-    const repoField = document.getElementById('ghRepo').value.trim();
-    const [owner, repo] = repoField.split('/');
-    if (!token || !owner || !repo) {
-      alert('請填入權杖與 owner/repo');
-      return;
-    }
-    sync.setSyncConfig({ token, owner, repo, path: 'meetings.json' });
-    await syncNow();
-    router();
-  };
-  document.getElementById('syncBtn').onclick = () => syncNow();
-  document.getElementById('clearSync').onclick = () => {
-    sync.clearSyncConfig();
-    toast('已關閉雲端同步');
-    router();
-  };
   document.getElementById('forceUpdateBtn').onclick = () => {
     toast('更新中…');
     forceUpdate();
   };
 
-  // 備份 / 還原
-  document.getElementById('exportBtn').onclick = () => onExport();
+  // 匯入備份：讀 JSON 交給 NAS 合併（不刪任何現有資料）
   const importInput = document.getElementById('importFile');
   document.getElementById('importBtn').onclick = () => importInput.click();
   importInput.onchange = async (e) => {
     const f = (e.target.files || [])[0];
     if (!f) return;
     try {
+      let doc;
+      try {
+        doc = JSON.parse(await f.text());
+      } catch (_) {
+        throw new Error('這不是有效的備份檔（JSON 解析失敗）');
+      }
+      if (!doc || !Array.isArray(doc.meetings)) throw new Error('備份檔格式不符（找不到 meetings）');
       toast('匯入中…');
-      const n = await importBackup(f);
-      toast(`匯入完成，目前共 ${n} 場會議 ✓`);
+      const r = (await api.importBackup(doc)) || {};
+      await refreshGroups();
+      await fetchList();
+      const n = (k) => (Array.isArray(r[k]) ? r[k].length : r[k] || 0);
+      alert(`匯入完成：新增 ${n('added')} 場、更新 ${n('updated')} 場、保留 ${n('kept')} 場${r.groups != null ? `，分類 ${n('groups')} 個` : ''}。`);
     } catch (err) {
-      alert('匯入失敗：' + (err && err.message ? err.message : err));
+      alert('匯入失敗：' + errText(err));
     } finally {
       importInput.value = ''; // 允許重選同一個檔案
     }
@@ -2696,22 +2321,25 @@ function renderSettings() {
 
 function router() {
   const h = location.hash || '#/';
-  refreshResumeBanner(); // 每次換頁都重算橫幅：辨識中離開進度頁時才會有回去的入口
-  if (h.startsWith('#/m/')) return renderDetail(h.slice(4));
-  if (h === '#/job') return renderJob();
+  refreshBanner(); // 每次換頁都重算橫幅：上傳中離開上傳頁時才會有回去的入口
+  if (h.startsWith('#/m/')) return renderDetail(decodeURIComponent(h.slice(4)));
+  if (h.startsWith('#/job/')) return renderProgress(decodeURIComponent(h.slice(6)));
   if (h === '#/new') return renderNew();
   if (h === '#/settings') return renderSettings();
   if (h === '#/groups') return renderGroups();
-  if (h.startsWith('#/g/')) return renderList(h.slice(4));
+  if (h.startsWith('#/g/')) return renderList(decodeURIComponent(h.slice(4)));
   return renderList();
 }
 window.addEventListener('hashchange', router);
 router();
 
-// 啟動時若已開啟雲端同步：先拉取合併，再重新整理當前畫面
-if (sync.isEnabled()) {
-  syncNow(true).then(() => router());
-}
+// 啟動時向 NAS 拿最新分類；清單類畫面的分類名稱／顏色要跟著更新
+refreshGroups().then(() => {
+  const h = location.hash || '#/';
+  if (h === '#/' || h === '#/groups' || h === '#/new' || h.startsWith('#/g/')) {
+    if (!(h === '#/new' && upload)) router();
+  }
+});
 
 // 強制更新後網址會帶 ?fresh=…，載入完成後把它清掉（保持網址乾淨、離線也好命中快取）
 if (location.search.includes('fresh=')) {
@@ -2752,11 +2380,6 @@ function maybeShowInstallHint() {
 }
 maybeShowInstallHint();
 
-// 未完成的辨識任務：啟動時、以及每次回到前景時，顯示「繼續」橫幅
-refreshResumeBanner();
-document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') refreshResumeBanner();
-});
 
 // 註冊 Service Worker（PWA / 離線）+ 自動更新
 let refreshing = false;
@@ -2793,7 +2416,7 @@ async function forceUpdate() {
       await Promise.all(keys.map((k) => caches.delete(k)));
     }
   } catch (_) {}
-  // 用帶時間戳的網址重新載入，強制繞過 iOS 的 HTTP 快取（GitHub Pages 有 10 分鐘快取）
+  // 用帶時間戳的網址重新載入，強制繞過 iOS 的 HTTP 快取
   const u = new URL(location.href);
   u.searchParams.set('fresh', String(Date.now()));
   location.replace(u.toString());

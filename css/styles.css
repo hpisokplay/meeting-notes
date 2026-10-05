@@ -343,3 +343,46 @@ ol.list.qa.editing .item-del { margin-top: 6px; }
 .fig-row:last-child { border-bottom: none; }
 .fig-l { flex: 1 1 auto; min-width: 0; line-height: 1.5; }
 .fig-v { flex: 0 0 auto; font-weight: 700; font-variant-numeric: tabular-nums; text-align: right; }
+
+/* ===== NAS 版 ===== */
+/* 連不上 NAS 的提示（頂欄下方） */
+.offline-banner {
+  flex: 0 0 auto; padding: 8px 14px; font-size: 13px; line-height: 1.5; text-align: center;
+  background: color-mix(in srgb, #ff9500 18%, var(--card)); color: var(--ink); border-bottom: 1px solid var(--line);
+}
+/* 清單卡片上的處理狀態 */
+.st-badge {
+  display: inline-block; margin-left: 6px; padding: 1px 8px; border-radius: 10px; font-size: 12px; font-weight: 700;
+  color: var(--brand); background: color-mix(in srgb, var(--brand) 14%, transparent); vertical-align: 1px;
+}
+.st-badge.st-queued { color: #ff9500; background: color-mix(in srgb, #ff9500 16%, transparent); }
+.st-badge.st-failed { color: var(--danger); background: color-mix(in srgb, var(--danger) 14%, transparent); }
+.st-warn { margin-top: 10px; cursor: pointer; }
+/* 上傳：每支檔案的進度 */
+.up-files { margin: 10px 0 2px; text-align: left; }
+.up-file { display: flex; justify-content: space-between; gap: 10px; font-size: 13px; padding: 3px 0; color: var(--ink); }
+.up-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.up-pct { flex: 0 0 auto; font-variant-numeric: tabular-nums; color: var(--muted); }
+/* 設定頁的開關列 */
+.set-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; font-size: 15px; line-height: 1.5; flex-wrap: wrap; }
+.set-row input[type="checkbox"] { width: 20px; height: 20px; flex: 0 0 auto; }
+.set-row input[type="number"] { padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: var(--ink); font-size: 15px; }
+#claudeModel, #newGroup { padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); font-size: 15px; }
+#newTitle { width: 100%; }
+/* 連結做成大按鈕（匯出備份） */
+a.big { display: block; width: 100%; padding: 15px; font-size: 16px; font-weight: 600; border-radius: 12px; margin-top: 10px; text-align: center; text-decoration: none; }
+a.big.secondary { background: var(--bg); color: var(--ink); }
+/* 錄音播放器：每支一個；點時間標記時那一支浮到底部播放 */
+.audio-part { position: relative; margin-top: 8px; }
+.audio-part audio { width: 100%; display: block; }
+.audio-part .audio-x { display: none; }
+.audio-part.floating {
+  position: fixed; left: 12px; right: 12px; bottom: calc(84px + env(safe-area-inset-bottom)); z-index: 55;
+  background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 8px 40px 8px 10px;
+  box-shadow: 0 6px 24px rgba(0,0,0,0.18); margin: 0;
+}
+.audio-part.floating .audio-x {
+  display: block; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+  border: none; background: transparent; color: var(--muted); font-size: 18px; padding: 6px;
+}
+.time-mark.seekable { color: var(--brand); cursor: pointer; }
