@@ -4,6 +4,7 @@ import os
 import shutil
 import time
 from pathlib import Path
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -33,12 +34,17 @@ def mount_static(app: FastAPI) -> None:
 
     @app.get("/{path:path}", include_in_schema=False)
     def static(path: str):
-        rel = path or "index.html"
-        parts = rel.split("/")
-        if not (rel in STATIC_FILES or (len(parts) > 1 and parts[0] in STATIC_DIRS)):
+        rel = unquote(path) or "index.html"
+        if "\\" in rel or "\x00" in rel or ".." in rel.split("/"):
             raise HTTPException(404, "找不到")
         p = (static_dir / rel).resolve()
-        if static_dir not in p.parents or not p.is_file():
+        try:
+            parts = p.relative_to(static_dir).parts
+        except ValueError:
+            raise HTTPException(404, "找不到")
+        ok = (len(parts) == 1 and parts[0] in STATIC_FILES) or \
+             (len(parts) > 1 and parts[0] in STATIC_DIRS)
+        if not ok or not p.is_file():
             raise HTTPException(404, "找不到")
         return FileResponse(p)
 

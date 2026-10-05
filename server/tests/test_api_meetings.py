@@ -79,3 +79,20 @@ def test_corrupt_worker_json_and_bad_ids(client, data_dir):
     assert client.get("/api/meetings/.hidden/audio/0").status_code == 400
     (data_dir / "meetings" / "bad.json").write_text("{half")
     assert client.get("/api/meetings").status_code == 200
+
+
+def test_static_encoded_traversal_blocked(client, static_dir):
+    (static_dir / "js").mkdir(exist_ok=True)
+    (static_dir / "js" / "app.js").write_text("//x")
+    (static_dir / "css").mkdir(exist_ok=True)
+    (static_dir / "server").mkdir(exist_ok=True)
+    (static_dir / "server" / "app.py").write_text("SECRET_SRC")
+    (static_dir / ".git").mkdir(exist_ok=True)
+    (static_dir / ".git" / "config").write_text("SECRET_GIT")
+    for p in ("/js/%2e%2e/server/app.py", "/js/..%2fserver/app.py",
+              "/js/%2e%2e/.git/config", "/css/..%5cserver%5capp.py",
+              "/js/%252e%252e/server/app.py", "/js/%2e%2e%2fserver%2fapp.py"):
+        r = client.get(p)
+        assert r.status_code == 404, p
+        assert "SECRET" not in r.text, p
+    assert client.get("/js/app.js").status_code == 200
