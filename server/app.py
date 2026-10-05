@@ -6,19 +6,46 @@ import time
 from pathlib import Path
 
 from fastapi import APIRouter, Body, FastAPI, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from .jobs import JobQueue
-from .storage import Store, read_json
+from .storage import BadId, Store, read_json
 from .uploads import build_router as build_uploads_router
 
 VERSION = "v100"
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
+STATIC_FILES = {"index.html", "sw.js", "manifest.webmanifest"}
+STATIC_DIRS = {"css", "js", "icons"}
+
+
+def _guard(fn):
+    """Bad meeting id (BadId from Store id validation) -> 400."""
+    try:
+        return fn()
+    except BadId:
+        raise HTTPException(400, "會議 id 不合法")
+
+
+def mount_static(app: FastAPI) -> None:
+    """Serve the PWA allowlist only. Routers must be included BEFORE calling this."""
+    static_dir = Path(os.environ.get("MEETINGS_STATIC") or REPO_ROOT).resolve()
+
+    @app.get("/{path:path}", include_in_schema=False)
+    def static(path: str):
+        rel = path or "index.html"
+        parts = rel.split("/")
+        if not (rel in STATIC_FILES or (len(parts) > 1 and parts[0] in STATIC_DIRS)):
+            raise HTTPException(404, "找不到")
+        p = (static_dir / rel).resolve()
+        if static_dir not in p.parents or not p.is_file():
+            raise HTTPException(404, "找不到")
+        return FileResponse(p)
+
 
 def _worker_status(store: Store) -> dict:
-    w = read_json(store.path("jobs", "worker.json"), {}) or {}
-    last = w.get("lastSeen")
+    w = read_json(store.path("jobs", "worker.json"), {})
+    last = w.get("lastSeen") if isinstance(w, dict) else None
     online = isinstance(last, (int, float)) and (time.time() - last) <= 60
     return {"online": bool(online), "lastSeen": last}
 
@@ -40,7 +67,7 @@ def build_router(store: Store) -> APIRouter:
 
     @r.get("/meetings/{mid}")
     def get_meeting(mid: str):
-        m = store.get(mid)
+        m = _guard(lambda: store.get(mid))
         if m is None:
             raise HTTPException(404, "找不到這場會議")
         return m
@@ -49,13 +76,13 @@ def build_router(store: Store) -> APIRouter:
     def put_meeting(mid: str, body: dict = Body(...)):
         if body.get("id") != mid:
             raise HTTPException(400, "會議 id 與網址不一致")
-        return store.save(body)
+        return _guard(lambda: store.save(body))
 
     @r.delete("/meetings/{mid}")
     def delete_meeting(mid: str):
         try:
-            store.trash(mid)
-        except (KeyError, ValueError):
+            _guard(lambda: store.trash(mid))
+        except KeyError:
             raise HTTPException(404, "找不到這場會議")
         return {"ok": True}
 
@@ -87,21 +114,13 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
     app.state.jobs = JobQueue(store)
     app.state.claude_cmd = claude_cmd
     app.state.start_threads = start_threads
+
+    @app.exception_handler(BadId)
+    def _bad_id(request, exc):
+        return JSONResponse({"detail": "會議 id 不合法"}, status_code=400)
+
     app.include_router(build_router(store))
     app.include_router(build_uploads_router(store, lambda: app.state.jobs))
 
-    static_dir = Path(os.environ.get("MEETINGS_STATIC") or REPO_ROOT).resolve()
-
-    # registered last so every /api route (including later routers) wins
-    @app.get("/{path:path}", include_in_schema=False)
-    def static(path: str):
-        if path.startswith("api/"):
-            raise HTTPException(404, "找不到")
-        p = (static_dir / (path or "index.html")).resolve()
-        if p.is_dir():
-            p = p / "index.html"
-        if static_dir not in p.parents or not p.is_file():
-            raise HTTPException(404, "找不到")
-        return FileResponse(p)
-
+    mount_static(app)  # keep last: routers must be included before this line
     return app

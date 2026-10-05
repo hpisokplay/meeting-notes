@@ -83,3 +83,37 @@ def test_render_md_legacy_timestamps(meeting, tmp_path):
     p = tmp_path / "x.docx"
     meeting_to_docx(meeting, p)
     assert p.stat().st_size > 1000
+
+
+def test_save_survives_xml_invalid_chars(data_dir, meeting):
+    s = Store(data_dir)
+    meeting["transcript"][0]["text"] = "壞\x0b字\x01元"
+    meeting["title"] = "標\x0c題"
+    s.save(meeting)
+    assert s.get(meeting["id"])["transcript"][0]["text"] == "壞\x0b字\x01元"
+    assert (data_dir / "exports" / f"{meeting['id']}.docx").exists()
+    idx = json.loads((data_dir / "index.json").read_text(encoding="utf-8"))
+    assert idx[0]["id"] == meeting["id"]
+    s.update(meeting["id"], lambda m: m.update(group="g2"))
+
+
+def test_derived_failure_never_blocks_json_save(data_dir, meeting, monkeypatch):
+    import server.storage as st
+    def boom(*a, **k):
+        raise RuntimeError("render broke")
+    monkeypatch.setattr(st, "meeting_to_docx", boom)
+    monkeypatch.setattr(st, "meeting_to_markdown", boom)
+    s = Store(data_dir)
+    s.save(meeting)
+    assert s.get(meeting["id"])["title"] == "測試會議"
+    assert json.loads((data_dir / "index.json").read_text(encoding="utf-8"))[0]["id"] == meeting["id"]
+
+
+def test_corrupt_json_skipped(data_dir, meeting):
+    s = Store(data_dir)
+    s.save(meeting)
+    (data_dir / "meetings" / "bad.json").write_text("{half", encoding="utf-8")
+    assert [m["id"] for m in s.list_meetings()] == [meeting["id"]]
+    assert s.get("bad") is None
+    s.save({**meeting, "id": "other1"})  # index rebuild tolerates the bad file
+    assert len(json.loads((data_dir / "index.json").read_text(encoding="utf-8"))) == 2

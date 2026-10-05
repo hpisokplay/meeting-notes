@@ -1,9 +1,18 @@
 """Render a meeting to Markdown / Word. Tolerates legacy transcript timestamps."""
 from __future__ import annotations
 
+import re
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
+
+_BAD_XML = re.compile('[^' + chr(9) + chr(10) + chr(13) + chr(0x20) + '-' + chr(0xD7FF) + chr(0xE000) + '-' + chr(0xFFFD) + chr(0x10000) + '-' + chr(0x10FFFF) + ']')
+
+
+def _x(text) -> str:
+    """Strip characters that are invalid in XML 1.0 (python-docx would raise)."""
+    return _BAD_XML.sub("", str(text))
+
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 
@@ -77,21 +86,21 @@ def meeting_to_docx(m: dict, path: Path) -> None:
 
     todo, pts, qa = _sections(m)
     d = Document()
-    d.add_heading(m.get("title") or "未命名會議", 0)
+    d.add_heading(_x(m.get("title") or "未命名會議"), 0)
     d.add_paragraph(f"日期：{_date(m)}（台北）")
-    d.add_paragraph(f"分類：{_group_name(m)}")
+    d.add_paragraph(_x(f"分類：{_group_name(m)}"))
     d.add_paragraph(f"長度：{_fmt_dur(m.get('durationSec'))}")
     d.add_heading("待辦", 1)
     for x in todo:
-        d.add_paragraph(x, style="List Bullet")
+        d.add_paragraph(_x(x), style="List Bullet")
     d.add_heading("重點", 1)
     for x in pts:
-        d.add_paragraph(x, style="List Bullet")
+        d.add_paragraph(_x(x), style="List Bullet")
     d.add_heading("Q&A", 1)
     for q, a in qa:
-        d.add_paragraph().add_run(f"Q：{q}").bold = True
-        d.add_paragraph(f"A：{a}")
+        d.add_paragraph().add_run(_x(f"Q：{q}")).bold = True
+        d.add_paragraph(_x(f"A：{a}"))
     d.add_heading("逐字稿", 1)
     for line in _lines(m):
-        d.add_paragraph(line)
+        d.add_paragraph(_x(line))
     d.save(str(path))

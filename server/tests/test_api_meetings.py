@@ -53,3 +53,29 @@ def test_static_index_served(client):
     assert r.status_code == 200 and "DD-INDEX" in r.text
     assert "create_app" not in client.get("/%2e%2e/server/app.py").text
     assert client.get("/api/nope").status_code == 404
+
+
+def test_static_allowlist(client, static_dir):
+    (static_dir / "js").mkdir()
+    (static_dir / "js" / "app.js").write_text("//x")
+    (static_dir / "manifest.webmanifest").write_text("{}")
+    (static_dir / ".git").mkdir()
+    (static_dir / ".git" / "config").write_text("secret")
+    (static_dir / "server").mkdir()
+    (static_dir / "server" / "app.py").write_text("secret")
+    assert client.get("/js/app.js").status_code == 200
+    assert client.get("/manifest.webmanifest").status_code == 200
+    for p in ("/.git/config", "/server/app.py", "/docs/x", "/.superpowers/x", "/js/../server/app.py"):
+        assert client.get(p).status_code == 404, p
+
+
+def test_corrupt_worker_json_and_bad_ids(client, data_dir):
+    (data_dir / "jobs").mkdir(parents=True)
+    (data_dir / "jobs" / "worker.json").write_text("{half")
+    assert client.get("/api/status").json()["worker"]["online"] is False
+    assert client.get("/api/meetings/.hidden").status_code == 400
+    assert client.delete("/api/meetings/.hidden").status_code == 400
+    assert client.put("/api/meetings/.hidden", json={"id": ".hidden"}).status_code == 400
+    assert client.get("/api/meetings/.hidden/audio/0").status_code == 400
+    (data_dir / "meetings" / "bad.json").write_text("{half")
+    assert client.get("/api/meetings").status_code == 200

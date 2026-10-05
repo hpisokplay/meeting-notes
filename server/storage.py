@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import secrets
 import shutil
@@ -12,9 +13,15 @@ from typing import Callable
 
 from .render import meeting_to_docx, meeting_to_markdown
 
+log = logging.getLogger(__name__)
+
 DEFAULT_SETTINGS = {"claudeModel": "sonnet", "fallbackEnabled": True,
                     "fallbackMinutes": 20, "tgNotify": True}
 LIST_FIELDS = ("id", "title", "createdAt", "updatedAt", "group", "durationSec", "status", "progress")
+
+
+class BadId(ValueError):
+    """Meeting id failed validation."""
 
 
 def atomic_write_bytes(path: Path, data: bytes) -> None:
@@ -40,6 +47,9 @@ def read_json(path: Path, default=None):
         return json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return default
+    except (json.JSONDecodeError, UnicodeDecodeError) as e:
+        log.error("corrupt json skipped: %s (%s)", path, e)
+        return default
 
 
 class Store:
@@ -64,15 +74,12 @@ class Store:
 
     def _mpath(self, mid: str) -> Path:
         if not mid or "/" in mid or "\\" in mid or mid.startswith("."):
-            raise ValueError("bad meeting id")
+            raise BadId("bad meeting id")
         return self.path("meetings", f"{mid}.json")
 
     # ---- meetings
     def get(self, mid: str) -> dict | None:
-        try:
-            return read_json(self._mpath(mid))
-        except ValueError:
-            return None
+        return read_json(self._mpath(mid))  # ValueError on a bad id
 
     def _all(self) -> list[dict]:
         out = []
@@ -98,17 +105,29 @@ class Store:
         with self._lock(mid):
             m["updatedAt"] = int(time.time() * 1000)
             atomic_write_json(self._mpath(mid), m)
+            self._write_derived(mid, m)
+        try:
+            self._write_index()
+        except Exception:
+            log.exception("index.json rebuild failed")
+        return m
+
+    def _write_derived(self, mid: str, m: dict) -> None:
+        """md / docx are best-effort: the json is already safely saved."""
+        try:
             atomic_write_bytes(self.path("meetings", f"{mid}.md"),
                                meeting_to_markdown(m).encode("utf-8"))
-            docx_tmp = self.path("exports", f"{mid}.docx.{secrets.token_hex(3)}.tmp")
-            try:
-                meeting_to_docx(m, docx_tmp)
-                os.replace(docx_tmp, self.path("exports", f"{mid}.docx"))
-            finally:
-                if docx_tmp.exists():
-                    docx_tmp.unlink()
-        self._write_index()
-        return m
+        except Exception:
+            log.exception("markdown render failed for %s", mid)
+        docx_tmp = self.path("exports", f"{mid}.docx.{secrets.token_hex(3)}.tmp")
+        try:
+            docx_tmp.parent.mkdir(parents=True, exist_ok=True)
+            meeting_to_docx(m, docx_tmp)
+            os.replace(docx_tmp, self.path("exports", f"{mid}.docx"))
+        except Exception:
+            log.exception("docx render failed for %s", mid)
+        finally:
+            docx_tmp.unlink(missing_ok=True)
 
     def update(self, mid: str, fn: Callable[[dict], None]) -> dict:
         with self._lock(mid):
