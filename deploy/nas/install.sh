@@ -10,6 +10,9 @@ TS=/var/packages/Tailscale/target/bin/tailscale
 mkdir -p "$BASE/app" "$BASE/claude-config" \
   /volume1/projects/meetings /volume1/docker/backups/meetings \
   /volume1/docker/worker/home /volume1/docker/tgbridge
+# data dir owned by uid 1026 (hpisokplay) / gid 100 (users): the ssh user must be able to touch
+# .restart (update_app.sh) and the TG bot must be able to write into inbox/
+chown -R 1026:100 /volume1/projects/meetings || true
 # bind-mounted files must exist
 [ -e /volume1/docker/worker/home/.claude-token ] || touch /volume1/docker/worker/home/.claude-token
 [ -e /volume1/docker/tgbridge/token ] || touch /volume1/docker/tgbridge/token
@@ -17,7 +20,7 @@ mkdir -p "$BASE/app" "$BASE/claude-config" \
 
 # worker key (mode 600, owned by uid 1026 = hpisokplay so ssh user can read it)
 if [ ! -s "$BASE/worker.key" ]; then
-  head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$BASE/worker.key"
+  ( umask 077; head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$BASE/worker.key" )
 fi
 chown 1026 "$BASE/worker.key" 2>/dev/null || true
 chmod 600 "$BASE/worker.key"
