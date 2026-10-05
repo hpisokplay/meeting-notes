@@ -1,5 +1,7 @@
-// 分類群組：存 localStorage，隨雲端同步文件（doc.groups / doc.groupsDeleted）跨裝置。
-// 群組 = { id, name, updatedAt }；會議用 m.group 指到群組 id。
+// 分類群組：主本在 NAS（GET/PUT /api/groups），localStorage 只當快取（秒開、離線可看）。
+// 群組 = { id, name, color }；會議用 m.group 指到群組 id。
+// 本機改動（新增／改名／刪除）後呼叫 pushGroups() 把整份寫回 NAS。
+import * as api from './api.js';
 
 const KEY = 'meeting_groups';
 const TOMB = 'meeting_group_tombstones';
@@ -79,4 +81,15 @@ export function removeGroup(id) {
 export function groupName(id) {
   const g = getGroups().find((x) => x.id === id);
   return g ? g.name : '';
+}
+
+// 從 NAS 拿最新分類寫進快取；連不上就沿用快取
+export async function loadGroups() {
+  const gs = await api.getGroups();
+  setGroups((gs || []).map((g, i) => ({ ...g, createdAt: i })));
+  return getGroups();
+}
+// 把目前快取的分類整份寫回 NAS
+export async function pushGroups() {
+  await api.saveGroups(getGroups().map(({ id, name, color }) => ({ id, name, color })));
 }
