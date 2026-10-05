@@ -65,6 +65,14 @@ def seconds_until_next(now: float) -> float:
     return (nxt - t).total_seconds()
 
 
+def needs_catchup(dest: Path, now: float, max_age: float = 24 * 3600) -> bool:
+    """True when there is no backup yet or the newest one is older than max_age."""
+    files = [p for p in Path(dest).glob(f"{PREFIX}*{SUFFIX}") if p.is_file()]
+    if not files:
+        return True
+    return now - max(p.stat().st_mtime for p in files) > max_age
+
+
 class BackupThread(threading.Thread):
     def __init__(self, store: Store, dest: Path | None = None, clock=time.time):
         super().__init__(daemon=True, name="backup")
@@ -75,6 +83,12 @@ class BackupThread(threading.Thread):
         self._halt.set()
 
     def run(self) -> None:
+        try:
+            dest = Path(self.dest) if self.dest else backup_dir()
+            if needs_catchup(dest, self.clock()):
+                log.info("catch-up backup: %s", run_backup(self.store, self.dest, self.clock()))
+        except Exception:
+            log.exception("catch-up backup failed")
         while not self._halt.wait(seconds_until_next(self.clock())):
             try:
                 log.info("backup written: %s", run_backup(self.store, self.dest, self.clock()))

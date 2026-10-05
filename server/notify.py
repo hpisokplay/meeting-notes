@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import threading
+import time
 import urllib.request
 from pathlib import Path
 
@@ -47,6 +48,14 @@ def done_text(m: dict) -> str:
     return f"✅《{m.get('title') or '未命名'}》轉好了\n{BASE_URL}{m.get('id')}"
 
 
+def summary_failed_text(m: dict) -> str:
+    return f"⚠️《{m.get('title') or '未命名'}》逐字稿已完成，但摘要失敗：{m.get('error')}\n{BASE_URL}{m.get('id')}"
+
+
+def _ready_text(m: dict) -> str:
+    return summary_failed_text(m) if m.get("error") else done_text(m)
+
+
 def failed_text(m: dict, error) -> str:
     return f"❌《{m.get('title') or '未命名'}》轉錄失敗：{error or '未知錯誤'}"
 
@@ -58,13 +67,19 @@ def _meeting(store: Store, job: dict):
         return None
 
 
-def on_job_done(store: Store, job: dict, send=notify) -> bool:
-    """Done listener: the pipeline summary finished -> meeting is done."""
+def on_job_done(store: Store, job: dict, send=notify, wait: float = 10.0, sleep=time.sleep) -> bool:
+    """Done listener: the pipeline summary finished -> meeting is done. The ai write may land just
+    after finish(), so a still-"summarizing" meeting is polled for up to `wait` seconds."""
     if job.get("kind") != "ai":
         return False
     m = _meeting(store, job)
+    waited = 0.0
+    while m and m.get("aiJobId") == job.get("id") and m.get("status") == "summarizing" and waited < wait:
+        sleep(0.25)
+        waited += 0.25
+        m = _meeting(store, job)
     if m and m.get("aiJobId") == job.get("id") and m.get("status") == "done":
-        send(done_text(m), store)
+        send(_ready_text(m), store)
         return True
     return False
 
@@ -80,7 +95,7 @@ def on_job_terminal(store: Store, job: dict, state: str, send=notify) -> bool:
         send(failed_text(m, job.get("error")), store)
         return True
     if job.get("kind") == "ai" and m.get("aiJobId") == job.get("id") and m.get("status") == "done":
-        send(done_text(m), store)  # summary failed permanently; transcript is usable
+        send(_ready_text(m), store)  # summary failed permanently; transcript is usable
         return True
     return False
 

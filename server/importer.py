@@ -27,12 +27,34 @@ def _union_chat(a, b) -> list:
         if not isinstance(c, dict):
             continue
         k = c.get("at")
-        if k is not None:
-            if k in seen:
-                continue
-            seen.add(k)
+        if k is None:
+            k = ("qa", str(c.get("q")), str(c.get("a")))
+        if k in seen:
+            continue
+        seen.add(k)
         out.append(c)
     out.sort(key=lambda c: c.get("at") if isinstance(c.get("at"), (int, float)) else 0)
+    return out
+
+
+def _merge_terms(a, b):
+    """Union terms.items by t; an item keeps its applied/draft marks from either side."""
+    if not isinstance(a, dict) or not isinstance(b, dict):
+        return a if isinstance(a, dict) else (b if isinstance(b, dict) else None)
+    out = dict(a)
+    for k, v in b.items():
+        out.setdefault(k, v)
+    items = [dict(i) if isinstance(i, dict) else i for i in a.get("items") or []]
+    index = {i.get("t"): i for i in items if isinstance(i, dict) and i.get("t") is not None}
+    for i in b.get("items") or []:
+        key = i.get("t") if isinstance(i, dict) else None
+        if key is not None and key in index:
+            for f in ("applied", "draft"):
+                if i.get(f) and not index[key].get(f):
+                    index[key][f] = i[f]
+        else:
+            items.append(i)
+    out["items"] = items
     return out
 
 
@@ -46,6 +68,12 @@ def _merge_one(local: dict, inc: dict) -> tuple[dict, bool]:
                 base[k] = local[k]
             else:
                 base.pop(k, None)
+    for k, v in other.items():  # never drop a field that only the other side has
+        if k not in base and not (k in SERVER_OWNED and other is inc):
+            base[k] = v
+    terms = _merge_terms(base.get("terms"), other.get("terms"))
+    if terms is not None:
+        base["terms"] = terms
     base.setdefault("status", "done")
     chat = _union_chat(local.get("chat"), inc.get("chat"))
     if chat:

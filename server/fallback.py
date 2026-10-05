@@ -24,7 +24,6 @@ ENGINE = "nas-cpu"
 SPEAKER = "說話者"
 WORKER_STALE_S = 120
 MIN_JOB_AGE_S = 60  # a job may be enqueued just before its meeting is saved
-CHECK_EVERY_AUDIO_S = 30
 MEETING_WRITE_INTERVAL = 5.0
 SAMPLE_RATE = 16000
 
@@ -34,20 +33,39 @@ Progress = Callable[[int, str], bool]
 Transcriber = Callable[[list, Progress], "dict | None"]
 
 
-def decode_audio(path: Path):
-    """ffmpeg -> 16 kHz mono s16le -> float32 numpy (no PyAV decode)."""
+WINDOW_S = 20 * 60  # transcribe in 20 min windows: bounded memory for 8 h recordings
+OVERLAP_S = 2
+
+
+def probe_duration(path: Path) -> float:
+    p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                        "-of", "csv=p=0", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        d = float(p.stdout.decode().strip())
+    except ValueError:
+        d = 0.0
+    if p.returncode != 0 or d <= 0:
+        raise RuntimeError("讀不到錄音長度：" + p.stderr.decode("utf-8", "replace")[-200:])
+    return d
+
+
+def decode_slice(path: Path, offset: float, length: float):
+    """ffmpeg (-ss before -i) -> 16 kHz mono s16le -> float32 numpy for just this slice."""
     import numpy as np
-    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vn", "-ac", "1",
-           "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
+    cmd = ["ffmpeg", "-nostdin", "-v", "error", "-ss", f"{offset:.3f}", "-i", str(path),
+           "-t", f"{length:.3f}", "-vn", "-ac", "1", "-ar", str(SAMPLE_RATE), "-f", "s16le", "-"]
     if shutil.which("nice"):
         cmd = ["nice", "-n", "10"] + cmd
     p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode != 0:
         raise RuntimeError("ffmpeg 解碼失敗：" + p.stderr.decode("utf-8", "replace")[-200:])
-    return np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    audio = np.frombuffer(p.stdout, dtype=np.int16).astype(np.float32)
+    audio /= 32768.0
+    return audio
 
 
 _MODEL = None
+_CC = None
 
 
 def _model():
@@ -58,30 +76,45 @@ def _model():
     return _MODEL
 
 
-def whisper_transcribe(paths: list, progress: Progress):
-    import numpy as np
-    from opencc import OpenCC
-    if not progress(0, "解碼音訊中…"):
+def _run_model(audio):
+    """-> [(start_sec_in_window, text)] (Traditional Chinese)."""
+    global _CC
+    if _CC is None:
+        from opencc import OpenCC
+        _CC = OpenCC("s2twp")
+    segs, _info = _model().transcribe(audio, language="zh", beam_size=1, vad_filter=True)
+    return [(float(sg.start), _CC.convert((sg.text or "").strip())) for sg in segs]
+
+
+def transcribe_windows(paths: list, progress: Progress, probe=probe_duration, decode=decode_slice,
+                       run_model=_run_model):
+    """Window-by-window transcription. Files in order with a running offset; each window is decoded
+    with OVERLAP_S extra seconds, and segments starting past the window length belong to the next one."""
+    if not progress(0, "NAS 備援轉錄準備中"):
         return None
-    audio = np.concatenate([decode_audio(Path(p)) for p in paths])
-    total = len(audio) / SAMPLE_RATE
-    if total <= 0:
-        raise RuntimeError("音訊是空的")
-    cc = OpenCC("s2twp")
-    if not progress(1, "載入模型…"):
-        return None
-    segs_iter, _info = _model().transcribe(audio, language="zh", beam_size=1, vad_filter=True)
-    out, last_check = [], 0.0
-    for seg in segs_iter:
-        text = cc.convert((seg.text or "").strip())
-        if text:
-            out.append({"speaker": SPEAKER, "text": text, "t": round(float(seg.start), 1)})
-        if seg.end - last_check >= CHECK_EVERY_AUDIO_S:
-            last_check = seg.end
-            pct = min(99, max(1, int(seg.end / total * 100)))
+    durs = [probe(Path(p)) for p in paths]
+    total = sum(durs)
+    out, base, done = [], 0.0, 0.0
+    for path, dur in zip(paths, durs):
+        off = 0.0
+        while off < dur:
+            length = min(WINDOW_S, dur - off)
+            audio = decode(Path(path), off, length + OVERLAP_S)
+            for start, text in run_model(audio):
+                if start < WINDOW_S and text:
+                    out.append({"speaker": SPEAKER, "text": text, "t": round(base + off + start, 1)})
+            del audio
+            off += length
+            done += length
+            pct = min(99, max(1, int(done / total * 100)))
             if not progress(pct, f"NAS 備援轉錄中…{pct}%"):
                 return None
+        base += dur
     return {"segments": out, "durationSec": round(total, 1), "engine": ENGINE}
+
+
+def whisper_transcribe(paths: list, progress: Progress):
+    return transcribe_windows(paths, progress)
 
 
 class FallbackThread(threading.Thread):
@@ -143,6 +176,7 @@ class FallbackThread(threading.Thread):
                     statuses=("queued", "transcribing"))
             return True
         try:
+            progress(0, "NAS 備援轉錄準備中")  # first heartbeat right after claim
             m = self.store.get(job["meeting"]) or {}
             paths = [self.store.path("audio", job["meeting"], a["file"]) for a in m.get("audio") or []]
             if not paths:
