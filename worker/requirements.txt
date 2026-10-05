@@ -1,0 +1,8 @@
+# torch/torchaudio come from https://download.pytorch.org/whl/cu128 (see install.ps1)
+faster-whisper==1.2.1
+opencc-python-reimplemented
+requests
+pyannote.audio==4.0.7
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
+# tests: pytest

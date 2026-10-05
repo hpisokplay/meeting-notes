@@ -3,3 +3,5 @@ node_modules/
 *.log
 server/.venv/
 __pycache__/
+.pytest_cache/
+.claude/
