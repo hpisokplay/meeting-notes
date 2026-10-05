@@ -7,6 +7,8 @@ under one process-wide lock. Cancelled jobs go to their own jobs/cancelled/ dire
 """
 from __future__ import annotations
 
+import hmac
+import logging
 import os
 import secrets
 import threading
@@ -14,12 +16,35 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from .storage import Store, atomic_write_json, read_json
+from fastapi import APIRouter, Body, Depends, Header, HTTPException, Response
+
+from .storage import BadId, Store, atomic_write_json, read_json
+
+log = logging.getLogger(__name__)
 
 # state -> directory name
 STATE_DIRS = {"queued": "queue", "running": "running", "done": "done",
               "failed": "failed", "cancelled": "cancelled"}
 ACTIVE_STATES = ("queued", "running")
+MAX_STALE_REQUEUES = 3
+STALE_FAIL_MSG = "轉錄器多次中斷，請按「重新轉錄」再試一次"
+
+
+class _Skip(Exception):
+    """Raised inside a store.update fn to abort the write (meeting no longer owned by the job)."""
+
+
+def update_meeting_if_job(store: Store, job: dict, fn, statuses=None) -> bool:
+    """store.update(meeting) only when meeting.jobId == job id (and status in `statuses`)."""
+    def apply(m):
+        if m.get("jobId") != job.get("id") or (statuses and m.get("status") not in statuses):
+            raise _Skip()
+        fn(m)
+    try:
+        store.update(job.get("meeting"), apply)
+        return True
+    except (_Skip, KeyError, BadId):
+        return False
 _LOCK = threading.RLock()  # process-wide: claim and every state move
 
 
@@ -28,6 +53,19 @@ class JobQueue:
         self.store = store
         self.queue_dir = store.path("jobs", "queue")
         self.dirs = {s: store.path("jobs", d) for s, d in STATE_DIRS.items()}
+        self._listeners: list = []
+
+    def add_terminal_listener(self, fn) -> None:
+        """fn(job, state) is called (outside the lock) after a job ends cancelled or failed
+        (permanent failure only; a retry_at fail does not fire)."""
+        self._listeners.append(fn)
+
+    def _notify(self, job, state) -> None:
+        for fn in list(self._listeners):
+            try:
+                fn(job, state)
+            except Exception:
+                log.exception("terminal listener failed")
 
     def _new_id(self, kind: str) -> str:
         return datetime.now().strftime("%Y%m%d-%H%M%S-%f") + "-" + secrets.token_hex(3) + "-" + kind
@@ -149,19 +187,26 @@ class JobQueue:
                 job.update(retries=(job.get("retries") or 0) + 1, notBefore=retry_at,
                            owner=None, claimedAt=None, heartbeat=None)
                 return self._move(job, path, "queued")
-            return self._move(job, path, "failed")
+            job = self._move(job, path, "failed")
+        self._notify(job, "failed")
+        return job
 
-    def cancel(self, jid):
+    def cancel(self, jid, notify: bool = True):
         """queued/running -> cancelled/. Returns the job, or None if unknown or already finished."""
         with _LOCK:
             job, path = self._load(jid)
             if job is None or job.get("state") not in ACTIVE_STATES:
                 return None
-            return self._move(job, path, "cancelled")
+            job = self._move(job, path, "cancelled")
+        if notify:
+            self._notify(job, "cancelled")
+        return job
 
     def requeue_stale(self, timeout_s: float = 600) -> list[str]:
-        """Running jobs whose heartbeat (else claimedAt) is older than timeout_s go back to the queue."""
-        out = []
+        """Running jobs whose heartbeat (else claimedAt) is older than timeout_s go back to the queue
+        (retries+1). A transcribe job already requeued MAX_STALE_REQUEUES times is failed instead and
+        its meeting marked failed; otherwise the meeting is reset to "queued"."""
+        out, dead, requeued = [], [], []
         with _LOCK:
             now = time.time()
             for p in list(self.dirs["running"].glob("*.json")):
@@ -171,10 +216,23 @@ class JobQueue:
                 last = max(job.get("heartbeat") or 0, job.get("claimedAt") or 0)
                 if last and now - last <= timeout_s:
                     continue
+                if job.get("kind") == "transcribe" and (job.get("retries") or 0) >= MAX_STALE_REQUEUES:
+                    job["error"] = STALE_FAIL_MSG
+                    dead.append(self._move(job, p, "failed"))
+                    continue
                 job.update(retries=(job.get("retries") or 0) + 1, owner=None, claimedAt=None,
                            heartbeat=None)
-                self._move(job, p, "queued")
+                requeued.append(self._move(job, p, "queued"))
                 out.append(job["id"])
+        for job in requeued:
+            if job.get("kind") == "transcribe":
+                update_meeting_if_job(self.store, job, lambda m: m.update(
+                    status="queued", progress={"stage": "queued", "pct": 0, "msg": "", "engine": ""}),
+                    statuses=("queued", "transcribing"))
+        for job in dead:
+            update_meeting_if_job(self.store, job, lambda m: m.update(status="failed", error=STALE_FAIL_MSG),
+                                  statuses=("queued", "transcribing"))
+            self._notify(job, "failed")
         return out
 
     def queued_age(self, jid) -> float:
@@ -185,13 +243,16 @@ class JobQueue:
         return max(0.0, time.time() - (job.get("created") or time.time()))
 
 
-def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dict) -> None:
+def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dict) -> bool:
     """Shared by the worker result endpoint and the NAS CPU fallback.
 
-    Writes transcript/durationSec/engine, moves the meeting to "summarizing", finishes the
-    transcribe job and enqueues the "ai" summary job (stored as meeting.aiJobId). If the meeting
-    was deleted (trashed) meanwhile, the job is just finished.
+    The transcribe job is finished FIRST (under the queue lock); only if that succeeds (job still
+    active, i.e. not cancelled / not already resulted) are the meeting changes applied and the "ai"
+    summary job enqueued (stored as meeting.aiJobId). Returns False when the job was already ended.
+    If the meeting was deleted (trashed) meanwhile, the job is just finished.
     """
+    if jobs.finish(job["id"]) is None:
+        return False
     mid = job.get("meeting")
     engine = result.get("engine") or ""
     segments = result.get("segments") or []
@@ -209,22 +270,16 @@ def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dic
                 m["progress"] = {"stage": "summarizing", "pct": 0, "msg": "", "engine": engine}
                 m["error"] = None
                 m["aiJobId"] = ai_jid
-            store.update(mid, apply)
-    except KeyError:  # trashed between get and update
-        if ai_jid:
-            jobs.cancel(ai_jid)
+            if not update_meeting_if_job(store, job, apply):
+                jobs.cancel(ai_jid, notify=False)
     except BaseException:
         if ai_jid:
-            jobs.cancel(ai_jid)
+            jobs.cancel(ai_jid, notify=False)
         raise
-    jobs.finish(job["id"])
+    return True
 
 
 # ---------------------------------------------------------------- HTTP API
-import hmac  # noqa: E402
-
-from fastapi import APIRouter, Body, Depends, Header, HTTPException, Response  # noqa: E402
-
 WORKER_OWNER = "gpu-worker"
 MEETING_WRITE_INTERVAL = 5.0  # seconds between meeting.json progress writes (pct 100 exempt)
 NEW_MEETING_GRACE = 60.0  # a transcribe job may be enqueued just before its meeting is saved
@@ -262,8 +317,11 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
     def check_meeting_exists(job):
         if job.get("kind") != "transcribe":
             return True
-        if store.get(job.get("meeting")) is not None:
-            return True
+        try:
+            if store.get(job.get("meeting")) is not None:
+                return True
+        except BadId:
+            return "會議不存在"
         if time.time() - (job.get("created") or 0) < NEW_MEETING_GRACE:
             return False  # meeting json may not be saved yet: leave queued
         return "會議不存在"
@@ -298,14 +356,13 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
         now = time.monotonic()
         if pct >= 100 or now - last_write.get(mid, -1e9) >= MEETING_WRITE_INTERVAL:
             last_write[mid] = now
+            for k in [k for k, t in last_write.items() if now - t > 3600]:
+                del last_write[k]
 
             def apply(m):
                 m["status"] = "transcribing"
                 m["progress"] = {"stage": stage, "pct": pct, "msg": msg, "engine": "gpu"}
-            try:
-                store.update(mid, apply)
-            except KeyError:
-                pass  # meeting trashed meanwhile
+            update_meeting_if_job(store, job, apply, statuses=("queued", "transcribing"))
         return {"ok": True}
 
     @r.post("/worker/jobs/{jid}/result", dependencies=[Depends(auth)])
@@ -314,22 +371,21 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
         segs = body.get("segments")
         if not isinstance(segs, list) or not all(isinstance(s, dict) for s in segs):
             raise HTTPException(400, "segments 格式不正確")
-        apply_transcript_result(store, get_jobs(), job, body)
+        if not apply_transcript_result(store, get_jobs(), job, body):
+            raise HTTPException(409, "工作已取消或已完成")
         return {"ok": True}
 
     @r.post("/worker/jobs/{jid}/fail", dependencies=[Depends(auth)])
     def worker_fail(jid: str, body: dict = Body(...)):
         job = owned_running(jid)
         err = str(body.get("error") or "轉錄失敗")
-        get_jobs().fail(jid, err)
+        if get_jobs().fail(jid, err) is None:
+            raise HTTPException(409, "工作已取消或已完成")
 
         def apply(m):
             m["status"] = "failed"
             m["error"] = err
-        try:
-            store.update(job["meeting"], apply)
-        except KeyError:
-            pass
+        update_meeting_if_job(store, job, apply)
         return {"ok": True}
 
     @r.get("/jobs/{jid}")
@@ -353,10 +409,7 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
             def apply(m):
                 m["status"] = "failed"
                 m["error"] = "已取消"
-            try:
-                store.update(job["meeting"], apply)
-            except KeyError:
-                pass
+            update_meeting_if_job(store, job, apply)
         return {"ok": True, "state": "cancelled"}
 
     return r

@@ -217,3 +217,114 @@ def test_queued_age(tmp_path):
     q = JobQueue(Store(tmp_path))
     jid = q.enqueue("transcribe", "m1", {})
     assert 0 <= q.queued_age(jid) < 5
+
+
+# ---- fix round 1
+def ai_jobs(jobs):
+    return [j for d in jobs.dirs.values() for p in d.glob("*.json")
+            if (j := json.loads(p.read_text(encoding="utf-8")))["kind"] == "ai"]
+
+
+def test_result_after_cancel_does_not_touch_meeting_or_enqueue_ai(env):
+    app, c, store, jobs = env
+    jid = mk_meeting(store, jobs)
+    job = jobs.claim(["transcribe"], "gpu-worker")
+    jobs.cancel(jid)
+    store.update("m1", lambda m: m.update(status="failed", error="已取消"))
+    assert apply_transcript_result(store, jobs, job, {"segments": [{"speaker": "A", "text": "x"}]}) is False
+    m = store.get("m1")
+    assert m["status"] == "failed" and m["error"] == "已取消" and m["transcript"] == []
+    assert ai_jobs(jobs) == []
+
+
+def test_double_result_enqueues_one_ai_job(env):
+    app, c, store, jobs = env
+    jid = mk_meeting(store, jobs)
+    job = jobs.claim(["transcribe"], "gpu-worker")
+    import threading
+    res = []
+    ts = [threading.Thread(target=lambda: res.append(apply_transcript_result(store, jobs, job, {"segments": []})))
+          for _ in range(2)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert sorted(res) == [False, True]
+    assert len(ai_jobs(jobs)) == 1
+    r = c.post(f"/api/worker/jobs/{jid}/result", headers=H, json={"segments": []})
+    assert r.status_code == 409
+
+
+def test_late_progress_does_not_resurrect_cancelled_or_finished_meeting(env):
+    app, c, store, jobs = env
+    jid = mk_meeting(store, jobs)
+    c.get("/api/worker/next", headers=H)
+    c.post(f"/api/jobs/{jid}/cancel")
+    c.post(f"/api/worker/jobs/{jid}/progress", headers=H, json={"stage": "asr", "pct": 100, "msg": ""})
+    assert store.get("m1")["status"] == "failed"
+    # guard directly (job still running but meeting already moved on)
+    jid2 = mk_meeting(store, jobs, mid="m2")
+    c.get("/api/worker/next", headers=H)
+    c.post(f"/api/worker/jobs/{jid2}/result", headers=H, json={"segments": []})
+    from server.jobs import update_meeting_if_job
+    ok = update_meeting_if_job(store, {"id": jid2, "meeting": "m2"},
+                               lambda m: m.update(status="transcribing"), statuses=("queued", "transcribing"))
+    assert ok is False and store.get("m2")["status"] == "summarizing"
+
+
+def test_stale_requeue_limit_fails_meeting(env):
+    app, c, store, jobs = env
+    jid = mk_meeting(store, jobs)
+    old = time.time() - 700
+    for i in range(3):
+        jobs.claim(["transcribe"], "w")
+        store.update("m1", lambda m: m.update(status="transcribing"))
+        rewrite(jobs.dirs["running"] / f"{jid}.json", heartbeat=old, claimedAt=old)
+        assert jobs.requeue_stale() == [jid]
+        m = store.get("m1")
+        assert m["status"] == "queued" and m["progress"]["stage"] == "queued"
+    assert jobs.get(jid)["retries"] == 3
+    jobs.claim(["transcribe"], "w")
+    rewrite(jobs.dirs["running"] / f"{jid}.json", heartbeat=old, claimedAt=old)
+    assert jobs.requeue_stale() == []
+    assert jobs.get(jid)["state"] == "failed"
+    m = store.get("m1")
+    assert m["status"] == "failed" and "多次中斷" in m["error"]
+
+
+def test_terminal_listener_fires_for_cancel_and_permanent_fail_only(tmp_path):
+    q = JobQueue(Store(tmp_path))
+    seen = []
+    q.add_terminal_listener(lambda j, s: seen.append((j["id"], s)))
+    q.add_terminal_listener(lambda j, s: 1 / 0)  # swallowed
+    a, b, d = (q.enqueue("ai", "m", {}) for _ in range(3))
+    q.claim(["ai"], "w")
+    q.fail(a, "x", retry_at=time.time() + 100)
+    assert seen == []
+    q.cancel(b)
+    q.claim(["ai"], "w")
+    q.fail(d, "boom")
+    assert seen == [(b, "cancelled"), (d, "failed")]
+
+
+def test_worker_fail_and_cancel_guarded_by_job_id(env):
+    app, c, store, jobs = env
+    jid = mk_meeting(store, jobs)
+    c.get("/api/worker/next", headers=H)
+    store.update("m1", lambda m: m.update(jobId="other", status="queued"))
+    assert c.post(f"/api/worker/jobs/{jid}/fail", headers=H, json={"error": "e"}).status_code == 200
+    assert store.get("m1")["status"] == "queued"
+    jid2 = mk_meeting(store, jobs, mid="m2")
+    store.update("m2", lambda m: m.update(jobId="other"))
+    assert c.post(f"/api/jobs/{jid2}/cancel").status_code == 200
+    assert store.get("m2")["status"] == "queued"
+    # fail of an already-cancelled job -> 409
+    assert c.post(f"/api/worker/jobs/{jid2}/fail", headers=H, json={"error": "e"}).status_code == 409
+
+
+def test_badid_meeting_job_failed_not_abort(env):
+    app, c, store, jobs = env
+    bad = jobs.enqueue("transcribe", "../x", {})
+    rewrite(jobs.dirs["queued"] / f"{bad}.json", created=time.time() - 1)
+    good = mk_meeting(store, jobs)
+    d = c.get("/api/worker/next", headers=H).json()
+    assert d["job"]["id"] == good
+    assert jobs.get(bad)["state"] == "failed" and jobs.get(bad)["error"] == "會議不存在"
