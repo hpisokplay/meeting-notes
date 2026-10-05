@@ -163,8 +163,8 @@ AI 工作在伺服器單一執行緒排隊執行（Claude 一次一件）。提�
 
 ## 8. 電腦轉錄器（worker/）
 
-- Python，獨立 venv：`%LOCALAPPDATA%\MeetingWorker\venv`；模型：faster-whisper large-v3（HF 快取）、pyannote community-1 放 `%LOCALAPPDATA%\MeetingWorker\models\pyannote-c1`（本機檔案，不需要 HF 權杖）。
-- 設定檔 `%LOCALAPPDATA%\MeetingWorker\config.json`：`{server, key}`。
+- Python，獨立 venv：`%USERPROFILE%\MeetingWorker\venv`；模型：faster-whisper large-v3（HF 快取）、pyannote community-1 放 `%USERPROFILE%\MeetingWorker\models\pyannote-c1`（本機檔案，不需要 HF 權杖）。
+- 設定檔 `%USERPROFILE%\MeetingWorker\config.json`：`{server, key}`。
 - 開機自動跑：Windows 工作排程器「登入時」，pythonw 隱藏視窗；日誌 `worker.log`（滾動）。
 - 一次一件；GPU 記憶體：whisper 用完釋放再跑 pyannote。
 
