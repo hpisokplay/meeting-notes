@@ -60,20 +60,31 @@ class Api:
 
 
 def download(api, item, dest, tries=5):
-    """Download with HTTP Range resume. item: {url,name,size}."""
+    """Download with HTTP Range resume. item: {url,name,size}.
+    Retry budget resets whenever bytes were gained."""
     url = api.server + item["url"]
     size = int(item.get("size") or 0)
     dest.parent.mkdir(parents=True, exist_ok=True)
     last_err = None
-    for _ in range(tries):
+    attempts = 0
+    while attempts < tries:
         have = dest.stat().st_size if dest.exists() else 0
-        if size and have >= size:
+        if size and have > size:  # corrupt partial: start over
+            dest.unlink()
+            have = 0
+        if size and have == size:
             return
+        start = have
         try:
             hdr = dict(api.headers)
             if have:
                 hdr["Range"] = "bytes=%d-" % have
             r = api.s.get(url, headers=hdr, stream=True, timeout=TIMEOUT)
+            if r.status_code == 416:
+                if have and (not size or have >= size):
+                    return  # already complete
+                dest.unlink()  # range makes no sense for this partial: restart
+                raise RuntimeError("HTTP 416")
             if r.status_code == 200 and have:  # server ignored Range: restart
                 have = 0
             elif r.status_code not in (200, 206):
@@ -86,21 +97,29 @@ def download(api, item, dest, tries=5):
                         api.progress("download", have * 100 / size, item.get("name", ""))
             if not size or have >= size:
                 return
+            last_err = "連線中斷（已收 %d / %d）" % (have, size)
         except Cancelled:
             raise
         except Exception as e:  # network blip: loop and resume
             last_err = e
+        have_now = dest.stat().st_size if dest.exists() else 0
+        attempts = 0 if have_now > start else attempts + 1
+        if attempts < tries:
             time.sleep(2)
     raise RuntimeError("下載錄音失敗：%s" % last_err)
 
 
 def gpu_process(api, job, audio):
-    """Full job: download -> whisper (all parts) -> free -> pyannote (all parts) -> merge."""
+    """Full job: download -> concat all parts into ONE 16 kHz mono stream ->
+    whisper once -> free -> pyannote once -> merge. One diarization keeps speakers
+    consistent across files."""
+    import numpy as np
+
     import asr
     import diar
     import opencc
     from pipeline import (PROMPT, align_words, build_segments, filter_hallucinations,
-                          name_speakers, offset_parts)
+                          name_speakers)
     cache = BASE / "cache" / job["id"]
     try:
         paths = []
@@ -109,23 +128,13 @@ def gpu_process(api, job, audio):
             download(api, item, p)
             paths.append(p)
         api.progress("download", 100, "")
-        waves = [asr.load_audio(p) for p in paths]
-        durations = [len(w) / 16000.0 for w in waves]
-        total = sum(durations) or 1.0
-        words_all, done = [], 0.0
-        for w, d in zip(waves, durations):
-            base = done
-            words_all.append(asr.transcribe_words(
-                w, lambda f, base=base, d=d: api.progress("asr", (base + f * d) * 100 / total, "")))
-            done += d
+        wave = np.concatenate([asr.load_audio(p) for p in paths])
+        total = len(wave) / 16000.0
+        words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""))
         asr.release()
         api.progress("diar", 0, "")
-        parts = []
-        for k, (w, words) in enumerate(zip(waves, words_all)):
-            turns = diar.diarize(w)
-            parts.append(build_segments(align_words(words, turns)))
-            api.progress("diar", (k + 1) * 100 / len(waves), "")
-        segs = offset_parts(parts, durations)
+        turns = diar.diarize(wave)
+        segs = build_segments(align_words(words, turns))
         cc = opencc.OpenCC("s2twp")
         for s in segs:
             s["text"] = cc.convert(s["text"])
@@ -159,7 +168,7 @@ class Worker:
         except Exception as e:
             log.error("job %s failed: %s", job["id"], traceback.format_exc())
             try:
-                api.fail("%s: %s" % (type(e).__name__, e))
+                api.fail("轉錄失敗：%s" % e)
             except Exception:
                 log.exception("could not report failure")
         return True
@@ -175,12 +184,16 @@ def setup_logging():
 
 
 def main():
-    import requests
-    setup_logging()
-    cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
-    w = Worker(cfg, requests.Session())
-    poll = cfg.get("poll", 10)
-    log.info("worker started, server %s", cfg["server"])
+    setup_logging()  # first, so startup failures under pythonw are logged
+    try:
+        import requests
+        cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+        w = Worker(cfg, requests.Session())
+        poll = cfg.get("poll", 10)
+        log.info("worker started, server %s", cfg["server"])
+    except Exception:
+        log.exception("startup failed (config.json missing/invalid or dependency missing)")
+        raise SystemExit(1)
     while True:
         try:
             if w.run_once():

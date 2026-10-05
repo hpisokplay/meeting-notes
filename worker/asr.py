@@ -29,10 +29,13 @@ def load_audio(path):
     """Decode any audio/video to 16 kHz mono float32 via ffmpeg (no PyAV)."""
     import numpy as np
     flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-    p = subprocess.run(
-        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
-         "-f", "s16le", "-"],
-        capture_output=True, creationflags=flags)
+    try:
+        p = subprocess.run(
+            ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vn", "-ac", "1", "-ar", "16000",
+             "-f", "s16le", "-"],
+            capture_output=True, creationflags=flags)
+    except FileNotFoundError:
+        raise RuntimeError("找不到 ffmpeg，請先安裝")
     if p.returncode != 0 or not p.stdout:
         raise RuntimeError("ffmpeg 無法解碼音檔：" + p.stderr.decode("utf-8", "replace")[-300:])
     return np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768.0

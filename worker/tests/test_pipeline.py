@@ -3,8 +3,9 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from pipeline import (align_words, build_segments, filter_hallucinations,
-                      name_speakers, offset_parts)
+import time
+
+from pipeline import align_words, build_segments, filter_hallucinations, name_speakers
 
 TURNS = [
     {"s": 0.0, "e": 5.0, "spk": "SPEAKER_00"},
@@ -59,12 +60,48 @@ def seg(text, spk="A", t=0.0):
     return {"speaker": spk, "text": text, "t": t}
 
 
+def texts(segs):
+    return [s["text"] for s in segs]
+
+
 def test_filter_drops_known_hallucinations():
     segs = [seg("中文字幕由 Amara.org 社群提供"), seg("今天討論預算"), seg("謝謝收看"),
-            seg("請不吝點贊訂閱"), seg("以下是繁體中文的會議。"), seg("中文的會議"),
+            seg("請不吝點贊訂閱"), seg("以下是繁體中文的會議。"),
             seg("字幕志願者 李"), seg("我們開始吧")]
-    out = filter_hallucinations(segs, PROMPT)
-    assert [s["text"] for s in out] == ["今天討論預算", "我們開始吧"]
+    assert texts(filter_hallucinations(segs, PROMPT)) == ["今天討論預算", "我們開始吧"]
+
+
+def test_filter_keeps_real_content():
+    segs = [seg("訂閱方案下個月調整"), seg("繁體中文"), seg("中文的會議紀錄很重要")]
+    assert texts(filter_hallucinations(segs, PROMPT)) == texts(segs)
+
+
+def test_filter_strips_phrase_keeps_rest():
+    segs = [seg("好那我們開始中文字幕由Amara.org社群提供")]
+    assert texts(filter_hallucinations(segs, PROMPT)) == ["好那我們開始"]
+    segs = [seg("接下來討論預算以下是繁體中文的會議。"), seg("請大家訂閱我們的頻道 謝謝觀看，下週見面再談預算")]
+    out = texts(filter_hallucinations(segs, PROMPT))
+    assert out[0] == "接下來討論預算"
+    assert "下週見面再談預算" in out[1] and "謝謝" not in out[1]
+
+
+def test_align_words_scales():
+    turns = [{"s": i * 10.0, "e": i * 10.0 + 9.0, "spk": "S%d" % (i % 4)} for i in range(5000)]
+    words = [(i * 0.25, i * 0.25 + 0.2, "字") for i in range(200000)]
+    t = time.time()
+    out = align_words(words, turns)
+    assert time.time() - t < 3.0
+    assert out[0][3] == "S0" and out[41][3] == "S1"  # 10.25s -> turn 1
+    assert len(out) == 200000
+
+
+def test_align_words_overlapping_long_turn():
+    turns = [{"s": 0.0, "e": 100.0, "spk": "LONG"}, {"s": 10.0, "e": 11.0, "spk": "SHORT"},
+             {"s": 20.0, "e": 21.0, "spk": "SHORT2"}]
+    out = align_words([(50.0, 50.5, "a"), (10.8, 11.6, "b"), (150.0, 150.5, "c")], turns)
+    assert out[0][3] == "LONG"   # found via prefix-max lookback past the short turns
+    assert out[1][3] == "LONG"   # overlap 0.8 with LONG vs 0.2 with SHORT
+    assert out[2][3] == "LONG"   # nearest (previous) turn by prefix max end
 
 
 def test_filter_collapses_repeats():
@@ -77,10 +114,3 @@ def test_name_speakers_order():
     segs = [seg("a", "SPEAKER_02"), seg("b", "SPEAKER_00"), seg("c", "SPEAKER_02")]
     out = name_speakers(segs)
     assert [s["speaker"] for s in out] == ["說話者 1", "說話者 2", "說話者 1"]
-
-
-def test_offset_parts():
-    parts = [[seg("a", t=1.0)], [seg("b", t=2.5)], [seg("c", t=0.0)]]
-    out = offset_parts(parts, [10.0, 20.0, 5.0])
-    assert [s["t"] for s in out] == [1.0, 12.5, 30.0]
-    assert [s["text"] for s in out] == ["a", "b", "c"]

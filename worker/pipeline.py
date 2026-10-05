@@ -1,30 +1,46 @@
 """Pure functions: word/speaker alignment, segment building, cleanup. No GPU, no network."""
+import bisect
 import re
 
 PROMPT = "以下是繁體中文的會議。"
 
-SENTENCE_END =tuple("。！？!?；;，,…")
-
-HALLUCINATIONS = ("Amara", "字幕志願者", "字幕由", "中文字幕", "請不吝點贊",
-                  "訂閱", "謝謝觀看", "謝謝收看")
+SENTENCE_END = tuple("。！？!?；;，,…")
 
 
 def align_words(words, turns):
     """words: [(start,end,text)], turns: [{"s","e","spk"}].
-    Speaker by max overlap, else nearest turn. Returns [(start,end,text,speaker)]."""
+    Speaker by max overlap, else nearest turn. Returns [(start,end,text,speaker)].
+    O((W+T) log T): turns sorted by start, bisect + prefix-max-end lookback."""
+    ts = sorted(turns, key=lambda t: (t["s"], t["e"]))
+    starts = [t["s"] for t in ts]
+    pm = []  # prefix max of end, and which turn index holds it
+    pmi = []
+    best_e, best_i = float("-inf"), -1
+    for i, t in enumerate(ts):
+        if t["e"] > best_e:
+            best_e, best_i = t["e"], i
+        pm.append(best_e)
+        pmi.append(best_i)
     out = []
     for a, b, w in words:
-        best, best_o = None, 0.0
-        for t in turns:
-            o = min(b, t["e"]) - max(a, t["s"])
-            if o > best_o:
-                best, best_o = t["spk"], o
-        if best is None:
-            if turns:
-                best = min(turns, key=lambda t: min(abs(t["s"] - b), abs(t["e"] - a)))["spk"]
-            else:
-                best = "SPEAKER_00"
-        out.append((a, b, w, best))
+        spk = None
+        if ts:
+            idx = bisect.bisect_left(starts, b) - 1  # last turn starting before word end
+            best_o = 0.0
+            i = idx
+            lo = max(-1, idx - 256)  # cap: pathological spanning turns must not make this O(T)
+            while i > lo and pm[i] > a:
+                o = min(b, ts[i]["e"]) - max(a, ts[i]["s"])
+                if o > best_o:
+                    spk, best_o = ts[i]["spk"], o
+                i -= 1
+            if spk is None:  # no overlap: nearest turn
+                prev_d = (a - pm[idx]) if idx >= 0 else float("inf")
+                nxt_d = (starts[idx + 1] - b) if idx + 1 < len(ts) else float("inf")
+                spk = ts[pmi[idx]]["spk"] if prev_d <= nxt_d else ts[idx + 1]["spk"]
+        else:
+            spk = "SPEAKER_00"
+        out.append((a, b, w, spk))
     return out
 
 
@@ -52,24 +68,53 @@ def _norm(text):
     return re.sub(r"[\s。，、！？!?,.;；:：「」『』\"'…\-]", "", text)
 
 
+_P = r"[^，。！？!?,.]"
+HALLU_RES = [re.compile(p, re.I) for p in (
+    r"(中文)?字幕由.*?(提供|製作)",
+    r"字幕志願者" + _P + "*",
+    r"Amara(\s*\.\s*org)?(\s*社群(提供)?)?",
+    r"請不吝點贊" + _P + "*",
+    r"謝謝\s*(觀看|收看)(本期)?(節目|影片)?",
+    r"訂閱" + _P + r"{0,10}(頻道|按讚)" + _P + "*",
+    r"中文字幕",
+    r"字幕由",
+)]
+SHORT_LIMIT = 20
+
+
+def _strip_hallu(text):
+    hit = False
+    for rx in HALLU_RES:
+        text, n = rx.subn("", text)
+        hit = hit or n > 0
+    return text, hit
+
+
+def _strip_prompt(text, prompt):
+    if len(prompt) < 6:
+        return text
+    for k in range(len(prompt), 5, -1):
+        if prompt[:k] in text:
+            return text.replace(prompt[:k], "")
+    return text
+
+
 def filter_hallucinations(segs, prompt):
-    """Drop known Whisper hallucinations + prompt echoes, collapse >=3 identical repeats."""
-    pn = _norm(prompt)
-    prefix = prompt[:6] if len(prompt) >= 6 else None
+    """Remove Whisper hallucinations/prompt echoes without eating real content;
+    collapse >=3 identical consecutive repeats."""
     kept = []
     for s in segs:
         txt = s["text"]
-        if any(h in txt for h in HALLUCINATIONS):
-            continue
-        n = _norm(txt)
-        if not n:
-            continue
-        if prompt and prompt in txt:
-            continue
-        if prefix and prefix in txt:
-            continue
-        if len(n) >= 4 and n in pn:  # echo of (part of) the prompt
-            continue
+        short = len(_norm(txt)) <= SHORT_LIMIT
+        stripped, hit = _strip_hallu(txt)
+        stripped = _strip_prompt(stripped, prompt)
+        if not _norm(stripped):
+            continue  # whole segment was hallucination / echo
+        if hit and short:
+            continue  # short segment containing a hallucination marker
+        if stripped != txt:
+            stripped = stripped.strip(" 	，,、")
+            s = {**s, "text": stripped}
         kept.append(s)
     out = []
     i = 0
@@ -94,15 +139,4 @@ def name_speakers(segs):
         if spk not in names:
             names[spk] = "說話者 %d" % (len(names) + 1)
         out.append({**s, "speaker": names[spk]})
-    return out
-
-
-def offset_parts(parts, durations):
-    """Shift each part's segment times by the summed duration of the preceding parts."""
-    out = []
-    base = 0.0
-    for segs, dur in zip(parts, durations):
-        for s in segs:
-            out.append({**s, "t": round(s["t"] + base, 3)})
-        base += dur
     return out

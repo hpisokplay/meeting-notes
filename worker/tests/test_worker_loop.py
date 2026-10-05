@@ -54,7 +54,7 @@ def test_loop_posts_fail_on_exception():
     assert w.run_once() is True
     url, body, kw = s.posts[-1]
     assert url == "http://nas/api/worker/jobs/j1/fail"
-    assert "音檔壞了" in body["error"]
+    assert body["error"] == "轉錄失敗：音檔壞了"  # Traditional Chinese, no exception class name
     assert kw["headers"]["X-Worker-Key"] == "K"
     assert w.run_once() is False  # 204 -> nothing
 
