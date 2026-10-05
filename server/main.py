@@ -13,13 +13,14 @@ from .app import create_app
 from .backup import BackupThread
 from .fallback import FallbackThread
 from .importer import import_dir
-from .uploads import scan_inbox
+from .uploads import scan_inbox, sweep_uploads
 
 log = logging.getLogger("server.main")
 
 RESTART_POLL_S = 2
 RESTART_GRACE_S = 3  # lets update_app.sh finish its two-rename swap
 INBOX_SCAN_S = 30
+UPLOAD_SWEEP_S = 3600  # abandoned-upload TTL sweep cadence (inside the inbox loop)
 
 
 def restart_requested(marker: Path, started_at: float) -> bool:
@@ -45,13 +46,29 @@ def _restart_watcher(marker: Path, started_at: float) -> None:
             log.exception("restart watcher error")
 
 
+def _inbox_tick(store, jobs, now: float, last_sweep: float) -> float:
+    """One inbox-loop round: scan the inbox; at most hourly also sweep abandoned uploads.
+    Returns the new last_sweep time."""
+    try:
+        scan_inbox(store, jobs)
+    except Exception:
+        log.exception("inbox scan failed")
+    if now - last_sweep >= UPLOAD_SWEEP_S:
+        last_sweep = now
+        try:
+            gone = sweep_uploads(store, now)
+            if gone:
+                log.info("swept %d abandoned uploads", len(gone))
+        except Exception:
+            log.exception("upload sweep failed")
+    return last_sweep
+
+
 def _inbox_loop(store, jobs) -> None:
+    last_sweep = 0.0
     while True:
         time.sleep(INBOX_SCAN_S)
-        try:
-            scan_inbox(store, jobs)
-        except Exception:
-            log.exception("inbox scan failed")
+        last_sweep = _inbox_tick(store, jobs, time.time(), last_sweep)
 
 
 def main() -> None:

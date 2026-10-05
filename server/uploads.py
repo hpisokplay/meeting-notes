@@ -1,6 +1,7 @@
 """Resumable chunked uploads, meeting creation from audio, audio serving, inbox scan."""
 from __future__ import annotations
 
+import logging
 import os
 import re
 import shutil
@@ -15,15 +16,20 @@ from starlette.concurrency import run_in_threadpool
 
 from .storage import Store, atomic_write_json, read_json
 
+log = logging.getLogger(__name__)
 CHUNK_SIZE = 8 * 1024 * 1024
 READ_SIZE = 1024 * 1024
-AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".caf", ".aiff", ".mp4", ".ogg", ".flac", ".webm"}
+AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".caf", ".aiff", ".mp4", ".ogg", ".flac", ".webm",
+              ".oga", ".opus", ".mov", ".m4v", ".3gp", ".amr", ".wma"}
 INBOX_SETTLE_SEC = 10
+UPLOAD_TTL_SEC = 3 * 24 * 3600  # abandoned resumable uploads are swept after this
 _UID_RE = re.compile(r"^[0-9a-f]{32}$")
 _BAD_CHARS = re.compile(r'[\x00-\x1f\x7f/\\<>:"|?*]')
 _MIME = {".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac",
          ".ogg": "audio/ogg", ".flac": "audio/flac", ".webm": "audio/webm",
-         ".mp4": "video/mp4", ".aiff": "audio/aiff", ".caf": "audio/x-caf"}
+         ".mp4": "video/mp4", ".aiff": "audio/aiff", ".caf": "audio/x-caf",
+         ".oga": "audio/ogg", ".opus": "audio/ogg", ".mov": "video/quicktime", ".m4v": "video/x-m4v",
+         ".3gp": "video/3gpp", ".amr": "audio/amr", ".wma": "audio/x-ms-wma"}
 
 
 def safe_name(name) -> str:
@@ -122,13 +128,23 @@ def create_meeting(store: Store, jobs, files: list, title=None, group=None) -> d
                 store.trash(mid)  # never hard-delete a meeting json
             except Exception:
                 pass
+        keep = False  # a source we could not put back must not be deleted with the audio dir
         for dest, orig in moved:
+            if not dest.exists():
+                continue
+            if orig.exists():
+                keep = True
+                log.error("rollback: %s exists again; kept %s", orig, dest)
+                continue
             try:
-                if dest.exists() and not orig.exists():
-                    shutil.move(str(dest), str(orig))
+                shutil.move(str(dest), str(orig))
             except OSError:
-                pass
-        shutil.rmtree(adir, ignore_errors=True)
+                keep = True
+                log.exception("rollback: could not move %s back to %s; kept it", dest, orig)
+        if keep:
+            log.error("rollback: audio dir %s left in place (contains unrestored source files)", adir)
+        else:
+            shutil.rmtree(adir, ignore_errors=True)
         raise
 
 
@@ -164,6 +180,27 @@ def scan_inbox(store: Store, jobs) -> list:
             continue  # create_meeting rolled back; file stays in inbox, retry next scan
         ids.append(m["id"])
     return ids
+
+
+def sweep_uploads(store: Store, now: float | None = None, ttl: float = UPLOAD_TTL_SEC) -> list:
+    """Remove uploads/<uid> dirs whose newest file is older than ttl (abandoned uploads).
+    Returns the removed uids."""
+    now = time.time() if now is None else now
+    gone = []
+    root = store.path("uploads")
+    if not root.is_dir():
+        return gone
+    for d in root.iterdir():
+        if not d.is_dir() or not _valid_uid(d.name):
+            continue
+        try:
+            newest = max([f.stat().st_mtime for f in d.iterdir()] + [d.stat().st_mtime])
+        except OSError:
+            continue
+        if now - newest > ttl:
+            shutil.rmtree(d, ignore_errors=True)
+            gone.append(d.name)
+    return gone
 
 
 def _parse_range(header, size: int):

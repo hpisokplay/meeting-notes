@@ -33,20 +33,25 @@ Progress = Callable[[int, str], bool]
 Transcriber = Callable[[list, Progress], "dict | None"]
 
 
-WINDOW_S = 20 * 60  # transcribe in 20 min windows: bounded memory for 8 h recordings
+# 5 min windows: bounded memory for 8 h recordings, and one window (~3-4 min of CPU at 1.5x
+# realtime) stays inside the 600 s stale-requeue timeout even without the keepalive thread.
+WINDOW_S = 5 * 60
 OVERLAP_S = 2
+KEEPALIVE_S = 60.0  # job heartbeat re-post interval while the transcriber is busy
 
 
-def probe_duration(path: Path) -> float:
+def probe_duration(path: Path):
+    """Seconds, or None when ffprobe ran fine but reports no duration (N/A: some streamed
+    webm/ogg); the caller then decodes windows until ffmpeg returns no more audio."""
     p = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
                         "-of", "csv=p=0", str(path)], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if p.returncode != 0:
+        raise RuntimeError("讀不到錄音長度：" + p.stderr.decode("utf-8", "replace")[-200:])
     try:
         d = float(p.stdout.decode().strip())
     except ValueError:
-        d = 0.0
-    if p.returncode != 0 or d <= 0:
-        raise RuntimeError("讀不到錄音長度：" + p.stderr.decode("utf-8", "replace")[-200:])
-    return d
+        return None
+    return d if d > 0 else None
 
 
 def decode_slice(path: Path, offset: float, length: float):
@@ -83,34 +88,54 @@ def _run_model(audio):
         from opencc import OpenCC
         _CC = OpenCC("s2twp")
     segs, _info = _model().transcribe(audio, language="zh", beam_size=1, vad_filter=True)
-    return [(float(sg.start), _CC.convert((sg.text or "").strip())) for sg in segs]
+    # lazy: faster-whisper decodes as the generator is consumed, so a cancel can stop mid-window
+    return ((float(sg.start), _CC.convert((sg.text or "").strip())) for sg in segs)
 
 
 def transcribe_windows(paths: list, progress: Progress, probe=probe_duration, decode=decode_slice,
                        run_model=_run_model):
     """Window-by-window transcription. Files in order with a running offset; each window is decoded
-    with OVERLAP_S extra seconds, and segments starting past the window length belong to the next one."""
+    with OVERLAP_S extra seconds, and segments starting past the window length belong to the next one.
+
+    A file whose probe gives None (duration N/A) is decoded window by window until ffmpeg returns
+    no audio. `progress.cancelled` (optional callable) is also checked between segments."""
+    cancelled = getattr(progress, "cancelled", None) or (lambda: False)
     if not progress(0, "NAS 備援轉錄準備中"):
         return None
     durs = [probe(Path(p)) for p in paths]
-    total = sum(durs)
+    known = all(d is not None for d in durs)
+    total = sum(d for d in durs if d is not None)
     out, base, done = [], 0.0, 0.0
     for path, dur in zip(paths, durs):
         off = 0.0
-        while off < dur:
-            length = min(WINDOW_S, dur - off)
+        while dur is None or off < dur:
+            length = WINDOW_S if dur is None else min(WINDOW_S, dur - off)
             audio = decode(Path(path), off, length + OVERLAP_S)
+            if dur is None:
+                got = len(audio) / SAMPLE_RATE
+                if got <= 0:
+                    break  # end of an unknown-length file
+                length = min(WINDOW_S, got)
             for start, text in run_model(audio):
+                if cancelled():
+                    return None
                 if start < WINDOW_S and text:
                     out.append({"speaker": SPEAKER, "text": text, "t": round(base + off + start, 1)})
             del audio
             off += length
             done += length
-            pct = min(99, max(1, int(done / total * 100)))
-            if not progress(pct, f"NAS 備援轉錄中…{pct}%"):
+            if known and total > 0:
+                pct = min(99, max(1, int(done / total * 100)))
+                msg = f"NAS 備援轉錄中…{pct}%"
+            else:  # unknown total: creep by minutes done
+                pct = min(99, max(1, int(done / 600)))
+                msg = f"NAS 備援轉錄中…已處理 {int(done // 60)} 分鐘"
+            if not progress(pct, msg):
                 return None
-        base += dur
-    return {"segments": out, "durationSec": round(total, 1), "engine": ENGINE}
+            if dur is None and length < WINDOW_S:
+                break  # short read: that was the last window
+        base += off if dur is None else dur
+    return {"segments": out, "durationSec": round(total if known else done, 1), "engine": ENGINE}
 
 
 def whisper_transcribe(paths: list, progress: Progress):
@@ -119,11 +144,12 @@ def whisper_transcribe(paths: list, progress: Progress):
 
 class FallbackThread(threading.Thread):
     def __init__(self, store: Store, jobs: JobQueue, transcriber: Transcriber | None = None,
-                 interval: float = 60.0):
+                 interval: float = 60.0, keepalive_s: float = KEEPALIVE_S):
         super().__init__(daemon=True, name="fallback")
         self.store, self.jobs = store, jobs
         self.transcriber = transcriber or whisper_transcribe
         self.interval = interval
+        self.keepalive_s = keepalive_s
         self._halt = threading.Event()
 
     def stop(self) -> None:
@@ -151,9 +177,14 @@ class FallbackThread(threading.Thread):
             if now - (job.get("created") or now) < wait:
                 return False
             try:
-                return True if self.store.get(job.get("meeting")) is not None else "會議不存在"
+                m = self.store.get(job.get("meeting"))
             except BadId:
                 return "會議不存在"
+            if m is None:
+                return "會議不存在"
+            if m.get("transcript"):
+                return False  # re-transcribing an existing transcript is GPU-only: leave it queued
+            return True
         job = self.jobs.claim(["transcribe"], OWNER, check=check)
         if job is None:
             return None
@@ -163,9 +194,21 @@ class FallbackThread(threading.Thread):
     def process(self, job: dict) -> None:
         jid = job["id"]
         last_write = [0.0]
+        last = {"pct": 0, "msg": "NAS 備援轉錄準備中"}
+        gone = threading.Event()  # job cancelled / requeued / finished elsewhere
+        stop_keepalive = threading.Event()
+
+        def keepalive():
+            # re-post the last pct/msg so a long window never looks stale to requeue_stale
+            while not stop_keepalive.wait(self.keepalive_s):
+                if self.jobs.progress(jid, "transcribe", last["pct"], last["msg"]) is None:
+                    gone.set()
+                    return
 
         def progress(pct, msg):
-            if self.jobs.progress(jid, "transcribe", pct, msg) is None:
+            last.update(pct=pct, msg=msg)
+            if gone.is_set() or self.jobs.progress(jid, "transcribe", pct, msg) is None:
+                gone.set()
                 return False  # cancelled / finished elsewhere
             now = time.monotonic()
             if pct >= 100 or now - last_write[0] >= MEETING_WRITE_INTERVAL:
@@ -175,6 +218,9 @@ class FallbackThread(threading.Thread):
                     progress={"stage": "transcribe", "pct": pct, "msg": msg, "engine": ENGINE}),
                     statuses=("queued", "transcribing"))
             return True
+        progress.cancelled = gone.is_set
+        ka = threading.Thread(target=keepalive, daemon=True, name=f"fallback-keepalive-{jid}")
+        ka.start()
         try:
             progress(0, "NAS 備援轉錄準備中")  # first heartbeat right after claim
             m = self.store.get(job["meeting"]) or {}
@@ -192,6 +238,9 @@ class FallbackThread(threading.Thread):
             err = f"轉錄失敗：{e}"
             if self.jobs.fail(jid, err) is not None:
                 update_meeting_if_job(self.store, job, lambda mm: mm.update(status="failed", error=err))
+        finally:
+            stop_keepalive.set()
+            ka.join(timeout=5)
 
     def run(self) -> None:
         try:

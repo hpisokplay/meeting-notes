@@ -28,20 +28,20 @@ def fake_env(durs):
 
 def test_windows_offsets_across_windows_and_files():
     W = F.WINDOW_S
-    paths, probe, decode, calls = fake_env([W + 600, 300])
+    paths, probe, decode, calls = fake_env([W + 200, 300])
 
     def model(audio):
         return [(5.0, "a"), (W + 1.0, "overlap-dup")] if audio[1] == 0 else [(10.0, "b")]
     prog = []
     r = transcribe_windows(paths, lambda p, m: prog.append(p) or True, probe, decode, model)
     segs = [(s["t"], s["text"]) for s in r["segments"]]
-    # window 1 of file 0: "a" at 5, overlap segment dropped; window 2 (off=W): "b"; file 1 offset W+600
+    # window 1 of file 0: "a" at 5, overlap segment dropped; window 2 (off=W): "b"; file 1 offset W+200
     assert (5.0, "a") in segs and not any(t == "overlap-dup" for _, t in segs)
-    assert (W + 10.0, "b") in segs and (W + 600 + 5.0, "a") in segs
+    assert (W + 10.0, "b") in segs and (W + 200 + 5.0, "a") in segs
     assert calls[0] == ("f0.m4a", 0.0, W + F.OVERLAP_S)
-    assert calls[1] == ("f0.m4a", W, 600 + F.OVERLAP_S)
+    assert calls[1] == ("f0.m4a", W, 200 + F.OVERLAP_S)
     assert calls[2] == ("f1.m4a", 0.0, 300 + F.OVERLAP_S)
-    assert r["durationSec"] == W + 900 and r["engine"] == "nas-cpu"
+    assert r["durationSec"] == W + 500 and r["engine"] == "nas-cpu"
     assert len(prog) == 1 + 3  # initial + one per window
 
 

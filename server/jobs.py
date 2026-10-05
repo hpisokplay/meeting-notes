@@ -349,9 +349,17 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
             return False  # meeting json may not be saved yet: leave queued
         return "會議不存在"
 
+    def touch_worker():
+        """Any authenticated worker call proves it is alive (a busy worker must not look offline,
+        or the NAS fallback would start stealing queued jobs)."""
+        try:
+            atomic_write_json(store.path("jobs", "worker.json"), {"lastSeen": time.time()})
+        except OSError:
+            log.exception("could not write worker.json")
+
     @r.get("/worker/next", dependencies=[Depends(auth)])
     def worker_next():
-        atomic_write_json(store.path("jobs", "worker.json"), {"lastSeen": time.time()})
+        touch_worker()
         job = get_jobs().claim(["transcribe"], WORKER_OWNER, check=check_meeting_exists)
         if job is None:
             return Response(status_code=204)
@@ -365,6 +373,7 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
 
     @r.post("/worker/jobs/{jid}/progress", dependencies=[Depends(auth)])
     def worker_progress(jid: str, body: dict = Body(...)):
+        touch_worker()
         owned_running(jid)
         stage = str(body.get("stage") or "")
         try:
@@ -390,6 +399,7 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
 
     @r.post("/worker/jobs/{jid}/result", dependencies=[Depends(auth)])
     def worker_result(jid: str, body: dict = Body(...)):
+        touch_worker()
         job = owned_running(jid)
         segs = body.get("segments")
         if not isinstance(segs, list) or not all(isinstance(s, dict) for s in segs):
@@ -400,6 +410,7 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
 
     @r.post("/worker/jobs/{jid}/fail", dependencies=[Depends(auth)])
     def worker_fail(jid: str, body: dict = Body(...)):
+        touch_worker()
         job = owned_running(jid)
         err = str(body.get("error") or "轉錄失敗")
         if get_jobs().fail(jid, err) is None:
