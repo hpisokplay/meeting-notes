@@ -4,12 +4,17 @@ import logging
 import logging.handlers
 import os
 import shutil
+import threading
 import time
 import traceback
 from pathlib import Path
 
-BASE = Path(os.environ.get("LOCALAPPDATA", ".")) / "MeetingWorker"
+# %USERPROFILE%\MeetingWorker, not %LOCALAPPDATA%: writes to LOCALAPPDATA from an MSIX-packaged
+# parent (e.g. the Claude desktop app) are virtualized into Packages\...\LocalCache.
+BASE = Path.home() / "MeetingWorker"
 TIMEOUT = 60
+KEEPALIVE_S = 60  # re-post the last progress this often while a stage is silent (diar, decode, model download)
+RESULT_BACKOFF = (15, 45, 90, 150)  # waits between the 5 result POST attempts (~5 min in total)
 log = logging.getLogger("worker")
 
 
@@ -24,6 +29,8 @@ class Api:
         self.s = session
         self.job_id = job_id
         self._last = (None, 0.0)
+        self._state = ("", 0, "")  # last (stage, pct, msg) for the keepalive thread
+        self.cancelled = threading.Event()  # set when the server answered 409 (job gone)
 
     @property
     def headers(self):
@@ -40,17 +47,58 @@ class Api:
         return self.s.post("%s/api/worker/jobs/%s/%s" % (self.server, self.job_id, path),
                            json=body, headers=self.headers, timeout=TIMEOUT)
 
+    def check(self):
+        """Raise Cancelled when a (keepalive) progress post was answered 409."""
+        if self.cancelled.is_set():
+            raise Cancelled()
+
     def progress(self, stage, pct, msg=""):
+        self.check()
+        self._state = (stage, int(pct), msg)
         now = time.time()
         if self._last[0] == stage and now - self._last[1] < 2.0 and pct < 100:
             return  # throttle
         self._last = (stage, now)
         r = self._post("progress", {"stage": stage, "pct": int(pct), "msg": msg})
         if r.status_code == 409:
+            self.cancelled.set()
             raise Cancelled()
 
-    def result(self, payload):
-        self._post("result", payload).raise_for_status()
+    def beat(self):
+        """Keepalive: re-post the last stage/pct unthrottled. A 409 sets `cancelled`;
+        network errors are only logged (the next beat retries)."""
+        stage, pct, msg = self._state
+        try:
+            r = self._post("progress", {"stage": stage, "pct": pct, "msg": msg})
+        except Exception as e:
+            log.warning("keepalive progress failed: %s", e)
+            return
+        if r.status_code == 409:
+            self.cancelled.set()
+
+    def result(self, payload, sleep=None):
+        """POST the result; retry network errors / 5xx with backoff, stop at once on 409
+        (Cancelled) or another 4xx (raise)."""
+        sleep = sleep or time.sleep
+        last = None
+        for attempt in range(len(RESULT_BACKOFF) + 1):
+            if attempt:
+                sleep(RESULT_BACKOFF[attempt - 1])
+            try:
+                r = self._post("result", payload)
+            except Exception as e:  # connection reset, timeout, DNS ...
+                last = e
+                log.warning("result post attempt %d failed: %s", attempt + 1, e)
+                continue
+            if r.status_code == 409:
+                raise Cancelled()
+            if r.status_code >= 500:
+                last = RuntimeError("上傳結果失敗 HTTP %d" % r.status_code)
+                log.warning("result post attempt %d: HTTP %d", attempt + 1, r.status_code)
+                continue
+            r.raise_for_status()
+            return
+        raise RuntimeError("上傳結果失敗：%s" % last)
 
     def fail(self, error):
         self._post("fail", {"error": error[:2000]})
@@ -109,6 +157,32 @@ def download(api, item, dest, tries=5):
     raise RuntimeError("下載錄音失敗：%s" % last_err)
 
 
+class Keepalive:
+    """Background thread calling api.beat() every `interval` s until stopped."""
+
+    def __init__(self, api, interval=None):
+        self.api = api
+        self.interval = KEEPALIVE_S if interval is None else interval
+        self._stop = threading.Event()
+        self._t = threading.Thread(target=self._run, daemon=True, name="keepalive")
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            self.api.beat()
+            if self.api.cancelled.is_set():
+                return
+
+    def __enter__(self):
+        self._t.start()
+        return self
+
+    def __exit__(self, *exc):
+        self._stop.set()
+        if self._t.ident is not None:  # started
+            self._t.join(timeout=TIMEOUT + 5)
+        return False
+
+
 def gpu_process(api, job, audio):
     """Full job: download -> concat all parts into ONE 16 kHz mono stream ->
     whisper once -> free -> pyannote once -> merge. One diarization keeps speakers
@@ -121,7 +195,9 @@ def gpu_process(api, job, audio):
     from pipeline import (PROMPT, align_words, build_segments, filter_hallucinations,
                           name_speakers)
     cache = BASE / "cache" / job["id"]
+    ka = Keepalive(api)
     try:
+        ka.__enter__()  # beats while ffmpeg decodes, the model downloads and pyannote runs
         paths = []
         for i, item in enumerate(audio):
             p = cache / ("%d%s" % (i, Path(item.get("name") or "a.m4a").suffix or ".m4a"))
@@ -129,11 +205,13 @@ def gpu_process(api, job, audio):
             paths.append(p)
         api.progress("download", 100, "")
         wave = np.concatenate([asr.load_audio(p) for p in paths])
+        api.check()
         total = len(wave) / 16000.0
         words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""))
         asr.release()
         api.progress("diar", 0, "")
         turns = diar.diarize(wave)
+        api.check()  # a keepalive 409 during diarization: stop before posting anything
         segs = build_segments(align_words(words, turns))
         cc = opencc.OpenCC("s2twp")
         for s in segs:
@@ -142,6 +220,7 @@ def gpu_process(api, job, audio):
         api.progress("upload", 0, "")
         return {"segments": segs, "durationSec": round(total, 2), "engine": "gpu"}
     finally:
+        ka.__exit__(None, None, None)
         shutil.rmtree(cache, ignore_errors=True)
 
 

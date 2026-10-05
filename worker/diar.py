@@ -1,11 +1,10 @@
 """pyannote community-1 speaker diarization from a local model folder (no HF token needed)."""
 import gc
-import os
 from pathlib import Path
 
 from asr import setup_cuda_dlls
 
-MODEL_DIR = Path(os.environ.get("LOCALAPPDATA", ".")) / "MeetingWorker" / "models" / "pyannote-c1"
+MODEL_DIR = Path.home() / "MeetingWorker" / "models" / "pyannote-c1"  # %USERPROFILE%, not MSIX-virtualized
 
 
 def diarize(audio, model_dir=None, sr=16000):

@@ -7,7 +7,8 @@ param(
 )
 $ErrorActionPreference = 'Stop'
 
-$base = Join-Path $env:LOCALAPPDATA 'MeetingWorker'
+# %USERPROFILE%\MeetingWorker (not %LOCALAPPDATA%: MSIX-packaged shells virtualize it); worker.py uses Path.home()
+$base = Join-Path $env:USERPROFILE 'MeetingWorker'
 $venv = Join-Path $base 'venv'
 $app = Join-Path $base 'app'
 $models = Join-Path $base 'models'
@@ -20,6 +21,15 @@ if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue)) { throw 'ffmpeg not
 
 New-Item -ItemType Directory -Force $base, $app, $models | Out-Null
 
+# re-install: stop the running worker first (IgnoreNew would otherwise keep the old process/code)
+$task = Get-ScheduledTask -TaskName 'MeetingWorker' -ErrorAction SilentlyContinue
+if ($task) {
+    Stop-ScheduledTask -TaskName 'MeetingWorker' -ErrorAction SilentlyContinue
+    for ($i = 0; $i -lt 30 -and (Get-ScheduledTask -TaskName 'MeetingWorker').State -eq 'Running'; $i++) {
+        Start-Sleep -Seconds 1
+    }
+}
+
 # 1. venv (python 3.12)
 if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
     & py -3.12 -m venv $venv
@@ -27,6 +37,7 @@ if (-not (Test-Path (Join-Path $venv 'Scripts\python.exe'))) {
 }
 $py = Join-Path $venv 'Scripts\python.exe'
 & $py -m pip install --upgrade pip
+if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed' }
 & $py -m pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu128
 if ($LASTEXITCODE -ne 0) { throw 'torch install failed' }
 & $py -m pip install faster-whisper==1.2.1 opencc-python-reimplemented requests pyannote.audio==4.0.7 nvidia-cublas-cu12 nvidia-cudnn-cu12
@@ -36,8 +47,11 @@ if ($LASTEXITCODE -ne 0) { throw 'pip install failed' }
 Copy-Item (Join-Path $src '*.py') $app -Force
 Copy-Item (Join-Path $src 'requirements.txt') $app -Force
 $dest = Join-Path $models 'pyannote-c1'
-if ((Resolve-Path $PyannoteDir).Path -ne $dest) {
-    Copy-Item $PyannoteDir $dest -Recurse -Force
+$srcFull = [System.IO.Path]::GetFullPath((Resolve-Path $PyannoteDir).Path).TrimEnd('\')
+if ($srcFull -ne [System.IO.Path]::GetFullPath($dest).TrimEnd('\')) {
+    # copy the folder CONTENTS: Copy-Item <dir> <existing dir> would nest pyannote-c1\pyannote-c1
+    New-Item -ItemType Directory -Force $dest | Out-Null
+    Copy-Item (Join-Path $srcFull '*') $dest -Recurse -Force
 }
 
 # 3. config
