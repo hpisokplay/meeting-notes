@@ -4,15 +4,19 @@
 import * as api from './api.js';
 
 const KEY = 'meeting_groups';
-const TOMB = 'meeting_group_tombstones';
 
-// 群組調色盤：新群組依序取色，存進群組資料（會跟著雲端同步）
+// 群組調色盤：新群組依序取色，存進群組資料（存到 NAS）
 export const GROUP_COLORS = ['#0a84ff', '#34c759', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00', '#63e6be'];
+// 顏色會直接插進 style 屬性 → 只接受 #hex，其他一律換成調色盤顏色（防止樣式／屬性注入）
+const HEX = /^#(?:[0-9a-fA-F]{3}|[0-9a-fA-F]{4}|[0-9a-fA-F]{6}|[0-9a-fA-F]{8})$/;
+export function safeColor(c, i = 0) {
+  return typeof c === 'string' && HEX.test(c.trim()) ? c.trim() : GROUP_COLORS[Math.abs(i) % GROUP_COLORS.length];
+}
 export function groupColor(id) {
   const gs = getGroups();
   const i = gs.findIndex((g) => g.id === id);
   if (i < 0) return '#8e8e93';
-  return gs[i].color || GROUP_COLORS[i % GROUP_COLORS.length];
+  return safeColor(gs[i].color, i);
 }
 
 export function getGroups() {
@@ -25,28 +29,6 @@ export function getGroups() {
 export function setGroups(gs) {
   localStorage.setItem(KEY, JSON.stringify(gs || []));
 }
-export function getGroupTombstones() {
-  try {
-    return JSON.parse(localStorage.getItem(TOMB)) || [];
-  } catch (_) {
-    return [];
-  }
-}
-export function setGroupTombstones(ids) {
-  localStorage.setItem(TOMB, JSON.stringify(Array.from(new Set(ids || []))));
-}
-const TOMB_TIME = 'meeting_group_tombstone_times';
-export function getGroupTombstoneTimes() {
-  try {
-    return JSON.parse(localStorage.getItem(TOMB_TIME)) || {};
-  } catch (_) {
-    return {};
-  }
-}
-export function setGroupTombstoneTimes(map) {
-  localStorage.setItem(TOMB_TIME, JSON.stringify(map || {}));
-}
-
 export function addGroup(name) {
   const gs = getGroups();
   const g = {
@@ -69,14 +51,6 @@ export function renameGroup(id, name) {
 }
 export function removeGroup(id) {
   setGroups(getGroups().filter((g) => g.id !== id));
-  const t = getGroupTombstones();
-  if (!t.includes(id)) {
-    t.push(id);
-    setGroupTombstones(t);
-  }
-  const times = getGroupTombstoneTimes();
-  times[id] = Date.now();
-  setGroupTombstoneTimes(times);
 }
 export function groupName(id) {
   const g = getGroups().find((x) => x.id === id);

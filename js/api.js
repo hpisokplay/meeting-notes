@@ -4,6 +4,7 @@
 export const config = {
   backoffMs: 1000, // 上傳單塊失敗後的等待（每次重試加倍）
   pollMs: 2000, // 等 AI 工作時的輪詢間隔
+  maxPollFailMs: 5 * 60 * 1000, // 輪詢時連續連不上／伺服器暫時錯誤最多忍這麼久才放棄
 };
 const RETRIES = 3;
 const enc = encodeURIComponent;
@@ -212,9 +213,24 @@ export const getJob = (jobId) => req('GET', `/api/jobs/${enc(jobId)}`);
 export const cancelJob = (jobId) => req('POST', `/api/jobs/${enc(jobId)}/cancel`, {});
 
 // 輪詢到工作結束：done → resolve(job)；failed → reject(伺服器錯誤文字)；cancelled → reject('已取消')
+// 暫時性錯誤（連不上、5xx、429）：手機切網路、NAS 重啟時常見，不該讓整個工作被當成失敗
+const isTransient = (e) => !!e && (e.offline || e.status >= 500 || e.status === 429 || e.status === 408);
+
 export async function waitJob(jobId, onProgress, signal) {
+  let failSince = null;
   for (;;) {
-    const j = await getJob(jobId);
+    let j;
+    try {
+      j = await getJob(jobId);
+      failSince = null;
+    } catch (e) {
+      if (e && e.name === 'AbortError') throw e;
+      if (!isTransient(e)) throw e;
+      if (failSince == null) failSince = Date.now();
+      if (Date.now() - failSince >= config.maxPollFailMs) throw e;
+      await sleep(config.pollMs, signal);
+      continue;
+    }
     if (onProgress) onProgress((j && j.progress) || null, j);
     const st = j && j.state;
     if (st === 'done') return j;

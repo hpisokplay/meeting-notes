@@ -1,6 +1,7 @@
 // 整合測試：以 jsdom 實際載入 app.js（api.js 換成記憶體裡的假 NAS），渲染清單、詳情、進度、設定頁。
 import 'fake-indexeddb/auto';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
+import * as api from '../js/api.js';
 
 const nas = vi.hoisted(() => ({ meetings: {}, groups: [], jobs: {}, calls: [] }));
 vi.mock('../js/api.js', () => {
@@ -223,6 +224,62 @@ describe('app（整合，假 NAS）', () => {
     expect(document.querySelector('.card[data-id="q1"]').innerHTML).toContain('排隊中（等電腦轉錄器）');
   });
 
+  it('換頁不會讓輪詢越疊越多：清單每 5 秒只問一次 NAS', async () => {
+    nas.meetings.p1 = { id: 'p1', title: '處理中', createdAt: Date.now(), status: 'transcribing', progress: { pct: 10 } };
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'setInterval', 'clearInterval'] });
+    const flush = async () => {
+      for (let i = 0; i < 40; i++) await new Promise((r) => setImmediate(r));
+    };
+    const nav = async (h) => {
+      location.hash = h;
+      window.dispatchEvent(new Event('hashchange'));
+      await flush();
+    };
+    try {
+      await nav('#/');
+      window.dispatchEvent(new Event('hashchange')); // 同一頁連畫兩次（像啟動時）
+      await flush();
+      await nav('#/m/test-1');
+      await nav('#/');
+      await vi.advanceTimersByTimeAsync(1); // 讓 jsdom 自己排的 hashchange 也跑完
+      await flush();
+      api.listMeetings.mockClear();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flush();
+      expect(api.listMeetings).toHaveBeenCalledTimes(1);
+      await vi.advanceTimersByTimeAsync(5000);
+      await flush();
+      expect(api.listMeetings).toHaveBeenCalledTimes(2);
+      // 離開清單後就不再問
+      await nav('#/settings');
+      api.listMeetings.mockClear();
+      await vi.advanceTimersByTimeAsync(15000);
+      await flush();
+      expect(api.listMeetings).toHaveBeenCalledTimes(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('編輯模式刪除：NAS 上的內容已變（那一條不在了）→ 不刪別條，提示再操作一次', async () => {
+    nas.meetings['test-1'].summary.mainPoints = ['重點甲', '重點乙'];
+    await go('#/m/test-1');
+    document.querySelector('[data-edit="mp"]').click();
+    await tick();
+    // 別台裝置剛把「重點甲」改掉了
+    nas.meetings['test-1'].summary.mainPoints = ['重點丙', '重點乙'];
+    document.querySelector('[data-del="mp:0"]').click();
+    await tick(120);
+    expect(nas.meetings['test-1'].summary.mainPoints).toEqual(['重點丙', '重點乙']);
+    expect(document.getElementById('toast').textContent).toBe('內容已更新，請再操作一次');
+    expect(document.getElementById('view').innerHTML).toContain('重點丙');
+    // 順序變了但那一條還在 → 刪對的那條
+    nas.meetings['test-1'].summary.mainPoints = ['新插入', '重點丙', '重點乙'];
+    document.querySelector('[data-del="mp:0"]').click(); // 畫面上第 0 條是「重點丙」
+    await tick(120);
+    expect(nas.meetings['test-1'].summary.mainPoints).toEqual(['新插入', '重點乙']);
+  });
+
   it('設定頁：NAS 狀態、Claude 型號、備援、TG 通知、備份；沒有金鑰與 GitHub 設定', async () => {
     await go('#/settings');
     await tick();
@@ -272,6 +329,28 @@ describe('播放與狀態的純函式', () => {
     expect(appMod.agoText((now - 120_000) / 1000, now)).toBe('2 分鐘前');
     expect(appMod.agoText(new Date(now - 3 * 3600_000).toISOString(), now)).toBe('3 小時前');
     expect(appMod.agoText(null, now)).toBe('從未連線');
+  });
+
+  it('removeSectionItemMatching：依內容找、同內容取最靠近原位置、找不到不動', async () => {
+    const appMod = await import('../js/app.js');
+    const m = { summary: { qa: ['A', 'B', 'A', 'C'] } };
+    expect(appMod.removeSectionItemMatching(m, 'summary', 'qa', 1, 'B')).toBe(true);
+    expect(m.summary.qa).toEqual(['A', 'A', 'C']);
+    expect(appMod.removeSectionItemMatching(m, 'summary', 'qa', 3, 'A')).toBe(true); // 取最靠近 3 的 A（index 1）
+    expect(m.summary.qa).toEqual(['A', 'C']);
+    expect(appMod.removeSectionItemMatching(m, 'summary', 'qa', 0, 'Z')).toBe(false);
+    expect(m.summary.qa).toEqual(['A', 'C']);
+    const n = { notes: { concepts: [{ term: 'x' }, { term: 'y' }] } };
+    expect(appMod.removeSectionItemMatching(n, 'notes', 'concepts', 0, { term: 'y' })).toBe(true);
+    expect(n.notes.concepts).toEqual([{ term: 'x' }]);
+  });
+
+  it('uploadInProgress：上傳或建立會議中才延後 SW 重整', async () => {
+    const appMod = await import('../js/app.js');
+    expect(appMod.uploadInProgress({ phase: 'uploading' })).toBe(true);
+    expect(appMod.uploadInProgress({ phase: 'creating' })).toBe(true);
+    expect(appMod.uploadInProgress({ phase: 'error' })).toBe(false);
+    expect(appMod.uploadInProgress(null)).toBe(false);
   });
 
   it('sortByName：多檔依檔名數字順序', async () => {

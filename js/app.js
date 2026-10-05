@@ -35,6 +35,10 @@ function setHeader(text, showBack) {
 }
 const errText = (e) => (e && e.message ? e.message : String(e));
 
+// 繪製世代：每次 router() 換頁就 +1。各頁的輪詢（清單刷新、進度頁、計時）只在自己那一代還是最新時才繼續，
+// 否則快速換頁或啟動時的兩次繪製會讓輪詢越疊越多。
+let renderGen = 0;
+
 // ===== 處理狀態（伺服器的 meeting.status / meeting.progress）=====
 const STAGE_TEXT = {
   uploading: '上傳中',
@@ -176,6 +180,29 @@ export function backupSection(meeting, kind, section) {
 
 export function hasAltVersion(meeting, kind, section) {
   return !!(meeting && meeting.alt && Array.isArray(meeting.alt[altKey(kind, section)]));
+}
+
+// 對著「從 NAS 重抓的最新版」刪除畫面上看到的那一條：先比對第 i 條是不是同一個內容，
+// 不是就找內容相同的那條（同內容多條時取最靠近 i 的）；找不到回 false（內容已被別處改過，不要刪錯）。
+export function removeSectionItemMatching(meeting, kind, section, i, value) {
+  const box = (meeting && meeting[kind]) || {};
+  const arr = box[section];
+  if (!Array.isArray(arr)) return false;
+  const key = JSON.stringify(value);
+  let at = -1;
+  if (i >= 0 && i < arr.length && JSON.stringify(arr[i]) === key) at = i;
+  else {
+    let best = Infinity;
+    arr.forEach((x, j) => {
+      if (JSON.stringify(x) === key && Math.abs(j - i) < best) {
+        best = Math.abs(j - i);
+        at = j;
+      }
+    });
+  }
+  if (at < 0) return false;
+  arr.splice(at, 1);
+  return true;
 }
 
 // 刪掉某一區的第 i 條（編輯模式用）
@@ -493,7 +520,7 @@ function pickGroup(current) {
     const gs = getGroups();
     ov.innerHTML = `<div class="sheet">
       <div class="sheet-title">設定分類</div>
-      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${esc(g.id)}"><span class="g-dot" style="background:${groupColor(g.id)}"></span>${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
+      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${esc(g.id)}"><span class="g-dot" style="background:${esc(groupColor(g.id))}"></span>${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
       <button class="sheet-btn" data-g="__new">➕ 新增群組</button>
       ${current ? '<button class="sheet-btn" data-g="__none">🚫 移出分類</button>' : ''}
       <button class="sheet-btn cancel" data-g="__cancel">取消</button>
@@ -538,7 +565,7 @@ const meetingHref = (m) => (m.status && m.status !== 'done' ? '#/job/' : '#/m/')
 
 // groupId：undefined = 全部；'__none' = 未分類；其他 = 該群組
 async function renderList(groupId) {
-  const route = location.hash;
+  const gen = renderGen; // 這次繪製的世代：換頁（router）後舊的輪詢自動停止
   const title = groupId === '__none' ? '🗂 未分類' : groupId ? `📂 ${groupName(groupId) || '分類'}` : 'DD會議紀錄';
   setHeader(title, !!groupId);
   if (groupId) backBtn.onclick = () => (location.hash = '#/groups');
@@ -562,7 +589,7 @@ async function renderList(groupId) {
     const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
     const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
     const gn = m.group && known.has(m.group) ? groupName(m.group) : '';
-    const gc = gn ? groupColor(m.group) : '';
+    const gc = gn ? esc(groupColor(m.group)) : '';
     return `<div class="card tap" data-id="${esc(m.id)}">
         <div class="card-top"><h3>${esc(m.title)}</h3><button class="grp-chip${gn ? ' has' : ''}" type="button"${gn ? ` style="color:${gc};border-color:${gc};background:color-mix(in srgb, ${gc} 14%, transparent)"` : ''}><span class="g-dot" style="background:${gc || 'var(--muted)'}"></span>${esc(gn || '未分類')}</button></div>
         <div class="meta">${formatDate(m.createdAt)} ${statusBadge(m)}</div>
@@ -576,7 +603,7 @@ async function renderList(groupId) {
     fetchingFull = true;
     try {
       for (const m of all) {
-        if (location.hash !== route) return;
+        if (gen !== renderGen) return;
         if (full.has(m.id)) continue;
         let fm = await cachedMeeting(m.id);
         if (!fm || (m.updatedAt && (fm.updatedAt || 0) < m.updatedAt)) {
@@ -590,7 +617,7 @@ async function renderList(groupId) {
     } finally {
       fetchingFull = false;
     }
-    if (location.hash === route && si.value.trim()) draw();
+    if (gen === renderGen && si.value.trim()) draw();
   };
   const searchable = (m) => {
     const fm = full.get(m.id);
@@ -637,9 +664,9 @@ async function renderList(groupId) {
   };
   // 先秒開快取，再向 NAS 更新；有會議還在處理就每 5 秒刷新狀態
   const refresh = async () => {
-    if (location.hash !== route) return;
+    if (gen !== renderGen) return;
     const fresh = await fetchList();
-    if (location.hash !== route) return;
+    if (gen !== renderGen) return;
     if (fresh) {
       all = fresh;
       draw();
@@ -652,7 +679,7 @@ async function renderList(groupId) {
 // 分類頁：群組清單（新增／改名／刪除／點入看該組會議）
 async function renderGroups() {
   setHeader('分類', false);
-  const route = location.hash;
+  const gen = renderGen; // 這次繪製的世代：換頁（router）後舊的輪詢自動停止
   const paint = (meetings) => {
     const gs = getGroups();
     const known = new Set(gs.map((g) => g.id));
@@ -663,7 +690,7 @@ async function renderGroups() {
     <div id="groupList" style="margin-top:12px">
       ${gs
         .map((g) => {
-          const gc = groupColor(g.id);
+          const gc = esc(groupColor(g.id));
           return `<div class="card tap group-card" data-g="${esc(g.id)}" style="border-left:5px solid ${gc}">
             <div class="card-top">
               <h3><span class="g-ico" style="background:color-mix(in srgb, ${gc} 20%, transparent);color:${gc}">📁</span>${esc(g.name)}</h3>
@@ -710,16 +737,24 @@ async function renderGroups() {
     });
   };
   const cached = await cachedList();
-  if (location.hash !== route) return;
+  if (gen !== renderGen) return;
   paint(cached);
   await refreshGroups();
   const fresh = await fetchList();
-  if (location.hash === route) paint(fresh || (await cachedList()));
+  if (gen === renderGen) paint(fresh || (await cachedList()));
 }
 
 // ===== 上傳（分塊、可續傳）=====
 // 上傳狀態存在畫面之外：使用者中途切到別頁再回來，還接得上進度。
 let upload = null; // { files:[{name,size,sent}], total, startAt, phase:'uploading'|'creating'|'error', error, ac, retry }
+// 新版 SW 接手時若正在上傳，先記著，等上傳結束再重整
+let reloadAfterUpload = false;
+export const uploadInProgress = (u) => !!u && (u.phase === 'uploading' || u.phase === 'creating');
+function maybeReloadAfterUpload() {
+  if (!reloadAfterUpload || uploadInProgress(upload)) return;
+  reloadAfterUpload = false;
+  window.location.reload();
+}
 const fmtMB = (b) => (b / 1048576).toFixed(b >= 1048576 * 100 ? 0 : 1) + ' MB';
 const mmss = (sec) => {
   const s = Math.max(0, Math.round(sec));
@@ -834,6 +869,7 @@ async function uploadAndCreate(files, title, group) {
     clearInterval(ticker);
     await wakeLock.stop();
     refreshBanner();
+    maybeReloadAfterUpload();
   }
 }
 
@@ -930,7 +966,7 @@ function refreshBanner() {
 // ===== 處理進度頁（轉錄／摘要在 NAS 與電腦上跑，這裡每 3 秒問一次）=====
 async function renderProgress(id) {
   setHeader('處理進度', true);
-  const route = location.hash;
+  const gen = renderGen; // 這次繪製的世代：換頁（router）後舊的輪詢自動停止
   view.innerHTML = `
     <div class="card">
       <h3 id="pgTitle" style="margin:0 0 8px"></h3>
@@ -1011,7 +1047,7 @@ async function renderProgress(id) {
   let timer = null;
   const tick = async () => {
     clearTimeout(timer);
-    if (location.hash !== route) return;
+    if (gen !== renderGen) return;
     let fresh = null;
     try {
       fresh = await api.getMeeting(id);
@@ -1026,7 +1062,7 @@ async function renderProgress(id) {
       }
       fresh = m || (await cachedMeeting(id));
     }
-    if (location.hash !== route) return;
+    if (gen !== renderGen) return;
     if (fresh) {
       m = fresh;
       if (!m.status || m.status === 'done') {
@@ -1039,7 +1075,7 @@ async function renderProgress(id) {
   };
   // 已耗時每秒更新
   const clock = setInterval(() => {
-    if (location.hash !== route) clearInterval(clock);
+    if (gen !== renderGen) clearInterval(clock);
     else if (m && isProcessing(m)) paint();
   }, 1000);
   tick();
@@ -1088,7 +1124,13 @@ async function renderDetail(id, preloaded) {
   const persist = async (mutate, opts = {}) => {
     try {
       const fresh = await api.getMeeting(id);
-      mutate(fresh);
+      if (mutate(fresh) === STALE) {
+        // 畫面上的內容已經不是最新版（別台或伺服器剛改過）→ 不存，換成最新版請使用者再操作一次
+        m = fresh;
+        await cacheMeeting(fresh);
+        toast('內容已更新，請再操作一次');
+        return null;
+      }
       if (opts.edit) fresh.editedAt = Date.now();
       const saved = await api.saveMeeting(fresh);
       await cacheMeeting(saved);
@@ -1100,6 +1142,9 @@ async function renderDetail(id, preloaded) {
       return null;
     }
   };
+
+  const STALE = Symbol('stale');
+  const sectionOf = (mm, src) => ((mm && mm[src[0]]) || {})[src[1]];
 
   // del：編輯模式下附上刪除鈕；此時不掛 data-jump，避免點刪除誤觸「跳到出處」
   const delBtn = (key, i) => `<button class="item-del" data-del="${key}:${i}" type="button">✕</button>`;
@@ -1589,19 +1634,26 @@ async function renderDetail(id, preloaded) {
           const [sec, iStr] = b.dataset.del.split(':');
           const src = SEC_SRC[sec];
           if (!src) return;
-          await persist((fresh) => removeSectionItem(fresh, src[0], src[1], +iStr), { edit: true });
+          const shown = (sectionOf(m, src) || [])[+iStr];
+          await persist(
+            (fresh) => (removeSectionItemMatching(fresh, src[0], src[1], +iStr, shown) ? undefined : STALE),
+            { edit: true }
+          );
           drawBody(lang);
           return;
         }
         const src = SEC_SRC[k];
         if (!src) return;
         const merge = !!b.dataset.mergev;
-        await persist((fresh) => {
-          if (merge) mergeSectionVersions(fresh, src[0], src[1]);
-          else swapSectionVersion(fresh, src[0], src[1]);
+        const seen = JSON.stringify(sectionOf(m, src) || []);
+        const ok = await persist((fresh) => {
+          // 最新版的這一區跟畫面上看到的不同 → 換版／合併的對象已變，不能盲目套用
+          if (JSON.stringify(sectionOf(fresh, src) || []) !== seen) return STALE;
+          const done = merge ? mergeSectionVersions(fresh, src[0], src[1]) : swapSectionVersion(fresh, src[0], src[1]);
+          return done ? undefined : STALE;
         }, { edit: true });
         drawBody(lang);
-        toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
+        if (ok) toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
       };
     });
 
@@ -2320,6 +2372,7 @@ function renderSettings() {
 }
 
 function router() {
+  renderGen++;
   const h = location.hash || '#/';
   refreshBanner(); // 每次換頁都重算橫幅：上傳中離開上傳頁時才會有回去的入口
   if (h.startsWith('#/m/')) return renderDetail(decodeURIComponent(h.slice(4)));
@@ -2389,7 +2442,9 @@ if ('serviceWorker' in navigator) {
     navigator.serviceWorker.addEventListener('controllerchange', () => {
       if (refreshing) return;
       refreshing = true;
-      window.location.reload();
+      // 上傳／建立會議途中重整會中斷上傳 → 延到上傳結束再重整
+      if (uploadInProgress(upload)) reloadAfterUpload = true;
+      else window.location.reload();
     });
   }
   window.addEventListener('load', () => {

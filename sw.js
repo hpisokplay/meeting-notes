@@ -39,6 +39,21 @@ self.addEventListener('activate', (e) => {
   );
 });
 
+// 離線且快取沒有這個檔時的退路
+async function offlineFallback(req) {
+  const hit = await caches.match(req, { ignoreSearch: true });
+  if (hit) return hit;
+  const accept = req.headers.get('accept') || '';
+  if (req.mode === 'navigate' || accept.includes('text/html')) {
+    const idx = (await caches.match('./index.html')) || (await caches.match('./'));
+    if (idx) return idx;
+  }
+  return new Response('離線中，且這個檔案沒有快取。', {
+    status: 503,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8' },
+  });
+}
+
 // 網路優先（network-first）：連線時一律拿最新程式碼，離線時才用快取。
 self.addEventListener('fetch', (e) => {
   const req = e.request;
@@ -58,6 +73,7 @@ self.addEventListener('fetch', (e) => {
         return res;
       })
       // 離線時回退到快取；ignoreSearch 讓帶 ?fresh=… 的強制更新網址也能命中 './'（否則離線白屏）
-      .catch(() => caches.match(req, { ignoreSearch: true }))
+      // 都沒有：導覽請求退回快取的 index.html，其他給一個最小的離線回應（避免瀏覽器顯示網路錯誤頁）
+      .catch(() => offlineFallback(req))
   );
 });

@@ -138,6 +138,33 @@ describe('jobs', () => {
     await expect(api.waitJob('j2')).rejects.toThrow('Claude 用量已達上限');
   });
 
+  it('waitJob keeps polling through transient offline / 5xx errors', async () => {
+    let n = 0;
+    vi.stubGlobal(
+      'fetch',
+      vi.fn(async () => {
+        n++;
+        if (n === 1) throw new TypeError('Failed to fetch');
+        if (n === 2) return json(502, { detail: 'bad gateway' });
+        return json(200, { id: 'j5', state: 'done' });
+      })
+    );
+    expect((await api.waitJob('j5')).state).toBe('done');
+    expect(n).toBe(3);
+  });
+
+  it('waitJob gives up when the errors persist past maxPollFailMs, and at once on 404', async () => {
+    api.config.maxPollFailMs = 20;
+    vi.stubGlobal('fetch', vi.fn(async () => { throw new TypeError('Failed to fetch'); }));
+    const e = await api.waitJob('j6').catch((x) => x);
+    expect(e.offline).toBe(true);
+    api.config.maxPollFailMs = 5 * 60 * 1000;
+    let calls = 0;
+    vi.stubGlobal('fetch', vi.fn(async () => { calls++; return json(404, { detail: '找不到工作' }); }));
+    await expect(api.waitJob('j7')).rejects.toThrow('找不到工作');
+    expect(calls).toBe(1);
+  });
+
   it('waitJob rejects with 已取消 when the job is cancelled', async () => {
     vi.stubGlobal('fetch', fakeFetch(() => json(200, { id: 'j3', state: 'cancelled' })));
     await expect(api.waitJob('j3')).rejects.toThrow('已取消');

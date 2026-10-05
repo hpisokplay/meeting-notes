@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { getGroups, addGroup, renameGroup, removeGroup, groupName, getGroupTombstones } from '../js/groups.js';
+import { getGroups, setGroups, addGroup, renameGroup, removeGroup, groupName, groupColor, GROUP_COLORS } from '../js/groups.js';
 
 describe('groups（分類群組）', () => {
   beforeEach(() => {
@@ -20,10 +20,22 @@ describe('groups（分類群組）', () => {
     expect(getGroups()).toHaveLength(0);
   });
 
-  it('刪除會留下墓碑（供跨裝置同步刪除）', () => {
+  it('刪除', () => {
     const g = addGroup('內部');
     removeGroup(g.id);
     expect(getGroups()).toHaveLength(0);
-    expect(getGroupTombstones()).toContain(g.id);
+    expect(localStorage.getItem('meeting_group_tombstones')).toBeNull();
+  });
+
+  it('顏色只接受 #hex：惡意字串換成調色盤顏色（不會注入 style 屬性）', () => {
+    setGroups([
+      { id: 'a', name: 'A', color: 'red;background:url(https://evil/x)" onmouseover="alert(1)' },
+      { id: 'b', name: 'B', color: '#34C759' },
+      { id: 'c', name: 'C' },
+    ]);
+    expect(groupColor('a')).toBe(GROUP_COLORS[0]);
+    expect(groupColor('b')).toBe('#34C759');
+    expect(groupColor('c')).toBe(GROUP_COLORS[2]);
+    expect(groupColor('none')).toBe('#8e8e93');
   });
 });
