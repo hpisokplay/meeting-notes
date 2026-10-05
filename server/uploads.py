@@ -1,0 +1,278 @@
+"""Resumable chunked uploads, meeting creation from audio, audio serving, inbox scan."""
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import subprocess
+import time
+import uuid
+from pathlib import Path
+
+from fastapi import APIRouter, Body, HTTPException, Request
+from fastapi.responses import StreamingResponse
+
+from .storage import Store, atomic_write_json, read_json
+
+CHUNK_SIZE = 8 * 1024 * 1024
+READ_SIZE = 1024 * 1024
+AUDIO_EXTS = {".m4a", ".mp3", ".wav", ".aac", ".caf", ".aiff", ".mp4", ".ogg", ".flac", ".webm"}
+INBOX_SETTLE_SEC = 10
+_UID_RE = re.compile(r"^[0-9a-f]{32}$")
+_BAD_CHARS = re.compile(r'[\x00-\x1f\x7f/\\<>:"|?*]')
+_MIME = {".m4a": "audio/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav", ".aac": "audio/aac",
+         ".ogg": "audio/ogg", ".flac": "audio/flac", ".webm": "audio/webm",
+         ".mp4": "video/mp4", ".aiff": "audio/aiff", ".caf": "audio/x-caf"}
+
+
+def safe_name(name) -> str:
+    base = str(name or "").replace("\\", "/").split("/")[-1]
+    base = _BAD_CHARS.sub("", base).strip(" .")
+    if len(base) > 120:
+        stem, ext = os.path.splitext(base)
+        base = stem[:120 - len(ext)] + ext
+    return base or "audio"
+
+
+def probe_duration(path: Path):
+    exe = shutil.which("ffprobe")
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=nw=1:nk=1", str(path)],
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=60)
+        return round(float(out.stdout.strip()), 2)
+    except Exception:
+        return None
+
+
+def _udir(store: Store, uid: str) -> Path:
+    return store.path("uploads", uid)
+
+
+def _valid_uid(uid) -> bool:
+    return isinstance(uid, str) and bool(_UID_RE.match(uid))
+
+
+def _load_upload(store: Store, uid: str) -> dict:
+    if not _valid_uid(uid):
+        raise HTTPException(404, "找不到這個上傳")
+    meta = read_json(_udir(store, uid) / "meta.json")
+    if meta is None:
+        raise HTTPException(404, "找不到這個上傳")
+    return meta
+
+
+def _received(store: Store, uid: str) -> list:
+    return sorted(int(p.stem) for p in _udir(store, uid).glob("*.part") if p.stem.isdigit())
+
+
+def _upload_view(store: Store, uid: str, meta: dict) -> dict:
+    return {"uploadId": uid, "chunkSize": CHUNK_SIZE, "chunks": meta["chunks"],
+            "received": _received(store, uid)}
+
+
+def _expected_len(meta: dict, index: int) -> int:
+    if index == meta["chunks"] - 1:
+        return meta["size"] - CHUNK_SIZE * (meta["chunks"] - 1)
+    return CHUNK_SIZE
+
+
+def create_meeting(store: Store, jobs, files: list, title=None, group=None) -> dict:
+    """files: [{name, src}]; src is a path (moved into audio/<id>/) or a callable(dest_path)
+    that writes the destination file."""
+    mid = store.new_id()
+    adir = store.path("audio", mid)
+    adir.mkdir(parents=True, exist_ok=True)
+    audio = []
+    for n, f in enumerate(files):
+        sname = safe_name(f["name"])
+        fname = f"{n}-{sname}"
+        dest = adir / fname
+        src = f["src"]
+        if callable(src):
+            src(dest)
+        else:
+            shutil.move(str(src), str(dest))
+        audio.append({"file": fname, "name": sname, "size": dest.stat().st_size,
+                      "durationSec": probe_duration(dest)})
+    now = int(time.time() * 1000)
+    if not title:
+        title = os.path.splitext(audio[0]["name"])[0] if audio else "新會議"
+    durs = [a["durationSec"] for a in audio]
+    m = {"id": mid, "title": title, "createdAt": now, "updatedAt": now, "group": group or None,
+         "status": "queued", "jobId": None,
+         "progress": {"stage": "queued", "pct": 0, "msg": "", "engine": ""},
+         "audio": audio, "transcript": [], "summary": None,
+         "durationSec": sum(durs) if durs and all(d is not None for d in durs) else None}
+    store.save(m)
+    jid = jobs.enqueue("transcribe", mid, {})
+    return store.update(mid, lambda x: x.update(jobId=jid))
+
+
+def _assembler(store: Store, uid: str, meta: dict):
+    def write(dest: Path):
+        tmp = dest.with_name(dest.name + ".tmp")
+        with open(tmp, "wb") as out:
+            for i in range(meta["chunks"]):
+                with open(_udir(store, uid) / f"{i}.part", "rb") as part:
+                    shutil.copyfileobj(part, out, READ_SIZE)
+            out.flush()
+            os.fsync(out.fileno())
+        if tmp.stat().st_size != meta["size"]:
+            tmp.unlink()
+            raise HTTPException(409, "上傳的檔案大小不符，請重新上傳")
+        os.replace(tmp, dest)
+    return write
+
+
+def scan_inbox(store: Store, jobs) -> list:
+    ids = []
+    now = time.time()
+    for p in sorted(store.path("inbox").iterdir(), key=lambda x: x.name):
+        if not p.is_file() or p.name.startswith(".") or p.suffix.lower() not in AUDIO_EXTS:
+            continue
+        try:
+            if now - p.stat().st_mtime < INBOX_SETTLE_SEC:
+                continue
+            m = create_meeting(store, jobs, [{"name": p.name, "src": p}])
+        except OSError:
+            continue  # still locked / vanished; retry on next scan
+        ids.append(m["id"])
+    return ids
+
+
+def _parse_range(header: str, size: int):
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", (header or "").strip())
+    if not m or (m.group(1) == "" and m.group(2) == ""):
+        raise HTTPException(416, "Range 無效")
+    if m.group(1) == "":
+        start, end = max(size - int(m.group(2)), 0), size - 1
+    else:
+        start = int(m.group(1))
+        end = min(int(m.group(2)) if m.group(2) else size - 1, size - 1)
+    if start >= size or start > end:
+        raise HTTPException(416, "Range 超出範圍")
+    return start, end
+
+
+def _iter_file(path: Path, start: int, end: int):
+    remaining = end - start + 1
+    with open(path, "rb") as f:
+        f.seek(start)
+        while remaining > 0:
+            chunk = f.read(min(READ_SIZE, remaining))
+            if not chunk:
+                break
+            remaining -= len(chunk)
+            yield chunk
+
+
+def build_router(store: Store, get_jobs) -> APIRouter:
+    r = APIRouter(prefix="/api")
+
+    @r.post("/uploads")
+    def start_upload(body: dict = Body(...)):
+        try:
+            size = int(body.get("size"))
+        except (TypeError, ValueError):
+            raise HTTPException(400, "檔案大小無效")
+        if size <= 0:
+            raise HTTPException(400, "檔案大小無效")
+        uid = uuid.uuid4().hex
+        meta = {"name": safe_name(body.get("name")), "size": size,
+                "mime": str(body.get("mime") or ""), "chunks": -(-size // CHUNK_SIZE),
+                "created": time.time()}
+        atomic_write_json(_udir(store, uid) / "meta.json", meta)
+        return _upload_view(store, uid, meta)
+
+    @r.get("/uploads/{uid}")
+    def get_upload(uid: str):
+        return _upload_view(store, uid, _load_upload(store, uid))
+
+    @r.put("/uploads/{uid}/{index}")
+    async def put_chunk(uid: str, index: int, request: Request):
+        meta = _load_upload(store, uid)
+        if index < 0 or index >= meta["chunks"]:
+            raise HTTPException(400, "分塊編號超出範圍")
+        want = _expected_len(meta, index)
+        d = _udir(store, uid)
+        tmp = d / f"{index}.part.{uuid.uuid4().hex[:6]}.tmp"
+        got = 0
+        try:
+            with open(tmp, "wb") as f:
+                async for piece in request.stream():
+                    got += len(piece)
+                    if got > want:
+                        break
+                    f.write(piece)
+            if got != want:
+                raise HTTPException(400, f"分塊大小不符（應為 {want} 位元組）")
+            os.replace(tmp, d / f"{index}.part")
+        finally:
+            tmp.unlink(missing_ok=True)
+        return {"received": _received(store, uid)}
+
+    @r.post("/meetings")
+    def create(body: dict = Body(...)):
+        uids = body.get("uploads")
+        if not isinstance(uids, list) or not uids:
+            raise HTTPException(400, "請至少提供一個上傳檔案")
+        files = []
+        for uid in uids:
+            if not _valid_uid(uid):
+                raise HTTPException(400, "上傳編號無效")
+            meta = read_json(_udir(store, uid) / "meta.json")
+            if meta is None:
+                raise HTTPException(404, "找不到這個上傳")
+            if _received(store, uid) != list(range(meta["chunks"])):
+                raise HTTPException(409, f"檔案「{meta['name']}」還沒上傳完成，請等上傳完成再建立會議")
+            files.append((uid, meta))
+        m = create_meeting(
+            store, get_jobs(),
+            [{"name": meta["name"], "src": _assembler(store, uid, meta)} for uid, meta in files],
+            title=(body.get("title") or "").strip() or None, group=body.get("group"))
+        for uid, _ in files:
+            shutil.rmtree(_udir(store, uid), ignore_errors=True)
+        return m
+
+    @r.get("/meetings/{mid}/audio/{n}")
+    def get_audio(mid: str, n: int, request: Request):
+        m = store.get(mid)
+        if m is None:
+            raise HTTPException(404, "找不到這場會議")
+        audio = m.get("audio") or []
+        if n < 0 or n >= len(audio):
+            raise HTTPException(404, "找不到這個錄音")
+        path = store.path("audio", mid, audio[n]["file"])
+        if not path.is_file():
+            raise HTTPException(404, "錄音檔不存在")
+        size = path.stat().st_size
+        mime = _MIME.get(path.suffix.lower(), "application/octet-stream")
+        headers = {"Accept-Ranges": "bytes"}
+        rng = request.headers.get("range")
+        if rng:
+            start, end = _parse_range(rng, size)
+            headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+            headers["Content-Length"] = str(end - start + 1)
+            return StreamingResponse(_iter_file(path, start, end), status_code=206,
+                                     media_type=mime, headers=headers)
+        headers["Content-Length"] = str(size)
+        return StreamingResponse(_iter_file(path, 0, size - 1), media_type=mime, headers=headers)
+
+    @r.post("/meetings/{mid}/retranscribe")
+    def retranscribe(mid: str):
+        m = store.get(mid)
+        if m is None:
+            raise HTTPException(404, "找不到這場會議")
+        if not m.get("audio"):
+            raise HTTPException(409, "這場會議沒有錄音檔，無法重新轉錄")
+        jid = get_jobs().enqueue("transcribe", mid, {})
+
+        def apply(x):
+            x.update(status="queued", jobId=jid,
+                     progress={"stage": "queued", "pct": 0, "msg": "", "engine": ""})
+        return store.update(mid, apply)
+
+    return r

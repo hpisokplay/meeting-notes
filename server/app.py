@@ -8,7 +8,9 @@ from pathlib import Path
 from fastapi import APIRouter, Body, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 
+from .jobs import JobQueue
 from .storage import Store, read_json
+from .uploads import build_router as build_uploads_router
 
 VERSION = "v100"
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -82,10 +84,11 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
     app = FastAPI(title="DD會議紀錄")
     store = Store(Path(data_dir))
     app.state.store = store
-    app.state.jobs = None  # filled in by the job-queue module (later task)
+    app.state.jobs = JobQueue(store)
     app.state.claude_cmd = claude_cmd
     app.state.start_threads = start_threads
     app.include_router(build_router(store))
+    app.include_router(build_uploads_router(store, lambda: app.state.jobs))
 
     static_dir = Path(os.environ.get("MEETINGS_STATIC") or REPO_ROOT).resolve()
 
