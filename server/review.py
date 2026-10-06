@@ -207,8 +207,10 @@ def fix_src_times(entries: list, tx: TranscriptIndex) -> list:
 
 
 def is_grounded(m: dict) -> bool:
-    """The meeting has been through the grounded pipeline (it has a review or a mode)."""
-    return isinstance(m.get("review"), dict) or m.get("mode") in MODES
+    """The meeting has been through the grounded pipeline. Only reprocess / summary set `mode`;
+    a review dict alone is NOT a sign (a PUT, notes, enhance or a speaker edit on a legacy meeting
+    also write one), otherwise legacy source-less entries would get locked after a second edit."""
+    return m.get("mode") in MODES
 
 
 def verify_review(m: dict, glossary, extra: list | None = None, *, replace_slips: bool = False,
@@ -544,9 +546,12 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
                         c["count"], c["ts"] = n, clean_ts(c.get("ts")) or occ
                 corr["at"] = now_ms()
             rv = m.get("review") if isinstance(m.get("review"), dict) else None
-            if rv:  # term items are rebuilt (pending) from the reset corrections by the next verify
+            if rv:  # term items are rebuilt (pending) from the reset corrections by the verify below
                 rv["items"] = [x for x in rv.get("items") or [] if not (isinstance(x, dict) and x.get("kind") == "term")]
             m["translations"] = {}
+            # verify now: the reset corrections are pending term items again, so the export gate is
+            # closed during the job (and stays closed if it fails)
+            m["review"] = verify_review(m, store.glossary_list())
         # no automatic correction afterwards: every correction is now a pending review item
         return start_reprocess(store, get_jobs(), mid, {"correction": False}, prepare=prepare)
 

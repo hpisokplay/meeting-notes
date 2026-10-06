@@ -940,13 +940,12 @@ def on_ai_job_terminal(store: Store, job: dict | None, state: str) -> None:
             m["error"] = job.get("error") or "摘要失敗"
         # the transcript may have changed before the job (restore-raw, new transcription) while the
         # job's own verify never ran: re-verify so the 待確認清單 matches what is stored now
-        try:
+        try:  # status is already reset: a failure here must not leave the meeting stuck
             if isinstance(m.get("review"), dict):
-                m["review"] = R.verify_review(m, glossary)
+                m["review"] = R.verify_review(m, store.glossary_list())
         except Exception:
             log.exception("re-verify after ai job %s failed", jid)
     try:
-        glossary = store.glossary_list()
         m = store.get(job["meeting"])
         if m and _is_pipeline_summary(m, jid):
             store.update(job["meeting"], apply)

@@ -121,7 +121,9 @@ def test_confirm_then_restore_makes_term_pending_again(app_client):
     out = c.post(f"/api/meetings/m1/review/{term['id']}", json={"action": "confirm"}).json()
     assert out["transcript"][0]["text"] == "Jeffrey 會負責"
     assert c.post("/api/meetings/m1/restore-raw").status_code == 200
-    assert not [r for r in store.get("m1")["review"]["items"] if r["kind"] == "term"]
+    # re-verified right away: the old (confirmed) term item is replaced by a pending one
+    terms = [r for r in store.get("m1")["review"]["items"] if r["kind"] == "term"]
+    assert [(r["text"], r["state"]) for r in terms] == [("Jefry", "pending")]
     run(app)
     m = store.get("m1")
     terms = [r for r in m["review"]["items"] if r["kind"] == "term"]

@@ -195,7 +195,8 @@ def test_restore_then_cancel_reverifies_and_keeps_before_restore(app_client, fak
     jid = c.post("/api/meetings/m1/restore-raw").json()["jobId"]
     m = store.get("m1")
     assert m["alt"]["transcript:beforeRestore"] == before  # M2
-    assert not any(x["kind"] == "term" for x in m["review"]["items"])  # removed by restore
+    # restore re-verifies at once: every reset correction is a pending term item again
+    assert sorted(x["text"] for x in pending(m) if x["kind"] == "term") == ["Jefry", "台積店"]
     assert c.post(f"/api/jobs/{jid}/cancel").status_code == 200
     m = store.get("m1")
     assert m["status"] == "done"
@@ -231,3 +232,71 @@ def test_new_transcription_drops_stale_review_keeps_confirmed(app_client, fake_e
     ids = {x["id"]: x for x in m["review"]["items"]}
     assert term["id"] not in ids and "corrections" not in m
     assert ids[num["id"]]["state"] == "confirmed"
+
+
+# ---------------------------------------------------------------- re-review: legacy meetings stay legacy
+def legacy(**kw):
+    m = {"id": "m1", "title": "t", "createdAt": 1, "status": "done", "transcript": [dict(s) for s in SEGS],
+         "summary": {"actionItems": ["舊待辦"], "mainPoints": ["舊重點"], "qa": []}}
+    m.update(kw)
+    return m
+
+
+def test_legacy_meeting_two_edits_not_locked(app_client):
+    app, c = app_client
+    store = app.state.store
+    store.save(legacy())
+    for text in ("改過一次", "改過兩次"):
+        body = c.get("/api/meetings/m1").json()
+        body["summary"]["mainPoints"] = [text]
+        got = c.put("/api/meetings/m1", json=body).json()
+        assert not [x for x in pending(got) if x["kind"] == "quote"]
+    assert isinstance(store.get("m1").get("review"), dict)  # a review dict alone does not make it strict
+    assert store.path("exports", "m1.docx").exists()
+    assert not store.path("meetings", "m1.md").read_text(encoding="utf-8").startswith("⚠️")
+
+
+@pytest.mark.parametrize("payload", [{"action": "notes"}, {"action": "enhance", "section": "qa"}])
+def test_legacy_meeting_notes_or_enhance_keeps_legacy_strings_unflagged(app_client, payload):
+    app, c = app_client
+    store, jobs = app.state.store, app.state.jobs
+    store.save(legacy())
+    jobs.enqueue("ai", "m1", payload)
+    run_claimed(store, jobs)
+    m = store.get("m1")
+    assert "mode" not in m
+    flagged = {x["text"] for x in m.get("review", {}).get("items", []) if x["kind"] == "quote"}
+    assert "舊待辦" not in flagged and "舊重點" not in flagged
+    body = c.get("/api/meetings/m1").json()  # and a later edit still does not arm it
+    body["summary"]["actionItems"] = ["舊待辦改"]
+    got = c.put("/api/meetings/m1", json=body).json()
+    assert not any(x["kind"] == "quote" and x["text"] == "舊待辦改" for x in got["review"]["items"])
+
+
+def test_restore_raw_term_items_pending_immediately(app_client, fake_env):
+    app, c = app_client
+    store, jobs = app.state.store, app.state.jobs
+    transcribed(store, jobs)
+    run_claimed(store, jobs)
+    for x in pending(store.get("m1")):
+        c.post(f"/api/meetings/m1/review/{x['id']}", json={"action": "confirm"})
+    assert pending(store.get("m1")) == []
+    assert c.post("/api/meetings/m1/restore-raw").status_code == 200
+    m = store.get("m1")
+    assert m["status"] == "summarizing"
+    assert sorted(x["text"] for x in pending(m) if x["kind"] == "term") == ["Jefry", "台積店"]
+    assert not store.path("exports", "m1.docx").exists()  # gate closed during the job
+
+
+def test_terminal_listener_resets_status_even_if_glossary_fails(app_client, fake_env, monkeypatch):
+    app, c = app_client
+    store, jobs = app.state.store, app.state.jobs
+    transcribed(store, jobs)
+    run_claimed(store, jobs)
+    jid = c.post("/api/meetings/m1/ai", json={"action": "reprocess"}).json()["jobId"]
+
+    def boom():
+        raise RuntimeError("settings unreadable")
+    monkeypatch.setattr(store, "glossary_list", boom)
+    assert c.post(f"/api/jobs/{jid}/cancel").status_code == 200
+    assert store.get("m1")["status"] == "done"
