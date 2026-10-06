@@ -18,10 +18,11 @@ import {
   exportLockText,
   REVIEW_KIND,
   srcSegIndex,
-  itemIdOf,
+  listItemIds,
+  confirmOnly,
 } from './items.js';
 
-const APP_VERSION = 'v102';
+const APP_VERSION = 'v103';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -1372,6 +1373,7 @@ async function renderDetail(id, preloaded) {
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
       <div class="export-lock" id="exportLock" hidden></div>
+      ${(Array.isArray(m.warnings) ? m.warnings : []).filter((w) => typeof w === 'string' && w).map((w) => `<div class="export-warn">⚠️ ${esc(w)}</div>`).join('')}
       <div class="lang-toggle" id="modeToggle" style="margin-top:10px">
         <button data-mode="meeting">📋 ${meetingMode(m) === 'lecture' ? '講座摘要' : '會議摘要'}</button>
         <button data-mode="notes">📚 學習筆記</button>
@@ -1848,7 +1850,7 @@ async function renderDetail(id, preloaded) {
             { edit: true }
           );
           drawBody(lang);
-          drawReview(); // 刪掉的條目若有待確認項目 → 視為已處理
+          drawReview(); // 存檔時伺服器重新驗證：刪掉的條目，它的待確認項目跟著消失
           return;
         }
         const src = SEC_SRC[k];
@@ -1862,7 +1864,7 @@ async function renderDetail(id, preloaded) {
           return done ? undefined : STALE;
         }, { edit: true });
         drawBody(lang);
-        drawReview(); // 換版／合併後條目可能不同 → 待確認清單跟著變
+        drawReview(); // 換版／合併後伺服器重新驗證，回傳的會議帶著新的待確認清單
         if (ok) toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
       };
     });
@@ -2288,7 +2290,8 @@ async function renderDetail(id, preloaded) {
     if (!r) return '';
     const [box, key] = String(r.section || '').split('.');
     const arr = ((m[box] || {})[key]) || [];
-    const target = r.itemId ? arr.find((x) => itemIdOf(x) === String(r.itemId)) : null;
+    const at = r.itemId ? listItemIds(arr).indexOf(String(r.itemId)) : -1;
+    const target = at >= 0 ? arr[at] : null;
     const src = itemSrc(target).sort((a, b) => Math.abs(a.t - t) - Math.abs(b.t - t))[0];
     return (src && src.quote) || r.text || '';
   };
@@ -2316,11 +2319,13 @@ async function renderDetail(id, preloaded) {
           <div class="review-text">${esc(r.text)}</div>
           ${r.detail ? `<div class="review-detail">${esc(r.detail)}</div>` : ''}
           ${r.suggestion ? `<div class="review-sugg">建議：${esc(r.suggestion)}</div>` : ''}
-          <div class="review-ops">
-            <button class="act-btn" type="button" data-rv="confirm">✅ 確認</button>
+          <div class="review-ops">${
+            confirmOnly(r)
+              ? `<button class="act-btn" type="button" data-rv="confirm">✅ 知道了</button>`
+              : `<button class="act-btn" type="button" data-rv="confirm">✅ 確認</button>
             <button class="act-btn" type="button" data-rv="edit">✏️ 改正</button>
-            <button class="act-btn" type="button" data-rv="delete">🗑 刪除</button>
-          </div>
+            <button class="act-btn" type="button" data-rv="delete">🗑 刪除</button>`
+          }</div>
         </div>`
       )
       .join('');
@@ -2391,12 +2396,12 @@ async function renderDetail(id, preloaded) {
     } catch (e) {
       noteFetchError(e);
       if (e && (e.status === 404 || e.status === 409)) {
-        // 那一條已不存在或已被處理（別台裝置、手動刪除、伺服器自動結案）→ 換成最新版重畫
+        // 404：那一條已不存在（別台裝置、重新驗證後已結案）；409：伺服器正在整理 → 換成最新版重畫
         try {
           const fresh = await api.getMeeting(id);
           await cacheMeeting(fresh);
           m = fresh;
-          toast('這一項已經處理過或內容已更新，已重新整理清單');
+          toast(e.status === 409 ? '整理中，請稍後再確認' : '這一項已經處理過或內容已更新，已重新整理清單');
           if (currentDetailId() === id) renderDetail(id, fresh);
           return;
         } catch (e2) {

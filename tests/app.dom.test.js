@@ -14,10 +14,35 @@ vi.mock('../js/api.js', () => {
       if (!nas.meetings[id]) throw notFound();
       return clone(nas.meetings[id]);
     }),
+    // 跟真伺服器一樣：review 由伺服器管（用戶端送來的不算）；摘要／筆記／逐字稿有變就重新驗證（簡化版：
+    // 指向已不存在條目的 pending 項目消失；已走新流程的會議裡沒附原句的摘要條目 → 新的待確認項目）
     saveMeeting: vi.fn(async (m) => {
       nas.calls.push(['saveMeeting', m.id]);
-      nas.meetings[m.id] = clone(m);
-      return clone(m);
+      const prev = nas.meetings[m.id];
+      const next = clone(m);
+      if (prev) {
+        if (prev.review) next.review = clone(prev.review);
+        else delete next.review;
+        const changed = ['summary', 'notes', 'transcript'].some((k) => JSON.stringify(prev[k]) !== JSON.stringify(next[k]));
+        if (changed && next.review) {
+          const idsOf = (sec) => {
+            const [b, k] = String(sec).split('.');
+            return (((next[b] || {})[k]) || []).map((x) => (x && typeof x === 'object' ? x.id : x));
+          };
+          const items = next.review.items.filter((r) => r.state !== 'pending' || !r.itemId || idsOf(r.section).includes(r.itemId));
+          Object.entries(next.summary || {}).forEach(([k, arr]) =>
+            (arr || []).forEach((x) => {
+              const ok = x && typeof x === 'object' && Array.isArray(x.src) && x.src.some((q) => q && q.quote);
+              const rid = 'nq-' + k + '-' + (typeof x === 'string' ? x : x.text);
+              if (!ok && !items.some((r) => r.id === rid))
+                items.push({ id: rid, kind: 'quote', section: 'summary.' + k, itemId: typeof x === 'string' ? x : x.id, text: typeof x === 'string' ? x : x.text, detail: '沒有附逐字稿原句，請確認。', state: 'pending' });
+            })
+          );
+          next.review.items = items;
+        }
+      }
+      nas.meetings[m.id] = next;
+      return clone(next);
     }),
     deleteMeeting: vi.fn(async (id) => {
       delete nas.meetings[id];
@@ -711,7 +736,81 @@ describe('app（整合，假 NAS）', () => {
     await tick(120);
     expect(alerts).toEqual([]);
     expect(document.getElementById('reviewCount').textContent).toBe('1');
+    expect(document.getElementById('toast').textContent).toContain('整理中，請稍後再確認');
+    expect(document.getElementById('toast').textContent).not.toContain('已經處理過');
+  });
+
+  it('待確認動作回 404 → 重抓會議重畫，提示已處理過', async () => {
+    nas.meetings['lec-1'] = lectureMeeting();
+    await go('#/m/lec-1');
+    api.reviewAction.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('找不到'), { status: 404 });
+    });
+    document.querySelector('.review-row[data-rid="rv000001"] [data-rv="confirm"]').click();
+    await tick(120);
     expect(document.getElementById('toast').textContent).toContain('已重新整理清單');
+  });
+
+  it('換版成沒有出處的舊版 → 伺服器重新驗證回傳待確認，畫面照伺服器的清單上鎖（不在前端隱藏）', async () => {
+    const m = lectureMeeting();
+    m.review.items.forEach((r) => (r.state = 'confirmed'));
+    m.alt = { 'summary:mainPoints': ['AI 自己補的一句', '另一句沒有出處'] };
+    nas.meetings['lec-1'] = m;
+    await go('#/m/lec-1');
+    const alerts = [];
+    window.alert = (msg) => alerts.push(msg);
+    expect(document.getElementById('exportLock').hidden).toBe(true);
+    document.querySelector('[data-swap="mp"]').click();
+    await tick(150);
+    expect(nas.meetings['lec-1'].summary.mainPoints).toEqual(['AI 自己補的一句', '另一句沒有出處']);
+    expect(document.getElementById('reviewCount').textContent).toBe('2');
+    expect(document.getElementById('exportLock').textContent).toContain('還有 2 項待確認');
+    document.getElementById('wordBtn').click();
+    await tick(20);
+    expect(alerts).toEqual(['還有 2 項待確認，處理完才能匯出']);
+    expect(document.querySelector('.sheet-ov')).toBeNull();
+  });
+
+  it('伺服器回報的待確認項目即使指向的條目不在畫面上，也照算（不再前端隱藏）', async () => {
+    const m = lectureMeeting();
+    m.review.items[0].itemId = 'ffffffff'; // 條目已不存在，但伺服器說還 pending
+    nas.meetings['lec-1'] = m;
+    await go('#/m/lec-1');
+    expect(document.getElementById('reviewCount').textContent).toBe('2');
+    expect(document.getElementById('exportLock').textContent).toContain('還有 2 項待確認');
+  });
+
+  it('講者口誤（沒有對應條目）只有「知道了」，送出 confirm', async () => {
+    const m = lectureMeeting();
+    m.review.items.push({ id: 'rvslip01', kind: 'slip', section: 'transcript', text: '只要繳五千塊', detail: '口誤', t: 700, state: 'pending' });
+    nas.meetings['lec-1'] = m;
+    await go('#/m/lec-1');
+    const row = document.querySelector('.review-row[data-rid="rvslip01"]');
+    const ops = [...row.querySelectorAll('[data-rv]')];
+    expect(ops.map((b) => b.dataset.rv)).toEqual(['confirm']);
+    expect(ops[0].textContent).toContain('知道了');
+    // 指向條目的項目仍有三個按鈕
+    expect(document.querySelectorAll('.review-row[data-rid="rv000001"] [data-rv]').length).toBe(3);
+    api.reviewAction.mockImplementationOnce(async (id, rid, action) => {
+      nas.calls.push(['reviewAction', id, rid, action]);
+      const mm = nas.meetings[id];
+      mm.review.items.find((x) => x.id === rid).state = 'confirmed';
+      return JSON.parse(JSON.stringify(mm));
+    });
+    ops[0].click();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['reviewAction', 'lec-1', 'rvslip01', 'confirm']);
+    expect(document.querySelector('.review-row[data-rid="rvslip01"]')).toBeNull();
+  });
+
+  it('meeting.warnings：詳情頁在匯出列下方每則顯示一行 ⚠️', async () => {
+    nas.meetings['test-1'].warnings = ['名詞校正失敗，已略過：Claude 執行失敗：boom', '檢查口誤失敗，已略過：x'];
+    await go('#/m/test-1');
+    const w = [...document.querySelectorAll('.export-warn')].map((x) => x.textContent);
+    expect(w).toEqual(['⚠️ 名詞校正失敗，已略過：Claude 執行失敗：boom', '⚠️ 檢查口誤失敗，已略過：x']);
+    const h = document.getElementById('view').innerHTML;
+    expect(h.indexOf('id="exportLock"')).toBeLessThan(h.indexOf('export-warn'));
+    expect(h.indexOf('id="wordBtn"')).toBeLessThan(h.indexOf('export-warn'));
   });
 
   it('各區「複製」也受匯出把關', async () => {

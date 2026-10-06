@@ -98,25 +98,65 @@ export function sha1Hex(str) {
   }
   return [h0, h1, h2, h3, h4].map((x) => x.toString(16).padStart(8, '0')).join('');
 }
-// 條目的 id：物件用自己的 id；舊字串（或沒有 id 的物件）用 sha1(text) 前 8 碼
-export const itemIdOf = (x) =>
-  x && typeof x === 'object' && x.id ? String(x.id) : sha1Hex(itemText(x)).slice(0, 8);
-
-// 待確認清單
-export const reviewItems = (m) => (m && m.review && Array.isArray(m.review.items) ? m.review.items : []);
-// 待確認項目指向的條目還在不在（手動刪除／換版／合併後可能已不存在 → 視為已處理）
-function targetExists(m, r) {
-  if (!r.itemId) return true; // 沒指向特定條目（名詞、逐字稿）
-  const sec = String(r.section || '');
-  const [box, key] = sec.split('.');
-  if ((box !== 'summary' && box !== 'notes') || !key) return true;
-  const arr = ((m && m[box]) || {})[key];
-  if (!Array.isArray(arr)) return false;
-  const want = String(r.itemId);
-  return arr.some((x) => itemIdOf(x) === want);
+// ---- 與伺服器 server/items.py 一致的條目純文字與 id（待確認項目的 itemId 用這個算）----
+// Python str() 的寫法：None → 'None'、True → 'True'
+const pyStr = (v) => (v == null ? 'None' : v === true ? 'True' : v === false ? 'False' : String(v));
+const orEmpty = (v) => (v ? String(v) : ''); // Python 的 str(x or "")
+// = items.item_text：舊字串、Item、筆記物件（大綱／名詞／圖表數字／表格／測驗）都攤成一段文字
+export function itemFlatText(x) {
+  if (x == null) return '';
+  if (typeof x === 'string') return x;
+  if (typeof x !== 'object' || Array.isArray(x)) return String(x);
+  if (typeof x.text === 'string') return x.text;
+  if ('q' in x || 'a' in x) {
+    const q = orEmpty(x.q).trim();
+    const a = orEmpty(x.a).trim();
+    return a ? `問：${q}\n答：${a}` : `問：${q}`;
+  }
+  if ('term' in x) {
+    const parts = [orEmpty(x.term), orEmpty(x.plain)].filter(Boolean);
+    const why = orEmpty(x.why);
+    return parts.join('：') + (why ? `（${why}）` : '');
+  }
+  if ('label' in x || 'value' in x) return `${orEmpty(x.label)}：${orEmpty(x.value)}`;
+  if ('headers' in x || 'rows' in x) {
+    const lines = [orEmpty(x.title), (x.headers || []).map(pyStr).join('｜')];
+    for (const r of x.rows || []) lines.push((Array.isArray(r) ? r : [r]).map(pyStr).join('｜'));
+    return lines.filter(Boolean).join('\n');
+  }
+  if ('title' in x || 'points' in x) {
+    const pts = (x.points || []).map(itemFlatText);
+    return [orEmpty(x.title)].concat(pts).join('\n').trim();
+  }
+  return '';
 }
-export const pendingReview = (m) => reviewItems(m).filter((r) => r && r.state === 'pending' && targetExists(m, r));
+const HEX8 = /^[0-9a-f]{8}$/;
+// 條目的 id（= items.normalize_item／normalize_entry）：合法的 8 碼 hex id 用自己的，否則 sha1(純文字) 前 8 碼
+export const itemIdOf = (x) =>
+  x && typeof x === 'object' && typeof x.id === 'string' && HEX8.test(x.id) ? x.id : sha1Hex(itemFlatText(x)).slice(0, 8);
+// 一整區的 id（= items.ensure_ids）：重複的 id 用「純文字#索引#k」重算，跟伺服器一樣
+export function listItemIds(arr) {
+  const seen = new Set();
+  return (Array.isArray(arr) ? arr : []).map((x, i) => {
+    let id = itemIdOf(x);
+    if (seen.has(id)) {
+      const text = itemFlatText(x);
+      for (let k = 1; ; k++) {
+        id = sha1Hex(`${text}#${i}#${k}`).slice(0, 8);
+        if (!seen.has(id)) break;
+      }
+    }
+    seen.add(id);
+    return id;
+  });
+}
+
+// 待確認清單：伺服器是唯一依據（換版／合併／刪除後，存檔時伺服器會重新驗證並回傳新的清單）
+export const reviewItems = (m) => (m && m.review && Array.isArray(m.review.items) ? m.review.items : []);
+export const pendingReview = (m) => reviewItems(m).filter((r) => r && r.state === 'pending');
 export const pendingCount = (m) => pendingReview(m).length;
+// 沒有對應條目可改／刪的項目（講者口誤等；名詞校正除外）→ 只能按「知道了」
+export const confirmOnly = (r) => !!r && r.kind !== 'term' && (!r.itemId || !/^(summary|notes)\./.test(String(r.section || '')));
 export const exportLockText = (n) => `還有 ${n} 項待確認，處理完才能匯出`;
 
 export const REVIEW_KIND = {

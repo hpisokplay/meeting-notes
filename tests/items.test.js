@@ -13,6 +13,9 @@ import {
   sha1Hex,
   itemIdOf,
   srcSegIndex,
+  itemFlatText,
+  listItemIds,
+  confirmOnly,
 } from '../js/items.js';
 import { meetingToHtmlBody, splitQA } from '../js/export.js';
 import { buildDocxBytes } from '../js/docx.js';
@@ -66,26 +69,53 @@ describe('items：字串與物件條目都吃', () => {
     expect(sha1Hex('')).toBe('da39a3ee5e6b4b0d3255bfef95601890afd80709');
     expect(sha1Hex('中文')).toBe('7be2d2d20c106eee0836c9bc2b939890a78e8fb3');
     expect(itemIdOf('abc')).toBe('a9993e36');
-    expect(itemIdOf({ id: 'x1', text: 'abc' })).toBe('x1');
+    // 不是 8 碼 hex 的 id，伺服器會用文字重算 → 前端也要一樣
+    expect(itemIdOf({ id: 'x1', text: 'abc' })).toBe('a9993e36');
+    expect(itemIdOf({ id: 'abcdef12', text: 'x' })).toBe('abcdef12');
   });
-  it('待確認項目指向的條目已不存在（手動刪除／換版）→ 不算待確認', () => {
+  it('itemFlatText／listItemIds 與伺服器 items.item_text／ensure_ids 一致（舊筆記物件、重複文字）', () => {
+    // 期望值由 server/items.py 算出
+    const notes = {
+      outline: [{ title: '第一節', points: ['要點甲', '要點乙'] }, { title: '第一節', points: ['要點甲', '要點乙'] }],
+      concepts: [{ term: '複委託', plain: '透過國內券商買海外股票', why: '常考' }, { term: 'CRS' }],
+      figures: [{ label: '稅率', value: '20%' }],
+      quiz: [{ q: '什麼是 CRS？', a: '共同申報準則' }, { q: '只有問題' }],
+      tables: [{ title: '比較', headers: ['項目', '數值'], rows: [['A', 1], ['B', null]] }],
+    };
+    expect(itemFlatText(notes.outline[0])).toBe('第一節\n要點甲\n要點乙');
+    expect(itemFlatText(notes.concepts[0])).toBe('複委託：透過國內券商買海外股票（常考）');
+    expect(itemFlatText(notes.figures[0])).toBe('稅率：20%');
+    expect(itemFlatText(notes.quiz[0])).toBe('問：什麼是 CRS？\n答：共同申報準則');
+    expect(itemFlatText(notes.tables[0])).toBe('比較\n項目｜數值\nA｜1\nB｜None');
+    expect(listItemIds(notes.outline)).toEqual(['c81c9efc', '11db2b52']); // 同內容第二節重算
+    expect(listItemIds(notes.concepts)).toEqual(['42f73d18', '037c298c']);
+    expect(listItemIds(notes.figures)).toEqual(['fd1c4d81']);
+    expect(listItemIds(notes.quiz)).toEqual(['4ff24c9b', 'bb6134b8']);
+    expect(listItemIds(notes.tables)).toEqual(['82ceac83']);
+    const summary = ['同一句', '同一句', '同一句', { id: 'x1', text: '非 hex id' }, { id: 'abcdef12', text: '合法' }];
+    expect(listItemIds(summary)).toEqual(['42573675', '86dae13c', '96e8824a', '7d2cf1a8', 'abcdef12']);
+  });
+  it('待確認數量以伺服器的 state 為準：指向的條目不見了也照算（伺服器存檔時會重新驗證）', () => {
     const m = {
-      summary: { mainPoints: [{ id: 'k1', text: 'a' }, 'abc'], qa: [] },
-      notes: { outline: [{ id: 'o1', title: 't' }] },
+      summary: { mainPoints: [{ id: 'k1', text: 'a' }], qa: [] },
       review: {
         items: [
           { id: 'r1', section: 'summary.mainPoints', itemId: 'k1', state: 'pending' },
           { id: 'r2', section: 'summary.mainPoints', itemId: 'gone', state: 'pending' },
-          { id: 'r3', section: 'summary.mainPoints', itemId: 'a9993e36', state: 'pending' }, // 舊字串條目
-          { id: 'r4', section: 'summary.risks', itemId: 'k9', state: 'pending' }, // 整區都沒了
-          { id: 'r5', section: 'notes.outline', itemId: 'o1', state: 'pending' },
-          { id: 'r6', section: 'notes.outline', itemId: 'o2', state: 'pending' },
-          { id: 'r7', kind: 'term', section: 'transcript', state: 'pending' }, // 不指向條目
+          { id: 'r3', section: 'summary.risks', itemId: 'k9', state: 'confirmed' },
+          { id: 'r4', kind: 'term', section: 'transcript', state: 'pending' },
         ],
       },
     };
-    expect(pendingReview(m).map((r) => r.id)).toEqual(['r1', 'r3', 'r5', 'r7']);
-    expect(pendingCount(m)).toBe(4);
+    expect(pendingReview(m).map((r) => r.id)).toEqual(['r1', 'r2', 'r4']);
+    expect(pendingCount(m)).toBe(3);
+  });
+  it('confirmOnly：口誤等沒有對應條目的項目只能「知道了」；名詞與條目項目可改正／刪除', () => {
+    expect(confirmOnly({ kind: 'slip', section: 'transcript' })).toBe(true);
+    expect(confirmOnly({ kind: 'quote', section: 'transcript' })).toBe(true);
+    expect(confirmOnly({ kind: 'term', section: 'transcript' })).toBe(false);
+    expect(confirmOnly({ kind: 'number', section: 'summary.mainPoints', itemId: 'k1' })).toBe(false);
+    expect(confirmOnly({ kind: 'quote', section: 'notes.outline', itemId: 'o1' })).toBe(false);
   });
   it('srcSegIndex：多支錄音每支 t 從 0 開始 → 用原句在 ±30 秒的候選裡挑；沒原句取檔案順序最前', () => {
     const tr = [
