@@ -130,7 +130,7 @@ def test_result_writes_transcript_and_enqueues_summary(env):
     assert m["progress"]["engine"] == "gpu" and m["error"] is None
     assert jobs.get(jid)["state"] == "done"
     ai = jobs.get(m["aiJobId"])
-    assert ai["kind"] == "ai" and ai["payload"] == {"action": "summary"} and ai["state"] == "queued"
+    assert ai["kind"] == "ai" and ai["payload"] == {"action": "reprocess"} and ai["state"] == "queued"
 
 
 def test_result_bad_body_400(env):

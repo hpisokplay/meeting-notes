@@ -5,6 +5,7 @@ back into the meeting by the server (the frontend just polls the job and refetch
 """
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import os
@@ -19,6 +20,8 @@ from typing import Callable
 from fastapi import APIRouter, Body, HTTPException
 
 from . import prompts as P
+from . import review as R
+from .items import ensure_ids, item_text, normalize_item, normalize_src
 from .storage import BadId, Store
 
 log = logging.getLogger(__name__)
@@ -50,9 +53,18 @@ ASK_CHUNK_CHARS = 50_000
 ABORT_CHECK_S = 1.0              # poll interval while claude runs
 HEARTBEAT_S = 30.0               # job heartbeat while claude runs (requeue_stale is 10 min)
 
-ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate"}
+ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess"}
 LABELS = {"summary": "摘要", "notes": "學習筆記", "ask": "回答問題", "terms": "挑專有名詞",
           "translate": "翻譯"}
+DEFAULT_MODEL = "opus"
+MAX_SRC = 3
+# reprocess progress: (stage, pct, msg) — the frontend shows these sub-steps
+STEP_CORRECTION = ("correction", 3, "名詞校正中")
+STEP_MODE = ("mode", 15, "判斷講座／會議")
+STEP_SUMMARY = ("summary", 25, "整理摘要中")
+STEP_NOTES = ("notes", 50, "整理筆記中")
+STEP_SLIPS = ("slips", 75, "檢查口誤中")
+STEP_VERIFY = ("verify", 92, "驗證中")
 
 
 class ClaudeError(Exception):
@@ -322,7 +334,24 @@ def _clean_anchor(x) -> str:
     return ANCHOR_PREFIX_RE.sub("", _s(x)).strip()
 
 
-def normalize_notes(r) -> dict:
+def normalize_notes(r, keep_src: bool = False) -> dict:
+    """keep_src: also carry each object's src (grounded notes)."""
+    out = _normalize_notes(r)
+    if not keep_src:
+        return out
+    o = r if isinstance(r, dict) else {}
+    for k in P.NOTES_KEYS:
+        raws = [x for x in _a(o.get(k)) if isinstance(x, dict)]
+        # _normalize_notes keeps input order and drops entries without their key field: re-align
+        key = {"outline": "title", "concepts": "term", "tables": "title", "figures": "label", "quiz": "q"}[k]
+        pool = list(raws)
+        for x in out[k]:
+            j = next((i for i, rw in enumerate(pool) if _s(rw.get(key)) == x[key]), None)
+            x["src"] = normalize_src(pool.pop(j).get("src")) if j is not None else []
+    return out
+
+
+def _normalize_notes(r) -> dict:
     o = r if isinstance(r, dict) else {}
     d = lambda x: x if isinstance(x, dict) else {}  # noqa: E731
     tables = []
@@ -395,58 +424,292 @@ def _dedupe(xs):
 class Ctx:
     """What an action needs: the meeting, a Claude caller and a progress reporter."""
 
-    def __init__(self, meeting: dict, call, report, model: str = "sonnet"):
+    def __init__(self, meeting: dict, call, report, model: str = DEFAULT_MODEL, glossary=None):
         self.m = meeting
         self.budget = HAIKU_MAX_CHARS if "haiku" in (model or "").lower() else MAX_CHARS
         self.call = call  # call(system, user, schema) -> dict
-        self.report = report  # report(pct, msg)
+        self.report = report  # report(pct, msg, stage=None)
         self.lines = transcript_lines(meeting.get("transcript"))
+        self.glossary = list(glossary or [])
+
+    def step(self, step, suffix: str = "") -> None:
+        stage, pct, msg = step
+        self.report(pct, msg + suffix, stage)
+
+
+def _optional(fn, what: str):
+    """Run an optional Claude step: retryable errors propagate, a permanent failure is skipped."""
+    try:
+        return fn()
+    except (ClaudeLimitError, ClaudeTransientError, ClaudeAborted):
+        raise
+    except ClaudeError as e:
+        log.warning("optional step %s skipped: %s", what, e)
+        return None
+
+
+def _merge_src(a: list, b: list) -> list:
+    out = list(a)
+    for s in b:
+        if len(out) >= MAX_SRC:
+            break
+        if s not in out:
+            out.append(s)
+    return out
+
+
+def _dedupe_items(items: list[dict]) -> list[dict]:
+    """Same text (whitespace-insensitive) -> one Item; sources merged (at most MAX_SRC)."""
+    out, by = [], {}
+    for it in items:
+        k = re.sub(r"\s+", "", it.get("text") or "")
+        if not k:
+            continue
+        if k in by:
+            by[k]["src"] = _merge_src(by[k]["src"], it.get("src") or [])
+            continue
+        it = {**it, "src": list(it.get("src") or [])[:MAX_SRC]}
+        by[k] = it
+        out.append(it)
+    return out
+
+
+def _first_t(it) -> float:
+    ts = [s["t"] for s in (it.get("src") or []) if isinstance(s.get("t"), (int, float))]
+    return min(ts) if ts else float("inf")
+
+
+def _order_by_group(items: list[dict]) -> list[dict]:
+    """Groups ordered by their earliest item, items by time inside a group (stable otherwise)."""
+    if not any(it.get("group") for it in items):
+        return items
+    first: dict[str, float] = {}
+    for it in items:
+        g = it.get("group") or ""
+        first[g] = min(first.get(g, float("inf")), _first_t(it))
+    order = {g: i for i, g in enumerate(sorted(first, key=lambda g: first[g]))}
+    return sorted(items, key=lambda it: (order[it.get("group") or ""], _first_t(it)))
+
+
+def _items_from(raw) -> list[dict]:
+    return [normalize_item(x) for x in _a(raw) if item_text(x).strip()]
+
+
+def _detect_mode(ctx: Ctx, lines: list[str]) -> str:
+    text = chunk_lines(lines, ctx.budget)[0] if lines else ""
+    r = ctx.call(P.MODE_DETECT, text, P.MODE_SCHEMA)
+    return r.get("mode") if r.get("mode") in R.MODES else "meeting"
+
+
+def _grounded_summary(ctx: Ctx, mode: str, lines: list[str], pct=(25, 50)) -> dict:
+    keys = P.LECTURE_KEYS if mode == "lecture" else P.MEETING_KEYS
+    prompt = P.SUMMARY_LECTURE if mode == "lecture" else P.SUMMARY_MEETING
+    schema = P.SUMMARY_LECTURE_SCHEMA if mode == "lecture" else P.SUMMARY_MEETING_SCHEMA
+    chunks = chunk_lines(lines, ctx.budget)
+    acc: dict[str, list] = {k: [] for k in keys}
+    for i, text in enumerate(chunks):
+        if len(chunks) > 1:
+            ctx.report(pct[0] + (pct[1] - pct[0]) * i // len(chunks),
+                       f"整理摘要中（第 {i + 1}/{len(chunks)} 段）", "summary")
+        r = ctx.call(prompt, text, schema)
+        for k in keys:
+            acc[k] += _items_from(r.get(k))
+    out = {k: ensure_ids(_dedupe_items(v)) for k, v in acc.items()}
+    out["mainPoints"] = _order_by_group(out["mainPoints"])
+    return out
+
+
+def _has_notes(m: dict) -> bool:
+    n = m.get("notes")
+    return isinstance(n, dict) and any(_a(n.get(k)) for k in P.NOTES_KEYS)
+
+
+def _grounded_notes(ctx: Ctx, lines: list[str], pct=(50, 75)) -> dict:
+    chunks = chunk_lines(lines, ctx.budget)
+    parts = []
+    for i, text in enumerate(chunks):
+        if len(chunks) > 1:
+            ctx.report(pct[0] + (pct[1] - pct[0]) * i // len(chunks),
+                       f"整理筆記中（第 {i + 1}/{len(chunks)} 段）", "notes")
+        parts.append(normalize_notes(ctx.call(P.NOTES, text, P.NOTES_SRC_SCHEMA), keep_src=True))
+    return {k: ensure_ids(dedupe_notes_items(k, [x for p in parts for x in p[k]]), notes=True)
+            for k in P.NOTES_KEYS}
+
+
+def _backup(m: dict, area: str, keys) -> None:
+    """Old summary / notes lists -> alt["<area>:<key>"] (flat keys) before an overwrite."""
+    old = m.get(area) if isinstance(m.get(area), dict) else {}
+    keys = [k for k in old if isinstance(old.get(k), list)] if keys is None else keys
+    if any(_a(old.get(k)) for k in keys):
+        alt = m.setdefault("alt", {})
+        for k in keys:
+            if isinstance(old.get(k), list):
+                alt[f"{area}:{k}"] = list(old[k])
+
+
+def _reverify(m: dict, ctx: Ctx, slips=None) -> None:
+    """Re-anchor sources and rebuild meeting.review (slips: regenerated slip list, or None to keep)."""
+    R.relocate_meeting_src(m)
+    extra = None
+    if slips is not None:
+        extra = R.slip_items(slips, R.TranscriptIndex(m.get("transcript"), m.get("durationSec")))
+    m["review"] = R.verify_review(m, ctx.glossary, extra, replace_slips=slips is not None)
 
 
 def _summary(ctx: Ctx, payload):
-    chunks = chunk_lines(ctx.lines, ctx.budget)
-    acc = {"actionItems": [], "mainPoints": [], "qa": []}
-    for i, text in enumerate(chunks):
-        ctx.report(5 + 90 * i // len(chunks), "Claude 摘要中…" if len(chunks) == 1
-                   else f"Claude 摘要中…（第 {i + 1}/{len(chunks)} 段）")
-        r = ctx.call(P.SUMMARY_PROMPT, text, P.SUMMARY_SCHEMA)
-        for k in acc:
-            acc[k] += [x for x in _a(r.get(k)) if isinstance(x, str) and x.strip()]
-    summary = {k: _dedupe(v) for k, v in acc.items()}
+    """Grounded, mode-aware summary (manual 「摘要」 button) + verification. No term correction."""
+    mode = ctx.m.get("mode") if ctx.m.get("mode") in R.MODES else None
+    if mode is None:
+        ctx.step(STEP_MODE)
+        mode = _detect_mode(ctx, ctx.lines)
+    ctx.step(STEP_SUMMARY)
+    summary = _grounded_summary(ctx, mode, ctx.lines, (25, 90))
+    ctx.step(STEP_VERIFY)
 
     def apply(m):
-        old = m.get("summary") if isinstance(m.get("summary"), dict) else {}
-        if any(_a(old.get(k)) for k in acc):
-            alt = m.setdefault("alt", {})
-            for k in acc:
-                alt[f"summary:{k}"] = list(_a(old.get(k)))
+        _backup(m, "summary", None)
+        m["mode"] = mode
         m["summary"] = summary
         m["translations"] = {}
         m["error"] = None  # any successful summary clears an old (e.g. failed-summary) error
+        _reverify(m, ctx)
     return apply
+
+
+def _reprocess(ctx: Ctx, payload):
+    """correction -> mode -> summary -> notes (if any) -> slips -> verify; one write at the end."""
+    m0 = ctx.m
+    fp = _fingerprint(m0.get("transcript"))
+    transcript = copy.deepcopy(m0.get("transcript") or [])
+    corrections = None
+    if payload.get("correction", True):
+        ctx.step(STEP_CORRECTION)
+
+        def correct():
+            got = []
+            for text in chunk_lines(transcript_lines(transcript), ctx.budget):
+                r = ctx.call(P.CORRECTION, P.correction_user_message(text, ctx.glossary), P.CORRECTION_SCHEMA)
+                got += _a(r.get("items"))
+            return got
+        proposals = _optional(correct, "correction")
+        if proposals is not None:
+            transcript, corrections = R.merge_corrections(m0.get("corrections"), proposals, transcript)
+    lines = transcript_lines(transcript)
+    mode = m0.get("mode") if m0.get("mode") in R.MODES else None
+    if mode is None:
+        ctx.step(STEP_MODE)
+        mode = _detect_mode(ctx, lines)
+    ctx.step(STEP_SUMMARY)
+    summary = _grounded_summary(ctx, mode, lines)
+    notes = None
+    if _has_notes(m0):
+        ctx.step(STEP_NOTES)
+        notes = _grounded_notes(ctx, lines)
+    slips = None
+    if payload.get("slips", True):
+        ctx.step(STEP_SLIPS)
+        slips = _optional(lambda: [x for text in chunk_lines(lines, ctx.budget)
+                                   for x in _a(ctx.call(P.SLIPS, text, P.SLIPS_SCHEMA).get("items"))], "slips")
+    ctx.step(STEP_VERIFY)
+
+    def apply(m):
+        if _fingerprint(m.get("transcript")) != fp:
+            raise ClaudeError("逐字稿在整理期間被修改，請再按一次「重新整理」")
+        if not (isinstance(m.get("transcriptRaw"), list) and m["transcriptRaw"]):
+            m["transcriptRaw"] = copy.deepcopy(m.get("transcript") or [])
+        m["transcript"] = transcript
+        if corrections is not None:
+            m["corrections"] = corrections
+        m["mode"] = mode
+        _backup(m, "summary", None)
+        m["summary"] = summary
+        if notes is not None:
+            _backup(m, "notes", list(P.NOTES_KEYS))
+            m["notes"] = {**notes, "generatedAt": int(time.time() * 1000)}
+        m["translations"] = {}
+        m["error"] = None
+        _reverify(m, ctx, slips)
+    return apply
+
+
+def _numbered_with_quotes(items: list[dict]) -> str:
+    out = []
+    for i, it in enumerate(items):
+        q = "／".join(s.get("quote") or "" for s in it.get("src") or [] if s.get("quote"))
+        out.append(f"{i + 1}. {it['text']}" + (f"\n   原句：{q}" if q else ""))
+    return "\n".join(out)
+
+
+def assemble_polished_items(polished, raws: list[dict], cap: int, honor_drop: bool) -> dict:
+    """assemble_polished for Items: an output's src = union of the covered raw items' sources."""
+    n = len(raws)
+    covered: set[int] = set()
+    outs, dropped = [], 0
+    for it in polished or []:
+        it = it if isinstance(it, dict) else {}
+        is_drop = honor_drop and it.get("drop") is True
+        text = it["text"].strip() if isinstance(it.get("text"), str) else ""
+        if not is_drop and not text:
+            continue
+        src = []
+        for x in it.get("src") if isinstance(it.get("src"), list) else []:
+            try:
+                x = int(float(x))
+            except (TypeError, ValueError):
+                continue
+            if 1 <= x <= n and x not in covered and x not in src:
+                src.append(x)
+        if not src:
+            continue
+        if is_drop:
+            covered.update(src)
+            dropped += len(src)
+            continue
+        if len(src) > cap:
+            for x in src:
+                covered.add(x)
+                outs.append((x, raws[x - 1]))
+            continue
+        covered.update(src)
+        merged: list = []
+        for x in sorted(src):
+            merged = _merge_src(merged, raws[x - 1].get("src") or [])
+        new = {"text": text, "src": merged}
+        g = _s(it.get("group")) or next((raws[x - 1].get("group") for x in src if raws[x - 1].get("group")), "")
+        if g:
+            new["group"] = g
+        outs.append((min(src), new))
+    for x in range(1, n + 1):
+        if x not in covered:
+            outs.append((x, raws[x - 1]))
+    outs.sort(key=lambda o: o[0])
+    return {"list": [normalize_item(t) for _, t in outs], "dropped": dropped}
 
 
 def _enhance(ctx: Ctx, payload):
     section = payload["section"]
-    meta = P.SECTION_META[section]
+    meta = P.SECTION_META_SRC[section]
+    old_meta = P.SECTION_META.get(section, {})
     batches = chunk_lines(ctx.lines, ENHANCE_BATCH_CHARS)
-    all_: list[str] = []
+    all_: list[dict] = []
     for i, text in enumerate(batches):
         ctx.report(5 + 70 * i // len(batches), f"Claude 加強{meta['label']}中…（{i + 1}/{len(batches)}）")
-        r = ctx.call(P.enhance_prompt(meta), text, P.ITEMS_SCHEMA)
-        all_ += [x.strip() for x in _a(r.get("items")) if isinstance(x, str) and x.strip()]
+        r = ctx.call(P.enhance_src_prompt(section), text, P.ITEMS_SRC_SCHEMA)
+        all_ += _items_from(r.get("items"))
     items = all_
     if all_:
         ctx.report(80, f"Claude 整理潤飾{meta['label']}中…")
-        r = ctx.call(P.polish_prompt(meta, len(all_)),
-                     "\n".join(f"{i + 1}. {s}" for i, s in enumerate(all_)), P.POLISH_SCHEMA)
+        r = ctx.call(P.polish_src_prompt(section, len(all_)), _numbered_with_quotes(all_), P.POLISH_SRC_SCHEMA)
         if not isinstance(r.get("items"), list):
             raise ClaudeError(f"整理{meta['label']}後結果為空，請重試")
-        cap = meta.get("cap") or P.MERGE_CAP
-        built = assemble_polished(r["items"], all_, cap, bool(meta.get("allowDrop")))
+        cap = old_meta.get("cap") or P.MERGE_CAP
+        built = assemble_polished_items(r["items"], all_, cap, bool(old_meta.get("allowDrop")))
         if built["dropped"] > max(2, len(all_) * 0.4) or not built["list"]:
-            built = assemble_polished(r["items"], all_, cap, False)
+            built = assemble_polished_items(r["items"], all_, cap, False)
         items = built["list"]
+    items = ensure_ids(items)
+    if section == "mainPoints":
+        items = _order_by_group(items)
 
     def apply(m):
         box = m["summary"] if isinstance(m.get("summary"), dict) else {}
@@ -454,26 +717,19 @@ def _enhance(ctx: Ctx, payload):
         box[section] = items
         m["summary"] = box
         m["translations"] = {}
+        _reverify(m, ctx)
     return apply
 
 
 def _notes(ctx: Ctx, payload):
-    chunks = chunk_lines(ctx.lines, ctx.budget)
-    parts = []
-    for i, text in enumerate(chunks):
-        ctx.report(5 + 90 * i // len(chunks), "Claude 整理學習筆記中…" if len(chunks) == 1
-                   else f"Claude 整理學習筆記中…（第 {i + 1}/{len(chunks)} 段）")
-        parts.append(normalize_notes(ctx.call(P.NOTES_PROMPT, text, P.NOTES_SCHEMA)))
-    notes = {k: dedupe_notes_items(k, [x for p in parts for x in p[k]]) for k in P.NOTES_KEYS}
+    ctx.report(5, "Claude 整理學習筆記中…", "notes")
+    notes = _grounded_notes(ctx, ctx.lines, (5, 90))
 
     def apply(m):
-        old = m.get("notes") if isinstance(m.get("notes"), dict) else {}
-        if any(_a(old.get(k)) for k in P.NOTES_KEYS):
-            alt = m.setdefault("alt", {})
-            for k in P.NOTES_KEYS:
-                alt[f"notes:{k}"] = list(_a(old.get(k)))
+        _backup(m, "notes", list(P.NOTES_KEYS))
         m["notes"] = {**notes, "generatedAt": int(time.time() * 1000)}
         m["translations"] = {}
+        _reverify(m, ctx)
     return apply
 
 
@@ -484,9 +740,9 @@ def _notes_enhance(ctx: Ctx, payload):
     all_ = []
     for i, text in enumerate(batches):
         ctx.report(5 + 90 * i // len(batches), f"Claude 加強{meta['label']}中…（{i + 1}/{len(batches)}）")
-        r = ctx.call(P.notes_enhance_prompt(section), text, P.notes_section_schema(section))
-        all_ += normalize_notes({section: r.get(section)})[section]
-    items = dedupe_notes_items(section, all_)
+        r = ctx.call(P.notes_src_enhance_prompt(section), text, P.notes_src_section_schema(section))
+        all_ += normalize_notes({section: r.get(section)}, keep_src=True)[section]
+    items = ensure_ids(dedupe_notes_items(section, all_), notes=True)
 
     def apply(m):
         box = m["notes"] if isinstance(m.get("notes"), dict) else {k: [] for k in P.NOTES_KEYS}
@@ -494,14 +750,25 @@ def _notes_enhance(ctx: Ctx, payload):
         box[section] = items
         m["notes"] = box
         m["translations"] = {}
+        _reverify(m, ctx)
     return apply
+
+
+def _flat_summary(s) -> dict:
+    """Any summary (legacy strings / Items, meeting or lecture) -> {actionItems, mainPoints} texts."""
+    s = s if isinstance(s, dict) else {}
+    t = lambda k: [item_text(x) for x in _a(s.get(k)) if item_text(x).strip()]  # noqa: E731
+    return {"actionItems": t("actionItems"),
+            "mainPoints": t("conclusions") + t("advice") + t("risks") + t("cases")
+            + (t("mainPoints") or t("keyPoints"))}
 
 
 def _ask(ctx: Ctx, payload):
     q = payload["question"].strip()
     ctx.report(10, "Claude 思考回答中…")
     text = pick_relevant(ctx.lines, q, budget=ctx.budget)
-    r = ctx.call(P.ASK_PROMPT, P.ask_user_message(ctx.m.get("summary"), text, q), P.ANSWER_SCHEMA)
+    r = ctx.call(P.ASK_PROMPT, P.ask_user_message(_flat_summary(ctx.m.get("summary")), text, q),
+                 P.ANSWER_SCHEMA)
     a = _s(r.get("answer"))
     if not a:
         raise ClaudeError("未取得回答，請重試。")
@@ -564,14 +831,19 @@ def _translate(ctx: Ctx, payload):
     fp = _fingerprint(m0.get("transcript"))
     s = m0.get("summary") if isinstance(m0.get("summary"), dict) else {}
     ctx.report(5, "Claude 翻譯摘要中…")
-    src_sum = {"actionItems": _a(s.get("actionItems")), "mainPoints": _a(s.get("mainPoints") or s.get("keyPoints")),
-               "qa": _a(s.get("qa"))}
-    r = ctx.call(system, json.dumps(src_sum, ensure_ascii=False), P.SUMMARY_SCHEMA)
-    out = {"summary": {k: _a(r.get(k)) for k in ("actionItems", "mainPoints", "qa")}}
+    keys = P.LECTURE_KEYS if m0.get("mode") == "lecture" else ("actionItems", "mainPoints", "qa")
+    # texts only (Items carry ids / sources the translation must not touch)
+    src_sum = {k: [x if isinstance(x, str) else item_text(x)
+                   for x in _a(s.get(k) or (s.get("keyPoints") if k == "mainPoints" else None))] for k in keys}
+    schema = {"type": "object", "properties": {k: {"type": "array", "items": {"type": "string"}} for k in keys},
+              "required": list(keys)}
+    r = ctx.call(system, json.dumps(src_sum, ensure_ascii=False), schema)
+    out = {"summary": {k: _a(r.get(k)) for k in keys}}
     notes = m0.get("notes") if isinstance(m0.get("notes"), dict) else None
     if notes and any(_a(notes.get(k)) for k in P.NOTES_KEYS):
         ctx.report(10, "Claude 翻譯學習筆記中…")
-        src = {k: _a(notes.get(k)) for k in P.NOTES_KEYS}
+        src = {k: [{f: v for f, v in x.items() if f not in ("id", "src")} if isinstance(x, dict) else x
+                   for x in _a(notes.get(k))] for k in P.NOTES_KEYS}
         out["notes"] = normalize_notes(ctx.call(system, json.dumps(src, ensure_ascii=False), P.NOTES_SCHEMA))
     segs = [x for x in _a(m0.get("transcript")) if isinstance(x, dict)]
     batches, cur, size = [], [], 0
@@ -614,7 +886,7 @@ def _translate(ctx: Ctx, payload):
 
 
 HANDLERS = {"summary": _summary, "enhance": _enhance, "notes": _notes, "notes_enhance": _notes_enhance,
-            "ask": _ask, "terms": _terms, "translate": _translate}
+            "ask": _ask, "terms": _terms, "translate": _translate, "reprocess": _reprocess}
 
 
 # ---------------------------------------------------------------- job handling
@@ -654,20 +926,23 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
     jid, mid = job["id"], job.get("meeting")
     payload = job.get("payload") or {}
     action = payload.get("action")
-    model = model or store.get_settings().get("claudeModel") or "sonnet"
-    state = {"pct": 0, "msg": "", "beat": time.monotonic(), "check": 0.0, "gone": False}
+    settings = store.get_settings()
+    model = model or settings.get("claudeModel") or DEFAULT_MODEL
+    glossary = store.glossary_list()
+    state = {"pct": 0, "msg": "", "stage": "claude", "beat": time.monotonic(), "check": 0.0, "gone": False}
     m = store.get(mid) if mid else None
     pipeline = bool(m) and _is_pipeline_summary(m, jid)
 
-    def report(pct, msg):
-        state.update(pct=pct, msg=msg)
-        if jobs.progress(jid, "claude", pct, msg) is None:
+    def report(pct, msg, stage=None):
+        stage = stage or "claude"
+        state.update(pct=pct, msg=msg, stage=stage)
+        if jobs.progress(jid, stage, pct, msg) is None:
             state["gone"] = True
         state["beat"] = time.monotonic()
         if pipeline:
             def ap(mm):
                 if _is_pipeline_summary(mm, jid):
-                    mm["progress"] = {"stage": "claude", "pct": pct, "msg": msg,
+                    mm["progress"] = {"stage": stage, "pct": pct, "msg": msg, "action": action,
                                       "engine": (mm.get("progress") or {}).get("engine", "")}
             try:
                 store.update(mid, ap)
@@ -680,7 +955,7 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
             return True
         if now - state["beat"] >= HEARTBEAT_S:
             state["beat"] = now
-            if jobs.progress(jid, "claude", state["pct"], state["msg"]) is None:
+            if jobs.progress(jid, state["stage"], state["pct"], state["msg"]) is None:
                 state["gone"] = True
         elif now - state["check"] >= ABORT_CHECK_S:
             state["check"] = now
@@ -700,8 +975,9 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
         handler = HANDLERS.get(action)
         if handler is None:
             raise ClaudeError(f"未知的 AI 動作：{action}")
-        report(0, f"Claude {LABELS.get(action, '處理')}中…" if action in LABELS else "Claude 處理中…")
-        apply = handler(Ctx(m, call, report, model), payload)
+        if action != "reprocess":  # reprocess reports its own sub-steps right away
+            report(0, f"Claude {LABELS.get(action, '處理')}中…" if action in LABELS else "Claude 處理中…")
+        apply = handler(Ctx(m, call, report, model, glossary), payload)
         if abort():
             raise ClaudeAborted("已取消")
 
@@ -712,7 +988,7 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
             if j is None or j.get("state") != "running":
                 raise ClaudeAborted("已取消")
             apply(mm)
-            if action == "summary" and _is_pipeline_summary(mm, jid):
+            if _is_pipeline_summary(mm, jid):
                 mm["status"] = "done"
                 mm["error"] = None
                 mm["progress"] = {"stage": "done", "pct": 100, "msg": "",
@@ -748,8 +1024,9 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
 def report_limit(store: Store, mid: str, jid: str, msg: str = LIMIT_MSG) -> None:
     def ap(m):
         if _is_pipeline_summary(m, jid):
-            m["progress"] = {"stage": "claude", "pct": 0, "msg": msg,
-                             "engine": (m.get("progress") or {}).get("engine", "")}
+            old = m.get("progress") or {}
+            m["progress"] = {"stage": old.get("stage") or "claude", "pct": 0, "msg": msg,
+                             "action": old.get("action"), "engine": old.get("engine", "")}
     try:
         store.update(mid, ap)
     except (KeyError, BadId):
@@ -795,7 +1072,7 @@ def build_ai_router(store: Store, get_jobs) -> APIRouter:
             raise HTTPException(400, "未知的 AI 動作")
         payload = {"action": action}
         if action == "enhance":
-            if body.get("section") not in P.SECTION_META:
+            if body.get("section") not in P.SECTION_META_SRC:
                 raise HTTPException(400, "未知的區塊")
             payload["section"] = body["section"]
         elif action == "notes_enhance":
@@ -819,6 +1096,8 @@ def build_ai_router(store: Store, get_jobs) -> APIRouter:
             raise HTTPException(404, "找不到這場會議")
         if not (isinstance(m.get("transcript"), list) and m["transcript"]):
             raise HTTPException(400, "這場沒有逐字稿，無法使用 AI 功能")
+        if action == "reprocess":  # pipeline job: status "summarizing" + aiJobId, like after transcription
+            return R.start_reprocess(store, get_jobs(), mid)
         return {"jobId": get_jobs().enqueue("ai", mid, payload)}
 
     return r

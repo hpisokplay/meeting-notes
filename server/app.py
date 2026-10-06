@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .ai import AIThread, build_ai_router, on_ai_job_terminal
 from .importer import build_router as build_import_router
+from .review import build_review_router
 from .jobs import JobQueue, build_jobs_router, load_worker_key
 from . import notify as tg_notify
 from .storage import BadId, Store, read_json
@@ -23,7 +24,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 STATIC_FILES = {"index.html", "sw.js", "manifest.webmanifest"}
 STATIC_DIRS = {"css", "js", "icons"}
 # owned by the server (job pipeline): a client PUT never changes them
-SERVER_OWNED = ("status", "progress", "jobId", "aiJobId", "audio", "error")
+SERVER_OWNED = ("status", "progress", "jobId", "aiJobId", "audio", "error",
+                "transcriptRaw", "corrections", "review", "mode")
 
 
 def _guard(fn):
@@ -148,6 +150,7 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
                                          worker_key if worker_key is not None else load_worker_key()))
     app.include_router(build_ai_router(store, lambda: app.state.jobs))
     app.include_router(build_import_router(store))
+    app.include_router(build_review_router(store, lambda: app.state.jobs))
     # cancelled / permanently failed pipeline summary -> meeting back to "done"
     if hasattr(app.state.jobs, "add_terminal_listener"):
         app.state.jobs.add_terminal_listener(lambda job, state: on_ai_job_terminal(store, job, state))

@@ -5,6 +5,7 @@ Model cache location is controlled by the HF_HOME env var (set in the container)
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import os
 import shutil
@@ -37,6 +38,7 @@ Transcriber = Callable[[list, Progress], "dict | None"]
 # realtime) stays inside the 600 s stale-requeue timeout even without the keepalive thread.
 WINDOW_S = 5 * 60
 OVERLAP_S = 2
+GLOSSARY_HINT_CHARS = 200  # initial_prompt budget (Whisper prompt tokens are limited)
 KEEPALIVE_S = 60.0  # job heartbeat re-post interval while the transcriber is busy
 
 
@@ -81,13 +83,28 @@ def _model():
     return _MODEL
 
 
-def _run_model(audio):
-    """-> [(start_sec_in_window, text)] (Traditional Chinese)."""
+def glossary_hint(glossary, limit: int = GLOSSARY_HINT_CHARS) -> str | None:
+    """Glossary terms as a short Whisper initial_prompt (<= limit chars), or None."""
+    out = ""
+    for g in glossary or []:
+        g = str(g).strip()
+        if not g:
+            continue
+        nxt = f"{out}、{g}" if out else g
+        if len(nxt) > limit:
+            break
+        out = nxt
+    return out or None
+
+
+def _run_model(audio, prompt: str | None = None):
+    """-> [(start_sec_in_window, text)] (Traditional Chinese). prompt: glossary initial_prompt."""
     global _CC
     if _CC is None:
         from opencc import OpenCC
         _CC = OpenCC("s2twp")
-    segs, _info = _model().transcribe(audio, language="zh", beam_size=1, vad_filter=True)
+    kw = {"initial_prompt": prompt} if prompt else {}
+    segs, _info = _model().transcribe(audio, language="zh", beam_size=1, vad_filter=True, **kw)
     # lazy: faster-whisper decodes as the generator is consumed, so a cancel can stop mid-window
     return ((float(sg.start), _CC.convert((sg.text or "").strip())) for sg in segs)
 
@@ -138,8 +155,16 @@ def transcribe_windows(paths: list, progress: Progress, probe=probe_duration, de
     return {"segments": out, "durationSec": round(total if known else done, 1), "engine": ENGINE}
 
 
-def whisper_transcribe(paths: list, progress: Progress):
-    return transcribe_windows(paths, progress)
+def whisper_transcribe(paths: list, progress: Progress, glossary=None):
+    hint = glossary_hint(glossary)
+    return transcribe_windows(paths, progress, run_model=lambda audio: _run_model(audio, hint))
+
+
+def _accepts_glossary(fn) -> bool:
+    try:
+        return "glossary" in inspect.signature(fn).parameters
+    except (TypeError, ValueError):
+        return False
 
 
 class FallbackThread(threading.Thread):
@@ -227,7 +252,11 @@ class FallbackThread(threading.Thread):
             paths = [self.store.path("audio", job["meeting"], a["file"]) for a in m.get("audio") or []]
             if not paths:
                 raise RuntimeError("這場會議沒有錄音檔")
-            result = self.transcriber(paths, progress)
+            glossary = (job.get("payload") or {}).get("glossary")
+            if _accepts_glossary(self.transcriber):
+                result = self.transcriber(paths, progress, glossary=glossary)
+            else:
+                result = self.transcriber(paths, progress)
             if result is None:
                 log.info("fallback job %s stopped (cancelled)", jid)
                 return

@@ -15,8 +15,27 @@ from .render import meeting_to_docx, meeting_to_markdown
 
 log = logging.getLogger(__name__)
 
-DEFAULT_SETTINGS = {"claudeModel": "sonnet", "fallbackEnabled": True,
-                    "fallbackMinutes": 20, "tgNotify": True}
+NL = chr(10)
+# Domain glossary (轉錄詞庫): Whisper hotwords at ASR time, reference for CORRECTION, name source
+# for verify. settings.glossary is a newline-separated string; this is its default.
+DEFAULT_GLOSSARY = [
+    # 稅務
+    "股利", "股利所得", "分離課稅", "綜合所得稅", "最低稅負", "基本所得額", "贈與稅", "遺產稅",
+    "房地合一", "實質課稅", "實質課稅原則", "納保法", "境外資金匯回專法", "受控外國公司", "CFC",
+    "實際管理處所", "PEM", "稅務居民", "非稅務居民", "183天", "海外所得", "營利事業所得稅",
+    "未分配盈餘", "全球最低稅負制", "國稅局", "財政部", "賦稅署", "會計師",
+    # 財富管理／金融
+    "複委託", "ETF", "OBU", "DBU", "CRS", "共同申報準則", "BVI", "英屬維京群島", "開曼", "開曼群島",
+    "境外公司", "控股公司", "信託", "保險", "保單", "家族辦公室", "亞洲資產管理中心", "美股", "台股",
+    "美元", "新台幣", "債券", "基金",
+    # 半導體／光通訊
+    "輝達", "台積電", "日月光", "晶圓", "先進封裝", "CoWoS", "400G", "800G", "1.6T", "CPO", "NPO",
+    "Pluggable", "光模組", "矽光子", "Turnkey", "Pilot line", "無塵室", "良率", "產能",
+]
+DEFAULT_SETTINGS = {"claudeModel": "opus", "fallbackEnabled": True,
+                    "fallbackMinutes": 20, "tgNotify": True,
+                    "glossary": NL.join(DEFAULT_GLOSSARY)}
+OLD_DEFAULT_MODEL = "sonnet"
 LIST_FIELDS = ("id", "title", "createdAt", "updatedAt", "group", "durationSec", "status", "progress")
 
 
@@ -160,12 +179,42 @@ class Store:
         atomic_write_json(self.path("groups.json"), groups)
 
     def get_settings(self) -> dict:
+        """Defaults + saved settings. One-time migration: a saved claudeModel still equal to the old
+        default "sonnet" becomes "opus" (flag modelMigrated, so a later explicit choice sticks)."""
+        p = self.path("settings.json")
+        raw = read_json(p, {}) or {}
+        if not raw.get("modelMigrated"):
+            if raw.get("claudeModel") in (None, OLD_DEFAULT_MODEL):
+                raw.pop("claudeModel", None)
+            raw["modelMigrated"] = True
+            if p.exists():
+                try:
+                    atomic_write_json(p, raw)
+                except OSError:
+                    log.exception("settings migration write failed")
         s = dict(DEFAULT_SETTINGS)
-        s.update(read_json(self.path("settings.json"), {}) or {})
+        s.update(raw)
+        if not isinstance(s.get("glossary"), str):
+            g = s.get("glossary")
+            s["glossary"] = NL.join(str(x) for x in g) if isinstance(g, list) else DEFAULT_SETTINGS["glossary"]
         return s
 
     def set_settings(self, patch: dict) -> dict:
         s = self.get_settings()
-        s.update({k: v for k, v in patch.items() if k in DEFAULT_SETTINGS})
+        patch = {k: v for k, v in patch.items() if k in DEFAULT_SETTINGS}
+        if "glossary" in patch:
+            g = patch["glossary"]
+            if isinstance(g, list):
+                g = NL.join(str(x) for x in g)
+            if not isinstance(g, str):
+                patch.pop("glossary")
+            else:
+                patch["glossary"] = NL.join(x.strip() for x in g.splitlines() if x.strip())
+        s.update(patch)
         atomic_write_json(self.path("settings.json"), s)
         return s
+
+    def glossary_list(self) -> list[str]:
+        """settings.glossary as a list (one term per line, blanks dropped)."""
+        g = self.get_settings().get("glossary")
+        return [x.strip() for x in (g or "").splitlines() if x.strip()]

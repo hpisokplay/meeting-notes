@@ -117,8 +117,11 @@ def test_summary_written_and_status_done(sj):
     mk(store, status="summarizing", aiJobId=jid, summary={})
     handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
     m = store.get("m1")
-    assert m["summary"] == {"actionItems": ["新待辦 [DRI: 待指派]"], "mainPoints": ["新重點：說明"],
-                            "qa": ["問：新問題？ 答：新答案。"]}
+    texts = {k: [x["text"] for x in v] for k, v in m["summary"].items()}
+    assert texts == {"actionItems": ["新待辦 [DRI: 說話者 1]"], "mainPoints": ["新重點：說明"],
+                     "qa": ["問：新問題？\n答：新答案。"]}
+    assert m["summary"]["mainPoints"][0]["src"] == [{"t": 3725.0, "quote": "我們談台積店的案子"}]
+    assert m["mode"] == "meeting" and isinstance(m["review"]["items"], list)
     assert m["status"] == "done" and m["progress"]["pct"] == 100
     assert m["translations"] == {}
     j = jobs.get(jid)
@@ -141,7 +144,8 @@ def test_enhance_backs_up_old_section(sj):
     run_job(store, jobs, "enhance", section="qa")
     m = store.get("m1")
     assert m["alt"]["summary:qa"] == ["問：舊 答：舊"]
-    assert m["summary"]["qa"] == ["潤飾1", "潤飾2"]
+    assert [x["text"] for x in m["summary"]["qa"]] == ["潤飾1", "潤飾2"]
+    assert m["summary"]["qa"][0]["src"] == [{"t": 3725.0, "quote": "我們談台積店的案子"}]
     assert m["summary"]["actionItems"] == ["舊待辦"]
     assert m["translations"] == {}
 
@@ -199,12 +203,15 @@ def test_notes_and_notes_enhance(sj):
     mk(store)
     run_job(store, jobs, "notes")
     n = store.get("m1")["notes"]
-    assert n["outline"] == [{"title": "第一節主題", "anchor": "第一句", "points": ["要點"]}]
+    src = [{"t": 3725.0, "quote": "我們談台積店的案子"}]
+    o = dict(n["outline"][0])
+    assert len(o.pop("id")) == 8
+    assert o == {"title": "第一節主題", "anchor": "第一句", "points": ["要點"], "src": src}
     assert n["tables"][0]["rows"] == [["1", "2"]] and isinstance(n["generatedAt"], int)
     run_job(store, jobs, "notes_enhance", section="quiz")
     m = store.get("m1")
-    assert m["alt"]["notes:quiz"] == [{"q": "題目？", "a": "答案"}]
-    assert m["notes"]["quiz"] == [{"q": "題目？", "a": "答案"}]
+    assert [(x["q"], x["src"]) for x in m["alt"]["notes:quiz"]] == [("題目？", src)]
+    assert [(x["q"], x["a"], x["src"]) for x in m["notes"]["quiz"]] == [("題目？", "答案", src)]
     assert m["notes"]["outline"] == n["outline"]
 
 
@@ -240,9 +247,13 @@ def test_long_transcript_is_chunked_for_summary(sj, monkeypatch, tmp_path):
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
     mk(store)
     run_job(store, jobs, "summary")
-    calls = log.read_text(encoding="utf-8").splitlines()
-    assert len(calls) == 3  # one per chunk
-    assert store.get("m1")["summary"]["actionItems"] == ["新待辦 [DRI: 待指派]"]  # deduped merge
+    calls = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines()]
+    schemas = [json.loads(c["argv"][c["argv"].index("--json-schema") + 1]) for c in calls]
+    assert sum("actionItems" in s["properties"] for s in schemas) == 3  # one per chunk
+    assert sum("mode" in s["properties"] for s in schemas) == 1  # mode detected once
+    ai_ = store.get("m1")["summary"]["actionItems"]
+    assert [x["text"] for x in ai_] == ["新待辦 [DRI: 說話者 1]"]  # deduped merge
+    assert len(ai_[0]["src"]) == 2  # sources merged (the middle line has no time)
 
 
 def test_ask_long_transcript_picks_relevant_chunks():

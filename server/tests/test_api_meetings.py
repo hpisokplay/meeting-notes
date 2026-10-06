@@ -29,15 +29,15 @@ def test_api_groups_roundtrip(client):
 
 
 def test_settings_roundtrip(client):
+    assert client.get("/api/settings").json()["claudeModel"] == "opus"  # new default (2026-10-06)
+    client.put("/api/settings", json={"claudeModel": "sonnet"})
     assert client.get("/api/settings").json()["claudeModel"] == "sonnet"
-    client.put("/api/settings", json={"claudeModel": "opus"})
-    assert client.get("/api/settings").json()["claudeModel"] == "opus"
 
 
 def test_status_shape(client, data_dir):
     s = client.get("/api/status").json()
     assert s["version"] == "v100" and s["worker"]["online"] is False
-    assert s["queue"] == 0 and s["claudeModel"] == "sonnet"
+    assert s["queue"] == 0 and s["claudeModel"] == "opus"
     assert isinstance(s["diskFreeGB"], (int, float))
     (data_dir / "jobs" / "queue").mkdir(parents=True)
     (data_dir / "jobs" / "worker.json").write_text(json.dumps({"lastSeen": time.time()}))

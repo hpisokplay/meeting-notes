@@ -283,14 +283,19 @@ def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dic
     ai_jid = None
     try:
         if mid and store.get(mid) is not None:
-            ai_jid = jobs.enqueue("ai", mid, {"action": "summary"})
+            # term correction -> mode -> grounded summary (-> notes) -> slips -> verify
+            ai_jid = jobs.enqueue("ai", mid, {"action": "reprocess"})
 
             def apply(m):
                 m["transcript"] = segments
+                # a new transcription is a new raw text: old raw / corrections no longer apply
+                m.pop("transcriptRaw", None)
+                m.pop("corrections", None)
                 if dur is not None:
                     m["durationSec"] = dur
                 m["status"] = "summarizing"
-                m["progress"] = {"stage": "summarizing", "pct": 0, "msg": "", "engine": engine}
+                m["progress"] = {"stage": "summarizing", "pct": 0, "msg": "", "engine": engine,
+                                 "action": "reprocess"}
                 m["error"] = None
                 m["aiJobId"] = ai_jid
             if not update_meeting_if_job(store, job, apply):
@@ -429,6 +434,7 @@ def build_jobs_router(store: Store, get_jobs, worker_key) -> APIRouter:
             raise HTTPException(404, "找不到這個工作")
         return {"id": job["id"], "kind": job.get("kind"), "meeting": job.get("meeting"),
                 "state": job.get("state"), "progress": job.get("progress"),
+                "action": (job.get("payload") or {}).get("action"),
                 "error": job.get("error")}
 
     @r.post("/jobs/{jid}/cancel")

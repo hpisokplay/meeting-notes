@@ -113,7 +113,7 @@ def create_meeting(store: Store, jobs, files: list, title=None, group=None) -> d
         if not title:
             title = os.path.splitext(audio[0]["name"])[0] if audio else "新會議"
         durs = [a["durationSec"] for a in audio]
-        jid = jobs.enqueue("transcribe", mid, {})
+        jid = jobs.enqueue("transcribe", mid, {"glossary": store.glossary_list()})
         m = {"id": mid, "title": title, "createdAt": now, "updatedAt": now, "group": group or None,
              "status": "queued", "jobId": jid,
              "progress": {"stage": "queued", "pct": 0, "msg": "", "engine": ""},
@@ -347,7 +347,7 @@ def build_router(store: Store, get_jobs) -> APIRouter:
             cur = jobs.read(x.get("jobId")) if x.get("jobId") else None
             if cur and cur.get("kind") == "transcribe" and cur.get("state") in ("queued", "running", "claimed"):
                 raise HTTPException(409, "已在轉錄中")
-            jid = jobs.enqueue("transcribe", mid, {})
+            jid = jobs.enqueue("transcribe", mid, {"glossary": store.glossary_list()})
             made.append(jid)
             x.update(status="queued", jobId=jid,
                      progress={"stage": "queued", "pct": 0, "msg": "", "engine": ""})

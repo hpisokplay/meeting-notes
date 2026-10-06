@@ -61,10 +61,11 @@ def test_update_locked_rmw(data_dir, meeting):
 
 def test_settings_defaults_and_new_id(data_dir):
     s = Store(data_dir)
-    assert s.get_settings() == {"claudeModel": "sonnet", "fallbackEnabled": True,
-                                "fallbackMinutes": 20, "tgNotify": True}
-    s.set_settings({"claudeModel": "opus"})
-    assert s.get_settings()["claudeModel"] == "opus"
+    got = s.get_settings()
+    assert got.pop("glossary").splitlines()[0] == "股利" and got.pop("modelMigrated") is True
+    assert got == {"claudeModel": "opus", "fallbackEnabled": True, "fallbackMinutes": 20, "tgNotify": True}
+    s.set_settings({"claudeModel": "sonnet"})
+    assert s.get_settings()["claudeModel"] == "sonnet"
     assert s.get_settings()["fallbackMinutes"] == 20
     a, b = s.new_id(), s.new_id()
     assert a != b and len(a) == 17 and s.get_groups() == []

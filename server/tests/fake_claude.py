@@ -11,6 +11,10 @@ Mode comes from env FAKE_CLAUDE_MODE:
 In auto mode, terms marked 《詞|cat》 in stdin are returned as the term-scan items, and
 FAKE_CLAUDE_TR_DROP=n (+ FAKE_CLAUDE_COUNTER=<file>) drops a segment in the first n
 transcript translation calls.
+Grounded prompts (2026-10-06): MODE_DETECT answers env FAKE_CLAUDE_KIND (default "meeting");
+SUMMARY_MEETING / SUMMARY_LECTURE / enhance-with-src / NOTES-with-src return Items whose src quotes
+the first "[HH:MM:SS] 說話者: 內容" line of stdin; CORRECTION returns env FAKE_CLAUDE_CORRECTIONS
+(JSON list, default []); SLIPS returns env FAKE_CLAUDE_SLIPS (JSON list, default []).
 FAKE_CLAUDE_LOG=<path> appends {"argv": [...], "stdin": "..."} as one JSON line per call.
 """
 import json
@@ -46,8 +50,33 @@ def bump_counter():
     return n
 
 
+def first_src(stdin):
+    m = re.search(r"^\[(\d\d):(\d\d):(\d\d)\] [^:]+: (.+)$", stdin, re.M)
+    if not m:
+        return []
+    h, mi, se, text = m.groups()
+    return [{"t": int(h) * 3600 + int(mi) * 60 + int(se), "quote": text[:20]}]
+
+
+def is_obj_list(schema, key):
+    p = (schema.get("properties") or {}).get(key) or {}
+    return (p.get("items") or {}).get("type") == "object"
+
+
+LECTURE = ("conclusions", "advice", "risks", "cases", "mainPoints", "qa")
+
+
 def auto(schema, system, stdin):
     props = set((schema.get("properties") or {}).keys())
+    src = first_src(stdin)
+    if props == {"mode", "reason"}:
+        return {"mode": os.environ.get("FAKE_CLAUDE_KIND", "meeting"), "reason": "測試"}
+    if props == set(LECTURE) and is_obj_list(schema, "qa"):
+        return {k: [{"text": f"講座{k}一", "group": "主題甲", "src": src}] for k in LECTURE}
+    if props == {"actionItems", "mainPoints", "qa"} and is_obj_list(schema, "qa"):
+        return {"actionItems": [{"text": "新待辦 [DRI: 說話者 1]", "src": src}],
+                "mainPoints": [{"text": "新重點：說明", "group": "主題甲", "src": src}],
+                "qa": [{"text": "問：新問題？" + chr(10) + "答：新答案。", "src": src}]}
     if "translator" in system:
         out = prefix_strings(json.loads(stdin), "[譯]")
         # FAKE_CLAUDE_TR_DROP=n: the first n segment batches come back one segment short
@@ -69,6 +98,12 @@ def auto(schema, system, stdin):
         if it.get("type") == "string":
             return {"items": ["加強一", "加強二"]}
         ip = set(it.get("properties", {}))
+        if "wrong" in ip:
+            return {"items": json.loads(os.environ.get("FAKE_CLAUDE_CORRECTIONS", "[]"))}
+        if "issue" in ip:
+            return {"items": json.loads(os.environ.get("FAKE_CLAUDE_SLIPS", "[]"))}
+        if "src" in ip and (it["properties"]["src"].get("items") or {}).get("type") == "object":
+            return {"items": [{"text": "加強一", "src": src}, {"text": "加強二", "src": src}]}
         if "src" in ip:
             n = len(re.findall(r"^\d+\. ", stdin, re.M))
             return {"items": [{"text": f"潤飾{i}", "src": [i]} for i in range(1, n + 1)]}
@@ -82,7 +117,9 @@ def auto(schema, system, stdin):
              "figures": [{"group": "市場規模", "label": "規模", "value": "10 億"}],
              "quiz": [{"q": "題目？", "a": "答案"}]}
     if props and props <= set(notes):
-        return {k: notes[k] for k in props}
+        with_src = is_obj_list(schema, next(iter(props))) and "src" in (
+            schema["properties"][next(iter(props))]["items"].get("properties") or {})
+        return {k: [{**x, "src": src} if with_src else x for x in notes[k]] for k in props}
     return {"unknown_schema": sorted(props)}
 
 
