@@ -2,6 +2,7 @@
 import json
 import logging
 import logging.handlers
+import multiprocessing
 import os
 import shutil
 import threading
@@ -17,9 +18,57 @@ KEEPALIVE_S = 60  # re-post the last progress this often while a stage is silent
 RESULT_BACKOFF = (15, 45, 90, 150)  # waits between the 5 result POST attempts (~5 min in total)
 log = logging.getLogger("worker")
 
+# The 8 GB card is shared with other programs (ComfyUI keeps its models in VRAM after generating):
+# wait for memory instead of failing, degrade after a while, give up only after a long time.
+WHISPER_VRAM_MB = 4500          # large-v3 float16 + batch 8 working memory
+WHISPER_LOWMEM_VRAM_MB = 3000   # int8_float16, batch 4/2
+PYANNOTE_VRAM_MB = 1500
+VRAM_RETRY_S = 60
+VRAM_DEGRADE_S = 30 * 60        # whisper -> int8_float16; pyannote -> CPU
+VRAM_GIVEUP_S = 90 * 60
+MSG_WAIT = "等待顯示卡空出記憶體（被其他程式占用，例如 ComfyUI）"
+MSG_LOWMEM = "顯示卡記憶體不足，改用省記憶體模式（較慢）"
+MSG_DIAR_CPU = "分辨說話者改用 CPU（較慢）"
+MSG_GIVEUP = "顯示卡記憶體一直不足（可能被其他程式占用），請關閉 ComfyUI 等程式後按「重新轉錄」"
+
 
 class Cancelled(Exception):
     """Server answered 409 on progress: the job was cancelled."""
+
+
+class GpuBusy(RuntimeError):
+    """GPU memory stayed full for VRAM_GIVEUP_S; str() is the user-facing message."""
+
+
+def is_cuda_oom(e):
+    """ctranslate2 ("CUDA failed with error out of memory") and torch.OutOfMemoryError
+    (a RuntimeError subclass, "CUDA out of memory. Tried to allocate ...")."""
+    return isinstance(e, RuntimeError) and "out of memory" in str(e).lower()
+
+
+class ChildDied(RuntimeError):
+    """The GPU child process exited without an answer (crash, driver reset)."""
+
+
+def is_gpu_error(e):
+    """Worth one retry in a fresh child: CUDA errors and child crashes."""
+    low = str(e).lower()
+    return isinstance(e, ChildDied) or (isinstance(e, RuntimeError) and any(
+        k in low for k in ("cuda", "cudnn", "cublas", "out of memory")))
+
+
+def user_error(e):
+    """Traditional Chinese fail message; the English detail stays in the log."""
+    if isinstance(e, GpuBusy):
+        return str(e)
+    if is_cuda_oom(e):
+        return MSG_GIVEUP
+    low = str(e).lower()
+    if isinstance(e, ChildDied):
+        return "轉錄失敗：顯示卡程序異常結束，請稍後按「重新轉錄」再試"
+    if any(k in low for k in ("cuda", "cudnn", "cublas", "nvidia")):
+        return "轉錄失敗：顯示卡（CUDA）發生錯誤，請重新開機或稍後按「重新轉錄」再試"
+    return "轉錄失敗：%s" % e
 
 
 class Api:
@@ -183,14 +232,196 @@ class Keepalive:
         return False
 
 
-def gpu_process(api, job, audio):
+class VramGate:
+    """Waiting for GPU memory. sleep/clock are injectable; the default sleep returns early when
+    the keepalive got a 409, so a cancel aborts the wait promptly."""
+
+    def __init__(self, api, sleep=None, clock=None):
+        self.api = api
+        self.sleep = sleep or api.cancelled.wait
+        self.clock = clock or time.monotonic
+        self.t0 = self.clock()
+
+    def elapsed(self):
+        return self.clock() - self.t0
+
+    def wait(self, why=""):
+        log.warning("GPU memory: %s; waiting %d s (%.0f s so far)", why, VRAM_RETRY_S, self.elapsed())
+        self.api.progress("wait", 0, MSG_WAIT)
+        self.sleep(VRAM_RETRY_S)
+        self.api.check()
+        self.api.beat()  # explicit poll: a cancel during the wait is seen now, not a minute later
+        self.api.check()
+
+
+def _gpu_child(conn, task, wave_path, kw):
+    """Child-process entry: one whisper or pyannote run on a fresh CUDA context. A long-lived
+    process whose context was invalidated by a display-driver reset (nvlddmkm event 153) gets
+    misleading 'out of memory' errors forever; a new process per stage avoids that and returns
+    all VRAM to the card when it exits."""
+    try:
+        import numpy as np
+        wave = np.load(wave_path)
+        if task == "asr":
+            import asr
+            res = asr.transcribe_words(wave, lambda f: conn.send(("progress", f)), **kw)
+        else:
+            import diar
+            res = diar.diarize(wave, **kw)
+        conn.send(("ok", res))
+    except BaseException as e:
+        conn.send(("err", type(e).__name__, str(e)[:4000], traceback.format_exc()[-8000:]))
+    finally:
+        conn.close()
+
+
+class ChildRunner:
+    """Runs each GPU stage in a fresh spawned child; relays progress, aborts on cancel."""
+    POLL_S = 0.5
+
+    def __init__(self, api, wave, workdir, target=None):
+        import numpy as np
+        self.api = api
+        self.target = target or _gpu_child
+        workdir.mkdir(parents=True, exist_ok=True)
+        self.path = str(workdir / "wave.npy")
+        np.save(self.path, wave)
+
+    def whisper(self, cb, **kw):
+        return self._run("asr", kw, cb)
+
+    def diarize(self, **kw):
+        return self._run("diar", kw, None)
+
+    def release(self):
+        pass  # the child exiting already returned its VRAM
+
+    def _died(self, p, task):
+        p.join(5)
+        return ChildDied("GPU child (%s) exited with code %s" % (task, p.exitcode))
+
+    def _run(self, task, kw, cb):
+        ctx = multiprocessing.get_context("spawn")
+        rx, tx = ctx.Pipe(duplex=False)
+        p = ctx.Process(target=self.target, args=(tx, task, self.path, kw), daemon=True,
+                        name="gpu-" + task)
+        p.start()
+        tx.close()  # parent keeps only the read end: EOF once the child is gone
+        try:
+            while True:
+                self.api.check()  # keepalive saw a 409: kill the child (finally) and stop
+                if not rx.poll(self.POLL_S):
+                    if not p.is_alive() and not rx.poll(0):
+                        raise self._died(p, task)
+                    continue
+                try:
+                    msg = rx.recv()
+                except EOFError:
+                    raise self._died(p, task)
+                if msg[0] == "progress":
+                    if cb:
+                        cb(msg[1])
+                elif msg[0] == "ok":
+                    p.join(30)
+                    return msg[1]
+                else:
+                    log.warning("GPU child (%s) %s: %s\n%s", task, msg[1], msg[2],
+                                msg[3] if len(msg) > 3 else "")
+                    raise RuntimeError(msg[2])
+        finally:
+            rx.close()
+            if p.is_alive():
+                p.terminate()
+                p.join(10)
+
+
+class InProcessRunner:
+    """Same interface as ChildRunner, in this process (tests, debugging)."""
+
+    def __init__(self, api, wave, workdir):
+        self.wave = wave
+
+    def whisper(self, cb, **kw):
+        import asr
+        return asr.transcribe_words(self.wave, cb, **kw)
+
+    def diarize(self, **kw):
+        import diar
+        return diar.diarize(self.wave, **kw)
+
+    def release(self):
+        import asr
+        asr.release()
+
+
+Runner = ChildRunner
+
+
+def run_whisper(api, asr, runner, gate):
+    """Whisper with VRAM wait/retry; int8_float16 batch 4 (then 2) after VRAM_DEGRADE_S."""
+    batch = 4
+    retried = False
+    while True:
+        if gate.elapsed() >= VRAM_GIVEUP_S:
+            raise GpuBusy(MSG_GIVEUP)
+        low = gate.elapsed() >= VRAM_DEGRADE_S
+        need = WHISPER_LOWMEM_VRAM_MB if low else WHISPER_VRAM_MB
+        free = asr.free_vram_mb()
+        if free is not None and free < need:
+            gate.wait("whisper needs %d MiB, %d free" % (need, free))
+            continue
+        kw = {"compute_type": "int8_float16", "batch_size": batch} if low else             {"compute_type": "float16", "batch_size": 8}
+        msg = MSG_LOWMEM if low else ""
+        api.progress("asr", 0, msg)
+        try:
+            return runner.whisper(lambda f: api.progress("asr", f * 100, msg), **kw)
+        except RuntimeError as e:
+            runner.release()
+            if is_gpu_error(e) and not retried:
+                retried = True  # first GPU error: straight away in a fresh process
+                log.warning("whisper GPU error (%s), retrying in a new process: %s", kw, e)
+                continue
+            if not is_cuda_oom(e):
+                raise
+            log.warning("whisper out of GPU memory (%s): %s", kw, e)
+            if low:
+                batch = 2
+            gate.wait("whisper out of memory")
+
+
+def run_diar(api, asr, runner, gate):
+    """pyannote with VRAM wait/retry; on the CPU after VRAM_DEGRADE_S."""
+    retried = False
+    while True:
+        if gate.elapsed() >= VRAM_DEGRADE_S:
+            log.warning("pyannote: GPU still full, running on the CPU")
+            api.progress("diar", 0, MSG_DIAR_CPU)
+            return runner.diarize(device="cpu")
+        free = asr.free_vram_mb()
+        if free is not None and free < PYANNOTE_VRAM_MB:
+            gate.wait("pyannote needs %d MiB, %d free" % (PYANNOTE_VRAM_MB, free))
+            continue
+        api.progress("diar", 0, "")
+        try:
+            return runner.diarize()
+        except RuntimeError as e:
+            if is_gpu_error(e) and not retried:
+                retried = True
+                log.warning("pyannote GPU error, retrying in a new process: %s", e)
+                continue
+            if not is_cuda_oom(e):
+                raise
+            log.warning("pyannote out of GPU memory: %s", e)
+            gate.wait("pyannote out of memory")
+
+
+def gpu_process(api, job, audio, sleep=None, clock=None, runner=None):
     """Full job: download -> concat all parts into ONE 16 kHz mono stream ->
     whisper once -> free -> pyannote once -> merge. One diarization keeps speakers
     consistent across files."""
     import numpy as np
 
     import asr
-    import diar
     import opencc
     from pipeline import (PROMPT, align_words, build_segments, filter_hallucinations,
                           fix_traditional, name_speakers, smooth_speakers)
@@ -207,10 +438,10 @@ def gpu_process(api, job, audio):
         wave = np.concatenate([asr.load_audio(p) for p in paths])
         api.check()
         total = len(wave) / 16000.0
-        words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""))
-        asr.release()
-        api.progress("diar", 0, "")
-        turns = diar.diarize(wave)
+        gpu = (runner or Runner)(api, wave, cache / "gpu")  # GPU stages run in child processes
+        words = run_whisper(api, asr, gpu, VramGate(api, sleep, clock))
+        gpu.release()
+        turns = run_diar(api, asr, gpu, VramGate(api, sleep, clock))
         api.check()  # a keepalive 409 during diarization: stop before posting anything
         segs = build_segments(align_words(words, turns))
         cc = opencc.OpenCC("s2twp")
@@ -247,7 +478,7 @@ class Worker:
         except Exception as e:
             log.error("job %s failed: %s", job["id"], traceback.format_exc())
             try:
-                api.fail("轉錄失敗：%s" % e)
+                api.fail(user_error(e))
             except Exception:
                 log.exception("could not report failure")
         return True

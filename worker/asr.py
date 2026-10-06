@@ -8,6 +8,7 @@ from pipeline import PROMPT
 
 _model = None
 _pipe = None
+_compute_type = None
 
 
 def setup_cuda_dlls():
@@ -41,18 +42,37 @@ def load_audio(path):
     return np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768.0
 
 
-def transcribe_words(audio, on_progress=None):
+def free_vram_mb():
+    """Free memory on GPU 0 in MiB (whole card, incl. ComfyUI etc.), or None when unknown.
+    nvidia-smi on purpose, not torch.cuda.mem_get_info: the long-lived worker process must never
+    create a CUDA context (a display-driver reset leaves it broken); GPU work runs in children."""
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        p = subprocess.run(["nvidia-smi", "--query-gpu=memory.free", "--format=csv,noheader,nounits"],
+                           capture_output=True, timeout=20, creationflags=flags)
+        if p.returncode == 0:
+            return int(p.stdout.decode("ascii", "replace").split()[0])
+    except Exception:
+        pass
+    return None
+
+
+def transcribe_words(audio, on_progress=None, compute_type="float16", batch_size=8):
     """Returns [(start, end, word)]. on_progress(fraction 0..1) called as segments arrive.
+    compute_type/batch_size are lowered by the worker when the GPU is short of memory.
     Neutral prompt only: glossary terms (as `hotwords` or inside initial_prompt) were measured
     to drop words (5-8%) and punctuation (~50%) on a 10-min lecture clip, and slow ASR 1.6-1.8x."""
-    global _model, _pipe
+    global _model, _pipe, _compute_type
     setup_cuda_dlls()
+    if _model is not None and _compute_type not in (None, compute_type):
+        release()
     if _model is None:
         from faster_whisper import BatchedInferencePipeline, WhisperModel
-        _model = WhisperModel("large-v3", device="cuda", compute_type="float16")
+        _model = WhisperModel("large-v3", device="cuda", compute_type=compute_type)
         _pipe = BatchedInferencePipeline(model=_model)
+        _compute_type = compute_type
     segs, info = _pipe.transcribe(
-        audio, batch_size=8, language="zh", vad_filter=True, beam_size=5,
+        audio, batch_size=batch_size, language="zh", vad_filter=True, beam_size=5,
         condition_on_previous_text=False, word_timestamps=True, initial_prompt=PROMPT)
     dur = max(info.duration, 1e-6)
     words = []
@@ -65,10 +85,11 @@ def transcribe_words(audio, on_progress=None):
 
 
 def release():
-    """Free GPU memory before pyannote runs."""
-    global _model, _pipe
+    """Free GPU memory (before pyannote runs, or after an out-of-memory error)."""
+    global _model, _pipe, _compute_type
     _pipe = None
     _model = None
+    _compute_type = None
     gc.collect()
     if "torch" in sys.modules:
         import torch

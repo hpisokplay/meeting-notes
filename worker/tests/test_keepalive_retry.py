@@ -107,7 +107,7 @@ def _fake_modules(monkeypatch, diarize):
     np = pytest.importorskip("numpy")
     asr = types.SimpleNamespace(load_audio=lambda p: np.zeros(16000, dtype="float32"),
                                 transcribe_words=lambda wave, cb, **kw: (cb(1.0), [])[1],
-                                release=lambda: None)
+                                release=lambda: None, free_vram_mb=lambda: None)
     diar = types.SimpleNamespace(diarize=diarize)
     opencc = types.SimpleNamespace(OpenCC=lambda cfg: types.SimpleNamespace(convert=lambda t: t))
     pipeline = types.SimpleNamespace(PROMPT="", align_words=lambda w, t: [], build_segments=lambda x: [],
@@ -117,6 +117,7 @@ def _fake_modules(monkeypatch, diarize):
         monkeypatch.setitem(sys.modules, name, mod)
     monkeypatch.setattr(W, "download", lambda api, item, dest: None)
     monkeypatch.setattr(W, "KEEPALIVE_S", 0.01)
+    monkeypatch.setattr(W, "Runner", W.InProcessRunner)  # fakes live in this process
 
 
 JOB = {"job": {"id": "j1", "meeting": "m1", "kind": "transcribe", "payload": {}},
