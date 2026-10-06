@@ -4,7 +4,7 @@ import os
 import subprocess
 import sys
 
-from pipeline import PROMPT
+from pipeline import PROMPT, build_hotwords
 
 _model = None
 _pipe = None
@@ -41,17 +41,21 @@ def load_audio(path):
     return np.frombuffer(p.stdout, np.int16).astype(np.float32) / 32768.0
 
 
-def transcribe_words(audio, on_progress=None):
+def transcribe_words(audio, on_progress=None, glossary=None):
     """Returns [(start, end, word)]. on_progress(fraction 0..1) called as segments arrive."""
     global _model, _pipe
     setup_cuda_dlls()
-    from faster_whisper import BatchedInferencePipeline, WhisperModel
     if _model is None:
+        from faster_whisper import BatchedInferencePipeline, WhisperModel
         _model = WhisperModel("large-v3", device="cuda", compute_type="float16")
         _pipe = BatchedInferencePipeline(model=_model)
+    kw = {}
+    hot = build_hotwords(glossary)
+    if hot:  # faster-whisper 1.2.1 BatchedInferencePipeline.transcribe supports hotwords
+        kw["hotwords"] = hot
     segs, info = _pipe.transcribe(
         audio, batch_size=8, language="zh", vad_filter=True, beam_size=5,
-        condition_on_previous_text=False, word_timestamps=True, initial_prompt=PROMPT)
+        condition_on_previous_text=False, word_timestamps=True, initial_prompt=PROMPT, **kw)
     dur = max(info.duration, 1e-6)
     words = []
     for s in segs:

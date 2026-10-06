@@ -193,7 +193,7 @@ def gpu_process(api, job, audio):
     import diar
     import opencc
     from pipeline import (PROMPT, align_words, build_segments, filter_hallucinations,
-                          name_speakers)
+                          fix_traditional, name_speakers, smooth_speakers)
     cache = BASE / "cache" / job["id"]
     ka = Keepalive(api)
     try:
@@ -207,7 +207,9 @@ def gpu_process(api, job, audio):
         wave = np.concatenate([asr.load_audio(p) for p in paths])
         api.check()
         total = len(wave) / 16000.0
-        words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""))
+        glossary = (job.get("payload") or {}).get("glossary") or []
+        words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""),
+                                     glossary=glossary)
         asr.release()
         api.progress("diar", 0, "")
         turns = diar.diarize(wave)
@@ -215,8 +217,8 @@ def gpu_process(api, job, audio):
         segs = build_segments(align_words(words, turns))
         cc = opencc.OpenCC("s2twp")
         for s in segs:
-            s["text"] = cc.convert(s["text"])
-        segs = name_speakers(filter_hallucinations(segs, PROMPT))
+            s["text"] = fix_traditional(cc.convert(s["text"]))
+        segs = name_speakers(smooth_speakers(filter_hallucinations(segs, PROMPT)))
         api.progress("upload", 0, "")
         return {"segments": segs, "durationSec": round(total, 2), "engine": "gpu"}
     finally:

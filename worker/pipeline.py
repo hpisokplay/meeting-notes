@@ -130,6 +130,57 @@ def filter_hallucinations(segs, prompt):
     return out
 
 
+MAX_HOTWORDS = 200
+
+
+def build_hotwords(glossary):
+    """Glossary list -> faster-whisper `hotwords` string (None when empty)."""
+    terms = [t.strip() for t in (glossary or []) if isinstance(t, str) and t.strip()]
+    return " ".join(terms[:MAX_HOTWORDS]) or None
+
+
+_TW_FIX = re.compile(r"(?<!一)隻(?=有|是|要|能|好)")
+
+
+def fix_traditional(text):
+    """Post-fix s2twp over-conversion of 只 -> 隻 (「一隻」 untouched)."""
+    return _TW_FIX.sub("只", text)
+
+
+def _join(a, b):
+    if a and b and a[-1].isascii() and a[-1].isalnum() and b[0].isascii() and b[0].isalnum():
+        return a + " " + b
+    return a + b
+
+
+def smooth_speakers(segs, max_sec=3.0, max_chars=8):
+    """A run of one other speaker sandwiched between the same speaker A on both sides,
+    shorter than max_sec AND <= max_chars, is reassigned to A; adjacent same-speaker
+    segments are then re-merged. Segments need speaker/text/t (start seconds)."""
+    segs = [dict(s) for s in segs]
+    n = len(segs)
+    i = 0
+    while i < n:
+        j = i
+        while j + 1 < n and segs[j + 1]["speaker"] == segs[i]["speaker"]:
+            j += 1
+        if (i > 0 and j + 1 < n and segs[i - 1]["speaker"] == segs[j + 1]["speaker"]
+                and segs[i - 1]["speaker"] != segs[i]["speaker"]):
+            dur = segs[j + 1]["t"] - segs[i]["t"]
+            chars = sum(len(s["text"].strip()) for s in segs[i:j + 1])
+            if dur < max_sec and chars <= max_chars:
+                for k in range(i, j + 1):
+                    segs[k]["speaker"] = segs[i - 1]["speaker"]
+        i = j + 1
+    out = []
+    for s in segs:
+        if out and out[-1]["speaker"] == s["speaker"]:
+            out[-1]["text"] = _join(out[-1]["text"], s["text"])
+        else:
+            out.append(s)
+    return out
+
+
 def name_speakers(segs):
     """SPEAKER_xx -> 說話者 N by first appearance."""
     names = {}
