@@ -444,3 +444,49 @@ def test_render_lecture_and_items():
     md = meeting_to_markdown(m)
     assert "## 核心結論\n- 結論一" in md and "## 風險提醒\n- 風險一" in md and "## 待辦" not in md
     assert "**Q：甲？**\nA：乙。" in md
+
+
+def test_retranscribe_reprocess_claimed_while_result_is_being_applied(sj, fake_env, monkeypatch):
+    """NAS 2026-10-06 (1791264491261aff4): a RE-transcription of a meeting that already had
+    summary / review / corrections / mode. The AI thread claimed the reprocess job in the same second
+    it was enqueued, i.e. before apply_transcript_result had stored the new transcript, so the job
+    fingerprinted the OLD transcript and failed 「逐字稿在整理期間被修改」 after the whole run."""
+    import threading
+    import time as _t
+    store, jobs = sj
+    old = [{"speaker": "說話者 1", "text": "舊的逐字稿內容", "t": 5.0}]
+    tjid = jobs.enqueue("transcribe", "m1", {})
+    store.save({"id": "m1", "title": "t", "createdAt": 1, "status": "transcribing", "jobId": tjid,
+                "transcript": old, "transcriptRaw": old, "mode": "lecture",
+                "summary": {"conclusions": [{"id": "a1b2c3d4", "text": "舊結論", "src": [{"t": 5.0}]}]},
+                "corrections": {"items": [{"wrong": "x", "right": "y", "state": "applied"}], "at": 1},
+                "review": {"items": [], "at": 1}})
+    tjob = jobs.claim(["transcribe"], "gpu-worker")
+    runs, stored = [], threading.Event()
+    real_enqueue = jobs.enqueue
+    real_rp = ai._reprocess
+
+    def slow_reprocess(ctx, payload):  # Claude runs for minutes: the result is stored meanwhile
+        apply = real_rp(ctx, payload)
+        stored.wait(10)
+        return apply
+    monkeypatch.setitem(ai.HANDLERS, "reprocess", slow_reprocess)
+
+    def enqueue_then_claim(kind, mid, payload):  # the AI thread polls and wins the race
+        jid = real_enqueue(kind, mid, payload)
+        if kind == "ai":
+            th = threading.Thread(target=lambda: runs.append(run_claimed(store, jobs)))
+            th.start()
+            runs.append(th)
+            _t.sleep(0.5)  # the AI thread reads the meeting now (before the result is stored)
+        return jid
+    monkeypatch.setattr(jobs, "enqueue", enqueue_then_claim)
+    assert apply_transcript_result(store, jobs, tjob, {"segments": SEGS, "durationSec": 40, "engine": "gpu"})
+    stored.set()
+    runs[0].join(30)
+    job = runs[1]
+    got = jobs.get(job["id"])
+    assert got["state"] == "done", got.get("error")
+    m = store.get("m1")
+    assert m["status"] == "done" and m["error"] is None and m["aiJobId"] == job["id"]
+    assert m["transcriptRaw"] == SEGS and m["transcript"][0]["text"] == "我們談台積電的案子，台積電很大"

@@ -967,7 +967,9 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
     model = model or settings.get("claudeModel") or DEFAULT_MODEL
     glossary = store.glossary_list()
     state = {"pct": 0, "msg": "", "stage": "claude", "beat": time.monotonic(), "check": 0.0, "gone": False}
-    m = store.get(mid) if mid else None
+    # under the meeting lock: the job may have been enqueued inside a store.update (new transcript,
+    # restore-raw) that is not saved yet; a stale snapshot fails the fingerprint check at the end
+    m = store.get_settled(mid) if mid else None
     pipeline = bool(m) and _is_pipeline_summary(m, jid)
 
     def report(pct, msg, stage=None):

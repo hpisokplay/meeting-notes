@@ -110,6 +110,11 @@ class Store:
     def get(self, mid: str) -> dict | None:
         return read_json(self._mpath(mid))  # ValueError on a bad id
 
+    def get_settled(self, mid: str) -> dict | None:
+        """get() after any update() in progress on this meeting has been saved."""
+        with self._lock(mid):
+            return self.get(mid)
+
     def _all(self) -> list[dict]:
         out = []
         for p in self.path("meetings").glob("*.json"):

@@ -280,13 +280,15 @@ def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dic
     engine = result.get("engine") or ""
     segments = result.get("segments") or []
     dur = result.get("durationSec")
-    ai_jid = None
+    made: list[str] = []
     try:
         if mid and store.get(mid) is not None:
-            # term correction -> mode -> grounded summary (-> notes) -> slips -> verify
-            ai_jid = jobs.enqueue("ai", mid, {"action": "reprocess"})
-
             def apply(m):
+                # term correction -> mode -> grounded summary (-> notes) -> slips -> verify.
+                # Enqueued under the meeting lock: the AI thread may claim it at once, and its
+                # snapshot (taken under the same lock) must already see the new transcript.
+                ai_jid = jobs.enqueue("ai", mid, {"action": "reprocess"})
+                made.append(ai_jid)
                 m["transcript"] = segments
                 # a new transcription is a new raw text: old raw / corrections no longer apply
                 m.pop("transcriptRaw", None)
@@ -304,10 +306,11 @@ def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dic
                 m["error"] = None
                 m["aiJobId"] = ai_jid
             if not update_meeting_if_job(store, job, apply):
-                jobs.cancel(ai_jid, notify=False)
+                for jid in made:
+                    jobs.cancel(jid, notify=False)
     except BaseException:
-        if ai_jid:
-            jobs.cancel(ai_jid, notify=False)
+        for jid in made:
+            jobs.cancel(jid, notify=False)
         raise
     return True
 
