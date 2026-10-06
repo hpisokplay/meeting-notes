@@ -11,6 +11,7 @@ from server import wordreview as W
 from server.ai import (Ctx, adjudicate_cards, correction_windows, handle_ai_job, merge_window_proposals,
                        transcript_lines)
 from server.app import create_app
+from server.items import hash8
 from server.verify import review_item
 
 FAKE = [sys.executable, str(Path(__file__).with_name("fake_claude.py"))]
@@ -248,3 +249,43 @@ def test_deep_correct_409_while_transcribing_and_400_without_transcript(app_clie
     m.update(status="done", transcript=[])
     app.state.store.save(m)
     assert c.post("/api/meetings/m1/ai", json={"action": "deep_correct"}).status_code == 400
+
+
+def test_uncertain_keep_on_term_flag_becomes_low_row():
+    from server.ai import uncertain_keeps_to_rows
+    f = review_item("term", "transcript", None, "園大", "可能聽錯", suggestion="元大", t=0.0)
+    m = {"review": {"items": [f]}}
+    raw = [{"span": "各位園大的", "action": "keep", "suggestion": "", "reason": "請查證主辦單位", "confidence": "low",
+            "itemIds": [], "fromFlags": [f["id"], "other"]},
+           {"span": "X大", "action": "keep", "suggestion": "", "reason": "沒錯", "confidence": "high",
+            "itemIds": [], "fromFlags": [f["id"]]}]
+    out = uncertain_keeps_to_rows(raw, m, {f["id"]})
+    assert out[0] == {"span": "園大", "action": "replace", "suggestion": "元大", "confidence": "low",
+                      "reason": "AI 沒把握，請確認：請查證主辦單位", "itemIds": [], "fromFlags": [f["id"]]}
+    assert out[1]["action"] == "keep" and out[1]["fromFlags"] == ["other"]
+    assert out[2] == raw[1]  # a sure keep stays a keep
+
+
+def test_deep_correct_reasks_term_flags_an_ai_keep_hid(app_client, monkeypatch):
+    app, c = app_client
+    monkeypatch.setenv("FAKE_CLAUDE_CORRECTIONS", json.dumps(CORR, ensure_ascii=False))
+    monkeypatch.setenv("FAKE_CLAUDE_ADJUDICATE", json.dumps(
+        [{"span": "園大開戶", "action": "keep", "suggestion": "", "reason": "請查證", "confidence": "low",
+          "itemIds": [], "fromFlags": ["*term:園大"]}], ensure_ascii=False))
+    m = deep_meeting()
+    m["corrections"]["items"].append({"wrong": "園大", "right": "元大", "confidence": "high", "count": 1,
+                                      "ts": [500.0], "state": "pending"})
+    flag = review_item("term", "transcript", None, "園大", "可能聽錯", suggestion="元大", t=500.0)
+    flag.update(id=hash8("term|transcript||園大|元大"), state="merged", mergedInto="aikeep01")
+    aikeep = {"id": "aikeep01", "kind": "word", "origin": "ai", "span": "我們在園大", "action": "keep",
+              "suggestion": "", "state": "confirmed", "resolution": "keep", "resolvedBy": "ai", "targets": [],
+              "fromFlags": [flag["id"]], "sources": ["term"], "reason": "請查證", "confidence": "low"}
+    m["review"]["items"] += [flag, aikeep]
+    app.state.store.save(m)
+    c.post("/api/meetings/m1/ai", json={"action": "deep_correct"})
+    handle_ai_job(app.state.store, app.state.jobs.claim(["ai"], "nas-ai"), FAKE, app.state.jobs)
+    m = app.state.store.get("m1")
+    rows = {(x["from"], x["to"]): x for x in W.review_rows(m["review"]["items"])}
+    assert rows[("園大", "元大")]["confidence"] == "low"
+    f = next(x for x in m["review"]["items"] if x["id"] == flag["id"])
+    assert f["state"] == "merged" and f["mergedInto"] == rows[("園大", "元大")]["cards"][0]

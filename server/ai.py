@@ -777,34 +777,83 @@ def _new_term_flags(m: dict, new: set[tuple]) -> set[str]:
             and r.get("state") == "pending" and (r.get("text"), r.get("suggestion")) in new}
 
 
+def _ai_kept_term_flags(m: dict, proposed: set[tuple]) -> set[str]:
+    """Term flags the scan proposed again that an earlier AI review settled by itself (auto "keep", the
+    user never saw them): 加強校對 asks again. A row the USER handled is never among them."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    items = [r for r in review.get("items") or [] if isinstance(r, dict)]
+    ai_kept = {r["id"] for r in items if W.is_card(r) and r.get("resolvedBy") == "ai" and W._kept_span(r)}
+    return {r["id"] for r in items if r.get("kind") == "term" and r.get("state") == W.MERGED
+            and r.get("mergedInto") in ai_kept and (r.get("text"), r.get("suggestion")) in proposed}
+
+
+def _reopen(m: dict, ids: set[str]) -> None:
+    for r in (m.get("review") or {}).get("items") or []:
+        if isinstance(r, dict) and r.get("id") in ids and r.get("state") == W.MERGED:
+            r["state"] = "pending"
+            r.pop("mergedInto", None)
+
+
+def uncertain_keeps_to_rows(raw: list, m: dict, flag_ids: set[str]) -> list:
+    """加強校對 favours recall: an AI "keep" that is not sure (confidence low / medium) about a term flag
+    would hide the candidate (keep cards are settled by the AI). Instead it becomes a low-confidence
+    replace card (wrong -> right, the AI's doubt as the reason) the user decides on."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    terms = {r["id"]: r for r in review.get("items") or [] if isinstance(r, dict) and r.get("kind") == "term"
+             and r.get("id") in flag_ids and r.get("text") and r.get("suggestion")}
+    out = []
+    for x in raw or []:
+        if not (isinstance(x, dict) and x.get("action") == "keep" and x.get("confidence") != "high"):
+            out.append(x)
+            continue
+        ff = [f for f in x.get("fromFlags") or [] if isinstance(f, str)]
+        mine = [f for f in ff if f in terms]
+        for f in mine:
+            reason = str(x.get("reason") or "").strip()
+            out.append({"span": terms[f]["text"], "action": "replace", "suggestion": terms[f]["suggestion"],
+                        "reason": f"AI 沒把握，請確認：{reason}" if reason else "AI 沒把握，請確認",
+                        "confidence": "low", "itemIds": [], "fromFlags": [f]})
+        rest = [f for f in ff if f not in terms]
+        if rest or not mine:
+            out.append({**x, "fromFlags": rest})
+    return out
+
+
 def _deep_correct(ctx: Ctx, payload):
     """加強校對: windowed exhaustive correction -> merge_corrections (safe ones auto-applied) -> adjudicate
-    only the new term flags -> new checklist rows. Summary / notes are not regenerated; handled rows
-    and corrections keep their state; the open rows stay (new cards are added, not swapped in)."""
+    only the new term flags (+ re-proposed ones an earlier AI review hid) -> new checklist rows.
+    Summary / notes are not regenerated; rows and corrections the user handled keep their state; the
+    open rows stay (new cards are added, not swapped in)."""
     m0 = ctx.m
     fp = _fingerprint(m0.get("transcript"))
     warnings: list[str] = []
     proposals = scan_corrections(ctx, copy.deepcopy(m0.get("transcript") or []), STEP_DEEP[2], (3, 88))
+    proposed = {(p["wrong"], p["right"]) for p in proposals}
     pm = copy.deepcopy(m0)
     new = _fold_deep(pm, proposals)
     _reverify(pm, ctx)
-    flag_ids = _new_term_flags(pm, new)
+    again = _ai_kept_term_flags(pm, proposed)
+    _reopen(pm, again)
+    flag_ids = _new_term_flags(pm, new) | again
     cards = []
     if flag_ids:
         ctx.step(STEP_DEEP_ADJUDICATE)
         budget = min(ctx.budget, ADJUDICATE_BUDGET)
         cards = _optional(lambda: adjudicate_cards(ctx, pm, budget, flag_ids, entries=False),
                           "AI 審稿", warnings) or []
+        cards = uncertain_keeps_to_rows(cards, pm, flag_ids)
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
             raise ClaudeError("逐字稿在加強校對期間被修改，請再按一次「加強校對」")
         got = _fold_deep(m, proposals)
         _reverify(m, ctx)
+        _reopen(m, again & _ai_kept_term_flags(m, proposed))
         W.add_ai_cards(m, cards)
         if warnings:
             m["warnings"] = [w for w in m.get("warnings") or [] if isinstance(w, str)] + warnings
-        log.info("deep_correct %s: %d new corrections, %d cards", m.get("id"), len(got), len(cards))
+        log.info("deep_correct %s: %d new corrections, %d re-asked, %d cards", m.get("id"), len(got),
+                 len(again), len(cards))
     return apply
 
 
