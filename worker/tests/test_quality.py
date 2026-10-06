@@ -54,6 +54,9 @@ def test_fix_traditional():
     assert fix_traditional("隻有你，隻是他，隻要好，隻能走，隻好去") == "只有你，只是他，只要好，只能走，只好去"
     assert fix_traditional("一隻有點大的貓") == "一隻有點大的貓"
     assert fix_traditional("三隻貓") == "三隻貓"
+    assert fix_traditional("兩隻好狗") == "兩隻好狗"
+    assert fix_traditional("三隻有") == "三隻有"
+    assert fix_traditional("隻有") == "只有"
 
 
 # ---- hotwords wiring
@@ -61,7 +64,31 @@ def test_build_hotwords():
     assert build_hotwords(None) is None
     assert build_hotwords([]) is None
     assert build_hotwords(["股利", " ", "ETF"]) == "股利 ETF"
-    assert len(build_hotwords(["t%d" % i for i in range(300)]).split()) == 200
+
+
+def test_hotwords_capped_by_size_and_warns(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="worker"):
+        out = build_hotwords(["t%d" % i for i in range(300)])
+    assert len(out.split()) == 60
+    assert "dropped 240 of 300" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="worker"):
+        out = build_hotwords(["一二三四五六七八九十"] * 10)  # 10 chars each -> 6 fit
+    assert len(out.split()) == 6 and "dropped 4 of 10" in caplog.text
+
+
+def test_hotwords_small_glossary_no_warning(caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="worker"):
+        assert build_hotwords(["Pilot line", "股利"]) == "Pilot line 股利"
+    assert caplog.text == ""
+
+
+def test_flicker_ababa_collapses():
+    segs = [S("A", "正文很長", 0.0), S("B", "嗯", 5.0), S("A", "對", 6.0), S("B", "好", 7.0), S("A", "繼續", 8.0)]
+    out = smooth_speakers(segs)
+    assert len(out) == 1 and out[0]["speaker"] == "A"
 
 
 class FakePipe:

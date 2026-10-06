@@ -1,5 +1,6 @@
 """Pure functions: word/speaker alignment, segment building, cleanup. No GPU, no network."""
 import bisect
+import logging
 import re
 
 PROMPT = "以下是繁體中文的會議。"
@@ -130,20 +131,38 @@ def filter_hallucinations(segs, prompt):
     return out
 
 
-MAX_HOTWORDS = 200
+HOTWORD_BUDGET = 60  # CJK chars + ASCII words; faster-whisper truncates hotwords at ~223 tokens
+_log = logging.getLogger("worker")
+_WORD_UNITS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-_+]*|[^\sA-Za-z0-9]")
+
+
+def _units(term):
+    return len(_WORD_UNITS.findall(term))
 
 
 def build_hotwords(glossary):
-    """Glossary list -> faster-whisper `hotwords` string (None when empty)."""
+    """Glossary list -> faster-whisper `hotwords` string (None when empty).
+    Terms are kept in order until the size budget is reached; the rest are dropped (warned)."""
     terms = [t.strip() for t in (glossary or []) if isinstance(t, str) and t.strip()]
-    return " ".join(terms[:MAX_HOTWORDS]) or None
+    kept, used = [], 0
+    for t in terms:
+        u = _units(t)
+        if used + u > HOTWORD_BUDGET:
+            break
+        kept.append(t)
+        used += u
+    if len(kept) < len(terms):
+        _log.warning("glossary too long for hotwords: dropped %d of %d terms", len(terms) - len(kept), len(terms))
+    return " ".join(kept) or None
 
 
-_TW_FIX = re.compile(r"(?<!一)隻(?=有|是|要|能|好)")
+_NUM_BEFORE = "一二兩三四五六七八九十幾每這那半"
+_TW_FIX = re.compile(r"(?<![" + _NUM_BEFORE + r"])隻(?=有|是|要|能|好)")
 
 
 def fix_traditional(text):
-    """Post-fix s2twp over-conversion of 只 -> 隻 (「一隻」 untouched)."""
+    """Post-fix s2twp over-conversion of 只 -> 隻, unless preceded by a numeral/quantifier
+    (「一隻」「兩隻好狗」「三隻有」 untouched)."""
     return _TW_FIX.sub("只", text)
 
 
@@ -156,7 +175,11 @@ def _join(a, b):
 def smooth_speakers(segs, max_sec=3.0, max_chars=8):
     """A run of one other speaker sandwiched between the same speaker A on both sides,
     shorter than max_sec AND <= max_chars, is reassigned to A; adjacent same-speaker
-    segments are then re-merged. Segments need speaker/text/t (start seconds)."""
+    segments are then re-merged. Segments need speaker/text/t (start seconds).
+
+    Trade-off: a real interjection of <= max_chars lasting < max_sec between two segments of
+    the same speaker is absorbed too. Accepted, because diarization flicker in lectures is
+    far more common than genuine one-word interjections."""
     segs = [dict(s) for s in segs]
     n = len(segs)
     i = 0
