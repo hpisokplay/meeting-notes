@@ -192,3 +192,28 @@ describe('匯出：物件條目與講座區塊', () => {
     expect(meetingToHtmlBody(m)).toContain('<li>交報告</li>');
   });
 });
+
+describe('待確認勾選清單（v107）', () => {
+  it('wordPair：短詞整個、長句只取改到的詞、單字擴成兩字、刪除最多 12 字；伺服器有 from／to 就用', async () => {
+    const { wordPair } = await import('../js/items.js');
+    expect(wordPair({ span: '討論稅', suggestion: '逃漏稅', action: 'replace' })).toEqual({ from: '討論稅', to: '逃漏稅' });
+    expect(wordPair({ span: '李專', suggestion: '理專', action: 'replace' })).toEqual({ from: '李專', to: '理專' });
+    expect(wordPair({ span: '所以選對專案你就自打嘴巴了', suggestion: '所以選對專案你就打自己嘴巴了', action: 'replace' })).toEqual({ from: '自打', to: '打自己' });
+    expect(wordPair({ span: '黃任宗當初賣掉公司拿到', suggestion: '黃任中當初賣掉公司拿到', action: 'replace' })).toEqual({ from: '任宗', to: '任中' });
+    expect(wordPair({ span: '選對專案你就自打嘴巴了真的', action: 'delete' })).toEqual({ from: '選對專案你就自打嘴巴了…', to: '（刪除）' });
+    expect(wordPair({ span: 'x', from: 'A', to: 'B' })).toEqual({ from: 'A', to: 'B' });
+  });
+  it('reviewRows：同一組字合併（卡、處數加總、最低信心），keep／非待確認不列', async () => {
+    const { reviewRows } = await import('../js/items.js');
+    const m = { review: { items: [
+      { id: 'a', span: '王曉明', action: 'replace', suggestion: '王小明', confidence: 'high', targets: [{ where: 'transcript', count: 2 }], state: 'pending' },
+      { id: 'b', span: '王曉明說', action: 'replace', suggestion: '王小明說', from: '王曉明', to: '王小明', confidence: 'low', targets: [{ where: 'summary.x', count: 1 }], state: 'pending' },
+      { id: 'c', span: '48%', action: 'keep', suggestion: '', confidence: 'high', targets: [], state: 'pending' },
+      { id: 'd', span: '嗯', action: 'delete', confidence: 'high', targets: [], state: 'confirmed' },
+    ] } };
+    const rows = reviewRows(m);
+    expect(rows.length).toBe(1);
+    expect(rows[0]).toMatchObject({ from: '王曉明', to: '王小明', count: 3, confidence: 'low' });
+    expect(rows[0].cards.map((x) => x.id)).toEqual(['a', 'b']);
+  });
+});

@@ -444,6 +444,26 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
 .word-sec { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
 .word-input { width: 100%; box-sizing: border-box; min-height: 44px; font-size: 16px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--card); color: inherit; }
 .word-edit .seg-edit-ops .act-btn { min-height: 44px; }
+/* 待確認勾選清單（v107）：一列一組字，預設全勾，底部一顆確認 */
+.wl-list { display: flex; flex-direction: column; background: var(--card); border: 1px solid var(--line); border-radius: 10px; overflow: hidden; }
+.wl-row + .wl-row { border-top: 1px solid var(--line); }
+.wl-line { display: flex; align-items: center; gap: 6px; min-height: 48px; padding: 0 4px 0 10px; }
+.wl-main { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 10px; min-height: 48px; cursor: pointer; }
+.wl-check { width: 24px; height: 24px; flex: 0 0 auto; margin: 0; accent-color: #1f9d55; }
+.wl-pair { min-width: 0; font-size: 17px; line-height: 1.35; word-break: break-all; }
+.wl-from { color: var(--ink); }
+.wl-arrow { color: var(--muted); margin: 0 6px; }
+.wl-to { color: #1f9d55; font-weight: 800; }
+.wl-row:has(.wl-check:not(:checked)) .wl-to { color: var(--muted); text-decoration: line-through; font-weight: 600; }
+.wl-low { font-size: 13px; flex: 0 0 auto; }
+.wl-n { flex: 0 0 auto; font-size: 12px; color: var(--muted); white-space: nowrap; }
+.wl-more { flex: 0 0 auto; width: 44px; height: 44px; border: none; background: none; color: var(--muted); font-size: 16px; cursor: pointer; }
+.wl-detail { padding: 0 12px 12px 44px; }
+.wl-edit { display: flex; gap: 6px; margin-top: 8px; }
+.wl-edit .word-input { flex: 1 1 auto; min-width: 0; }
+.wl-edit .act-btn { flex: 0 0 auto; min-height: 44px; }
+.wl-bar { position: sticky; bottom: 0; z-index: 2; padding: 8px 0 2px; background: color-mix(in srgb, #ff9500 8%, var(--card)); }
+.wl-confirm { width: 100%; min-height: 50px; font-size: 16px; font-weight: 800; }
 .gaps-line { margin-top: 6px; font-size: 13px; font-weight: 600; color: #b35900; }
 .gaps-line summary { cursor: pointer; min-height: 32px; display: flex; align-items: center; }
 .gaps-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-weight: 400; }

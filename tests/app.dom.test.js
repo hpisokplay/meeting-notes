@@ -71,6 +71,7 @@ vi.mock('../js/api.js', () => {
     jobIdOf: (r) => (r && (r.jobId || r.aiJobId)) || null,
     // 待確認清單：照契約改狀態、edit 改條目文字、delete 移掉條目，回傳更新後的會議
     acceptHighReview: vi.fn(async () => { throw new Error('unmocked'); }),
+    applyReviewBatch: vi.fn(async () => { throw new Error('unmocked'); }),
     reviewAction: vi.fn(async (id, rid, action, text) => {
       nas.calls.push(['reviewAction', id, rid, action, text]);
       const m = nas.meetings[id];
@@ -929,149 +930,122 @@ describe('app（整合，假 NAS）', () => {
     m.gaps = [{ start: 60, end: 150 }, { start: 400, end: 490 }];
     return m;
   };
-  const wordReply = (applied, mutate) => async (id, rid, action, text) => {
-    nas.calls.push(['reviewAction', id, rid, action, text]);
-    const m = nas.meetings[id];
-    m.review.items.find((x) => x.id === rid).state = action === 'keep' ? 'confirmed' : 'edited';
-    if (mutate) mutate(m);
-    m.updatedAt += 1;
-    return { ...JSON.parse(JSON.stringify(m)), applied };
+  // ---- 待確認勾選清單（v107）----
+  const checklistMeeting = () => {
+    const m = wordMeeting();
+    m.review.items.push(
+      // 同一組字（王曉明 → 王小明）、不同 span → 併成同一列
+      { id: 'rw000005', span: '王曉明負責', action: 'replace', suggestion: '王小明負責', from: '王曉明', to: '王小明', reason: 'r', confidence: 'low',
+        targets: [{ where: 'transcript', count: 3 }], context: '【王曉明負責】', state: 'pending' },
+      // 長句 span、只改一個詞：只顯示那組字（沒有 from／to 的舊資料由前端算）
+      { id: 'rw000006', span: '所以選對專案你就自打嘴巴了', action: 'replace', suggestion: '所以選對專案你就打自己嘴巴了', reason: '', confidence: 'medium',
+        targets: [{ where: 'transcript', count: 1 }], context: '【所以選對專案你就自打嘴巴了】', state: 'pending' }
+    );
+    return m;
   };
+  const rowOf = (from) => [...document.querySelectorAll('.wl-row')].find((x) => x.querySelector('.wl-from').textContent === from);
 
-  it('單字訂正卡：上下文標示（跳脫）、三種建議、低信心標籤、理由時間鈕、影響範圍；merged 不顯示不計數；舊格式退回舊卡', async () => {
-    nas.meetings['w-1'] = wordMeeting();
+  it('勾選清單：只顯示字詞對、預設全勾、合併同一組字、keep／merged 不顯示；舊格式退回舊卡；沒有大按鈕', async () => {
+    nas.meetings['w-1'] = checklistMeeting();
     await go('#/m/w-1');
     const box = document.getElementById('reviewCard');
-    expect(document.getElementById('reviewCount').textContent).toBe('4'); // merged 不算
-    expect(box.querySelector('[data-rid="rw000004"]')).toBeNull();
-    expect(box.textContent).toContain('AI 已逐項判斷並給建議；沒問題按「照建議」即可');
-    const c1 = box.querySelector('.word-card[data-rid="rw000001"]');
-    expect(c1.querySelector('mark.word-hit').textContent).toBe('王曉明');
-    expect(c1.querySelector('.word-ctx b')).toBeNull(); // 上下文裡的 HTML 要跳脫
-    expect(c1.querySelector('.word-ctx').textContent).toContain('<b>');
-    expect(c1.querySelector('.word-sugg').innerHTML).toContain('建議改成：<b>王小明</b>');
-    expect(c1.querySelector('.word-scope').textContent).toBe('會改到：逐字稿 2 處、摘要 2 條');
-    expect(c1.querySelector('.word-low')).toBeNull();
-    const chip = c1.querySelector('.word-reason [data-rt="700"]');
+    expect(box.querySelector('.review-head').textContent).toContain('⚠️ 待確認（4 項）'); // 3 列＋1 張舊卡
+    expect(box.textContent).toContain('AI 已勾選建議，沒問題直接按確認；取消勾選 = 保留原文');
+    const rows = [...box.querySelectorAll('.wl-row')];
+    expect(rows.map((x) => x.querySelector('.wl-pair').textContent)).toEqual(['王曉明→王小明', '嗯那個→（刪除）', '自打→打自己']);
+    expect(rows.every((x) => x.querySelector('.wl-check').checked)).toBe(true);
+    expect(box.textContent).not.toContain('保留（不是錯誤）'); // keep 卡（rw000002）不出現
+    expect(box.textContent).not.toContain('48%');
+    const r1 = rowOf('王曉明');
+    expect(r1.querySelector('.wl-to').tagName).toBe('B');
+    expect(r1.querySelector('.wl-n').textContent).toBe('7 處'); // 2+1+1（rw000001）+3（rw000005）
+    expect(r1.querySelector('.wl-low')).toBeTruthy(); // 合併後最低信心是 low → ⚠️，但仍勾選
+    expect(r1.querySelector('.wl-check').checked).toBe(true);
+    expect(rowOf('自打').querySelector('.wl-low')).toBeNull();
+    // 細節預設收起；▸ 展開看上下文（跳脫）、理由時間鈕
+    const d = r1.querySelector('.wl-detail');
+    expect(d.hidden).toBe(true);
+    r1.querySelector('.wl-more').click();
+    expect(d.hidden).toBe(false);
+    expect(d.querySelector('mark.word-hit').textContent).toBe('王曉明');
+    expect(d.querySelector('.word-ctx b')).toBeNull();
+    const chip = d.querySelector('.word-reason [data-rt="700"]');
     expect(chip.textContent).toContain('00:11:40');
-    expect(c1.querySelector('[data-wv="accept"]').textContent).toContain('照建議');
-    const c2 = box.querySelector('[data-rid="rw000002"]');
-    expect(c2.textContent).toContain('建議：保留（不是錯誤）');
-    expect(c2.querySelector('.word-low').textContent).toContain('請自行判斷');
-    expect(box.querySelector('[data-rid="rw000003"]').textContent).toContain('建議：刪除這段');
-    // 舊格式（沒有 span）用舊卡片
-    const old = box.querySelector('.review-row[data-rid="rv000009"]');
-    expect(old.classList.contains('word-card')).toBe(false);
-    expect(old.querySelector('[data-rv="confirm"]')).toBeTruthy();
-    expect(old.textContent).toContain('找不到原句');
-    // 時間鈕跳到逐字稿那一句
     chip.click();
     expect(document.querySelector('.seg[data-seg="2"]').classList.contains('flash')).toBe(true);
+    // 一顆確認鈕；舊的逐張大按鈕與「全部照建議」都不見了
+    expect(document.getElementById('wlConfirm').textContent).toBe('✅ 確認（套用 3 項，保留 0 項）');
+    expect(box.querySelector('[data-wv]')).toBeNull();
+    expect(document.getElementById('acceptHighBtn')).toBeNull();
+    const old = box.querySelector('.review-row[data-rid="rv000009"]');
+    expect(old.querySelector('[data-rv="confirm"]')).toBeTruthy();
+    expect(old.textContent).toContain('找不到原句');
   });
 
-  it('單字訂正卡：照建議送 accept，toast 顯示套用數並依回傳重畫', async () => {
-    nas.meetings['w-1'] = wordMeeting();
+  it('勾選清單：取消勾選＝保留；確認送 accept／keep 卡 id、toast、依回傳重畫', async () => {
+    nas.meetings['w-1'] = checklistMeeting();
     await go('#/m/w-1');
-    api.reviewAction.mockImplementationOnce(
-      wordReply({ transcript: 2, items: 1 }, (m) => (m.summary.mainPoints[0].text = '王小明說要測試（已改）'))
-    );
-    document.querySelector('[data-rid="rw000001"] [data-wv="accept"]').click();
+    const cb = rowOf('自打').querySelector('.wl-check');
+    cb.checked = false;
+    cb.dispatchEvent(new Event('change'));
+    expect(document.getElementById('wlConfirm').textContent).toBe('✅ 確認（套用 2 項，保留 1 項）');
+    let release;
+    let body;
+    api.applyReviewBatch.mockImplementationOnce(async (id, accept, keep) => {
+      body = { id, accept, keep };
+      await new Promise((r) => (release = r));
+      const m = nas.meetings[id];
+      m.review.items.forEach((x) => {
+        if (accept.includes(x.id) || keep.includes(x.id)) x.state = 'confirmed';
+      });
+      m.summary.mainPoints[0].text = '王小明說要測試（已改）';
+      m.updatedAt += 1;
+      return { ...JSON.parse(JSON.stringify(m)), applied: { cards: 3, kept: 1, transcript: 5, items: 1 } };
+    });
+    document.getElementById('wlConfirm').click();
+    await tick();
+    expect(document.getElementById('wlConfirm').disabled).toBe(true); // 送出中停用
+    expect(body).toEqual({ id: 'w-1', accept: ['rw000001', 'rw000005', 'rw000003'], keep: ['rw000006'] });
+    release();
     await tick(120);
-    expect(nas.calls).toContainEqual(['reviewAction', 'w-1', 'rw000001', 'accept', undefined]);
-    expect(document.getElementById('toast').textContent).toBe('已改：逐字稿 2 處、摘要 1 條');
-    expect(document.getElementById('reviewCount').textContent).toBe('3');
-    expect(document.querySelector('[data-rid="rw000001"]')).toBeNull();
+    expect(document.getElementById('toast').textContent).toBe('已套用 2 項：逐字稿 5 處、摘要 1 條');
+    expect(document.querySelector('.wl-row')).toBeNull();
+    expect(document.getElementById('reviewCount').textContent).toBe('1'); // 只剩舊卡
     expect(document.getElementById('view').innerHTML).toContain('（已改）');
   });
 
-  it('全部照建議：只算高信心非人名，確認後送出、toast 顯示並依回傳重畫；取消不送', async () => {
-    const wm = wordMeeting();
-    wm.review.items.push(
-      { id: 'rw000010', span: '台積店', action: 'replace', suggestion: '台積電', reason: 'r', confidence: 'high', targets: [{ where: 'transcript', count: 1 }], context: '【台積店】', sources: ['term'], state: 'pending' },
-      { id: 'rw000011', span: '股利所得', action: 'keep', suggestion: '', reason: 'r', confidence: 'high', targets: [], context: '【股利所得】', sources: [], state: 'pending' },
-      { id: 'rw000012', span: '黃任宗', action: 'replace', suggestion: '黃任中', reason: 'r', confidence: 'high', targets: [], context: '【黃任宗】', sources: [], state: 'pending' }
-    );
-    nas.meetings['w-1'] = wm;
+  it('勾選清單：自己改把這一列每張卡都送 edit（span 裡的錯字換成輸入）', async () => {
+    nas.meetings['w-1'] = checklistMeeting();
     await go('#/m/w-1');
-    const btn = document.getElementById('acceptHighBtn');
-    expect(btn.textContent).toBe('⚡ 全部照建議（高信心 2 張）'); // rw000001 有 name 來源、黃任宗像人名 → 不算
-    const asked = [];
-    window.confirm = (t) => (asked.push(t), false);
-    btn.click();
-    expect(asked[0]).toBe('將一次套用 2 張高信心建議（不含人名）。其餘 5 張仍需逐張確認。確定？');
-    expect(api.acceptHighReview).not.toHaveBeenCalled();
-    window.confirm = () => true;
-    let release;
-    api.acceptHighReview.mockImplementationOnce(async (id) => {
-      nas.calls.push(['acceptHigh', id]);
-      await new Promise((r) => (release = r));
+    const calls = [];
+    const editReply = async (id, rid, action, text) => {
+      calls.push([rid, action, text]);
       const m = nas.meetings[id];
-      ['rw000010', 'rw000011'].forEach((x) => (m.review.items.find((i) => i.id === x).state = 'confirmed'));
-      m.updatedAt += 1;
-      return { ...JSON.parse(JSON.stringify(m)), applied: { cards: 2, transcript: 3, items: 1 } };
-    });
-    btn.click();
-    await tick();
-    expect(document.querySelector('[data-rid="rw000001"] [data-wv="accept"]').disabled).toBe(true); // 送出中停用
-    release();
-    await tick(120);
-    expect(nas.calls).toContainEqual(['acceptHigh', 'w-1']);
-    expect(document.getElementById('toast').textContent).toBe('已套用 2 張：逐字稿 3 處、摘要 1 條');
-    expect(document.querySelector('[data-rid="rw000010"]')).toBeNull();
-    expect(document.getElementById('acceptHighBtn')).toBeNull();
-  });
-
-  it('全部照建議：沒有符合的卡就不顯示按鈕', async () => {
-    nas.meetings['w-1'] = wordMeeting();
-    await go('#/m/w-1');
-    expect(document.getElementById('acceptHighBtn')).toBeNull();
-  });
-
-  it('單字訂正卡：保留原文送 keep；自己改送 edit＋文字；送出中按鈕停用', async () => {
-    nas.meetings['w-1'] = wordMeeting();
-    await go('#/m/w-1');
-    let release;
-    api.reviewAction.mockImplementationOnce(async (...a) => {
-      await new Promise((r) => (release = r));
-      return wordReply({ transcript: 0, items: 0 })(...a);
-    });
-    document.querySelector('[data-rid="rw000002"] [data-wv="keep"]').click();
-    await tick();
-    expect(document.querySelector('[data-rid="rw000001"] [data-wv="accept"]').disabled).toBe(true);
-    release();
-    await tick(120);
-    expect(nas.calls).toContainEqual(['reviewAction', 'w-1', 'rw000002', 'keep', undefined]);
-    expect(document.getElementById('toast').textContent).toContain('已保留原文');
-
-    api.reviewAction.mockImplementationOnce(wordReply({ transcript: 2, items: 2 }));
-    document.querySelector('[data-rid="rw000001"] [data-wv="edit"]').click();
-    const inp = document.querySelector('[data-rid="rw000001"] .word-input');
+      m.review.items.find((x) => x.id === rid).state = 'edited';
+      return { ...JSON.parse(JSON.stringify(m)), applied: { transcript: 1, items: 1 } };
+    };
+    api.reviewAction.mockImplementationOnce(editReply).mockImplementationOnce(editReply);
+    const r1 = rowOf('王曉明');
+    r1.querySelector('.wl-more').click();
+    const inp = r1.querySelector('.word-input');
     expect(inp.value).toBe('王小明');
     inp.value = '王筱明';
-    document.querySelector('[data-rid="rw000001"] [data-re="save"]').click();
+    r1.querySelector('.wl-edit-btn').click();
     await tick(120);
-    expect(nas.calls).toContainEqual(['reviewAction', 'w-1', 'rw000001', 'edit', '王筱明']);
+    expect(calls).toEqual([['rw000001', 'edit', '王筱明'], ['rw000005', 'edit', '王筱明負責']]);
     expect(document.getElementById('toast').textContent).toBe('已改：逐字稿 2 處、摘要 2 條');
+    expect(rowOf('王曉明')).toBeUndefined();
   });
 
-  it('單字訂正卡：stale 不顯示不計數；摘要條數＝條目數（不是出現次數）；照建議按在 keep 卡上顯示已確認', async () => {
-    const m = wordMeeting();
-    m.review.items = [
-      { id: 'rw000010', kind: 'word', span: '黃任宗', action: 'replace', suggestion: '黃任中', reason: '', confidence: 'high',
-        targets: [{ where: 'transcript', count: 4 }, { where: 'notes.concepts', itemId: 'dddddddd', count: 2 }], context: '【黃任宗】', state: 'pending' },
-      { id: 'rw000011', kind: 'word', span: '舊制', action: 'keep', suggestion: '', reason: '', confidence: 'high',
-        targets: [{ where: 'summary.cases', itemId: 'e1', count: 1 }], context: '【舊制】', state: 'pending' },
-      { id: 'rw000012', kind: 'word', span: '不見了', action: 'replace', suggestion: 'x', reason: '', confidence: 'high', targets: [], context: '【不見了】', state: 'stale' },
-    ];
-    nas.meetings['w-1'] = m;
+  it('勾選清單：409 時重抓並提示整理中', async () => {
+    nas.meetings['w-1'] = checklistMeeting();
     await go('#/m/w-1');
-    expect(document.getElementById('reviewCount').textContent).toBe('2');
-    expect(document.querySelector('[data-rid="rw000012"]')).toBeNull();
-    expect(document.querySelector('[data-rid="rw000010"] .word-scope').textContent).toBe('會改到：逐字稿 4 處、摘要 1 條');
-    api.reviewAction.mockImplementationOnce(wordReply({ transcript: 0, items: 0 }));
-    document.querySelector('[data-rid="rw000011"] [data-wv="accept"]').click();
+    api.applyReviewBatch.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('整理中'), { status: 409 });
+    });
+    document.getElementById('wlConfirm').click();
     await tick(120);
-    expect(document.getElementById('toast').textContent).toBe('已確認 ✓');
+    expect(document.getElementById('toast').textContent).toBe('整理中，請稍後再確認');
   });
 
   it('單字訂正卡：只剩 stale／merged 時整個清單隱藏', async () => {

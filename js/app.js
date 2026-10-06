@@ -21,7 +21,8 @@ import {
   listItemIds,
   confirmOnly,
   isWordReview,
-  isAcceptHighEligible,
+  reviewRows,
+  legacyPending,
   reviewScope,
   scopeText,
   splitTimes,
@@ -29,7 +30,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v106';
+const APP_VERSION = 'v107';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -424,28 +425,37 @@ function currentDetailId() {
 // ---- 單字訂正卡（ReviewItem v2：有 span 的待確認項目）----
 const timeChip = (t, label) =>
   t != null && isFinite(t) ? `<button class="src-chip" type="button" data-rt="${Number(t)}">▶ ${esc(label || fmtSec(t))}</button>` : esc(label || '');
-function wordReviewCardHtml(r) {
+// 勾選清單的一列：☑ 錯字 → 正確（N 處）▸；展開看上下文、理由、自己改
+function wordRowHtml(row, checked) {
+  const r = row.cards[0];
   const ctx = splitContext(r.context || `【${r.span}】`)
     .map((p) => (p.hit ? `<mark class="word-hit">${esc(p.text)}</mark>` : esc(p.text)))
     .join('');
-  const act = r.action === 'keep' || r.action === 'delete' ? r.action : 'replace';
-  const sugg =
-    act === 'keep' ? '建議：保留（不是錯誤）' : act === 'delete' ? '建議：刪除這段' : `建議改成：<b>${esc(r.suggestion || '')}</b>`;
-  const low = r.confidence === 'low' ? ' <span class="word-low">⚠️ 請自行判斷</span>' : '';
   const reason = splitTimes(r.reason || '')
     .map((p) => (p.label ? timeChip(p.t, p.label) : esc(p.text)))
     .join('');
-  return `<div class="review-row word-card" data-rid="${esc(r.id)}">
-    <div class="word-ctx">${ctx}</div>
-    <div class="word-sugg">${sugg}${low}</div>
-    ${reason ? `<div class="word-reason">${reason}</div>` : ''}
-    <div class="word-scope">${esc(scopeText(reviewScope(r), '會改到：'))}</div>
-    <div class="review-ops word-ops">
-      <button class="act-btn primary word-accept" type="button" data-wv="accept">✅ 照建議</button>
-      <div class="word-sec">
-        <button class="act-btn" type="button" data-wv="keep">保留原文</button>
-        <button class="act-btn" type="button" data-wv="edit">✏️ 自己改</button>
-      </div>
+  const scope = row.cards.reduce(
+    (a, c) => {
+      const x = reviewScope(c);
+      return { transcript: a.transcript + x.transcript, items: a.items + x.items };
+    },
+    { transcript: 0, items: 0 }
+  );
+  const low = row.confidence === 'low' ? '<span class="wl-low" title="AI 沒把握，請看一下">⚠️</span>' : '';
+  const editVal = row.action === 'replace' ? row.to : '';
+  return `<div class="wl-row" data-row="${esc(row.id)}" data-rid="${esc(r.id)}">
+    <div class="wl-line">
+      <label class="wl-main"><input type="checkbox" class="wl-check"${checked ? ' checked' : ''}>
+        <span class="wl-pair"><span class="wl-from">${esc(row.from)}</span><span class="wl-arrow">→</span><b class="wl-to">${esc(row.to)}</b></span>${low}</label>
+      <span class="wl-n">${Number(row.count) || 0} 處</span>
+      <button class="wl-more" type="button" aria-expanded="false" aria-label="看詳細">▸</button>
+    </div>
+    <div class="wl-detail" hidden>
+      <div class="word-ctx">${ctx}</div>
+      ${reason ? `<div class="word-reason">${reason}</div>` : ''}
+      <div class="word-scope">${esc(scopeText(scope, '會改到：'))}</div>
+      <div class="wl-edit"><input class="word-input" type="text" enterkeyhint="done" aria-label="自己改成" placeholder="自己改成…" value="${esc(editVal)}">
+        <button class="act-btn wl-edit-btn" type="button">✏️ 自己改</button></div>
     </div>
   </div>`;
 }
@@ -2390,6 +2400,7 @@ async function renderDetail(id, preloaded) {
     return (src && src.quote) || r.text || '';
   };
   let reviewOpen = true;
+  const unchecked = new Set(); // 勾選清單裡被取消勾選的列（= 保留原文）
   const drawReviewInner = () => {
     const all = reviewItems(m).filter((r) => r && r.state !== 'merged' && r.state !== 'stale'); // 已併進別張卡／原文已不存在的不顯示、不計數
     paintExportLock();
@@ -2406,11 +2417,14 @@ async function renderDetail(id, preloaded) {
       return;
     }
     reviewBox.className = 'review-box';
-    const rows = pend
-      .map((r) =>
-        isWordReview(r)
-          ? wordReviewCardHtml(r)
-          : `<div class="review-row" data-rid="${esc(r.id)}">
+    const rows = reviewRows(m);
+    const legacy = legacyPending(m);
+    const total = rows.length + legacy.length;
+    const rowIds = new Set(rows.map((x) => x.id));
+    [...unchecked].forEach((x) => !rowIds.has(x) && unchecked.delete(x));
+    const legacyHtml = legacy
+      .map(
+        (r) => `<div class="review-row" data-rid="${esc(r.id)}">
           <div class="review-top"><span class="review-kind k-${esc(r.kind)}">${esc(REVIEW_KIND[r.kind] || r.kind || '待確認')}</span>${r.t != null && isFinite(Number(r.t)) ? `<button class="src-chip" type="button" data-rt="${Number(r.t)}">▶ ${esc(fmtSec(r.t))}</button>` : ''}</div>
           <div class="review-text">${esc(r.text)}</div>
           ${r.detail ? `<div class="review-detail">${esc(r.detail)}</div>` : ''}
@@ -2425,49 +2439,72 @@ async function renderDetail(id, preloaded) {
         </div>`
       )
       .join('');
-    const anyWord = pend.some(isWordReview);
-    const hint = anyWord
-      ? `<div class="hint review-hint">AI 已逐項判斷並給建議；沒問題按「照建議」即可</div>
-        <details class="review-why"><summary>為什麼要確認？</summary>錄音轉文字常把人名、專有名詞、數字聽錯，摘要也可能跟著寫錯。AI 已對照逐字稿原話提出建議，請你最後確認一次；全部處理完才能分享／匯出。</details>`
-      : `<div class="hint" style="margin:0 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>`;
-    const eligible = pend.filter(isAcceptHighEligible).length;
-    const bulk = eligible
-      ? `<button class="act-btn primary review-bulk" id="acceptHighBtn" type="button" style="width:100%;margin:0 0 8px"${locked() ? ` data-locked disabled title="${LOCK_MSG}"` : ''} data-n="${eligible}" data-rest="${pend.length - eligible}">⚡ 全部照建議（高信心 ${eligible} 張）</button>`
+    const list = rows.length
+      ? `<div class="hint review-hint">AI 已勾選建議，沒問題直接按確認；取消勾選 = 保留原文</div>
+        <div class="wl-list">${rows.map((row) => wordRowHtml(row, !unchecked.has(row.id))).join('')}</div>
+        <div class="wl-bar"><button class="act-btn primary wl-confirm" id="wlConfirm" type="button"${locked() ? ` data-locked disabled title="${LOCK_MSG}"` : ''}></button></div>`
       : '';
-    reviewBox.innerHTML = `<div class="review-head" id="reviewHead">⚠️ 待確認清單（<span id="reviewCount">${pend.length}</span>）<span class="chev">${reviewOpen ? '▾' : '▸'}</span></div>
+    const legacyHint = legacy.length
+      ? `<div class="hint" style="margin:${rows.length ? '10px' : '0'} 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>`
+      : '';
+    reviewBox.innerHTML = `<div class="review-head" id="reviewHead">⚠️ 待確認（<span id="reviewCount">${total}</span> 項）<span class="chev">${reviewOpen ? '▾' : '▸'}</span></div>
       <div class="review-list"${reviewOpen ? '' : ' hidden'}>
-        ${bulk}
-        ${hint}
-        ${rows}
+        ${list}
+        ${legacyHint}
+        ${legacyHtml}
       </div>`;
     document.getElementById('reviewHead').onclick = () => {
       reviewOpen = !reviewOpen;
       drawReview();
     };
-    const bulkBtn = document.getElementById('acceptHighBtn');
-    if (bulkBtn)
-      bulkBtn.onclick = () => {
+    const confirmBtn = document.getElementById('wlConfirm');
+    const paintConfirm = () => {
+      if (!confirmBtn) return;
+      const keep = rows.filter((x) => unchecked.has(x.id)).length;
+      confirmBtn.textContent = `✅ 確認（套用 ${rows.length - keep} 項，保留 ${keep} 項）`;
+    };
+    paintConfirm();
+    reviewBox.querySelectorAll('.wl-row').forEach((el) => {
+      const row = rows.find((x) => x.id === el.dataset.row);
+      el.querySelector('.wl-check').onchange = (e) => {
+        if (e.target.checked) unchecked.delete(row.id);
+        else unchecked.add(row.id);
+        paintConfirm();
+      };
+      const more = el.querySelector('.wl-more');
+      more.onclick = () => {
+        const d = el.querySelector('.wl-detail');
+        d.hidden = !d.hidden;
+        more.textContent = d.hidden ? '▸' : '▾';
+        more.setAttribute('aria-expanded', String(!d.hidden));
+      };
+      const inp = el.querySelector('.word-input');
+      const save = () => {
+        const v = inp.value.trim();
+        if (!v) {
+          alert('請填入要改成的文字');
+          return;
+        }
+        sendRowEdit(row, v);
+      };
+      el.querySelector('.wl-edit-btn').onclick = save;
+      inp.onkeydown = (e) => {
+        if (e.key === 'Enter') save();
+      };
+    });
+    if (confirmBtn)
+      confirmBtn.onclick = () => {
         if (reviewSending) return;
-        const n = Number(bulkBtn.dataset.n);
-        const rest = Number(bulkBtn.dataset.rest);
-        if (!confirm(`將一次套用 ${n} 張高信心建議（不含人名）。其餘 ${rest} 張仍需逐張確認。確定？`)) return;
-        sendAcceptHigh();
+        const accept = [];
+        const keep = [];
+        rows.forEach((row) => row.cards.forEach((c) => (unchecked.has(row.id) ? keep : accept).push(c.id)));
+        sendBatch(accept, keep, rows.length - rows.filter((x) => unchecked.has(x.id)).length);
       };
     reviewBox.querySelectorAll('[data-rt]').forEach((b) => {
       b.onclick = () => {
         const t = Number(b.dataset.rt);
-        const r = pend.find((x) => String(x.id) === b.closest('.review-row').dataset.rid);
+        const r = pend.find((x) => String(x.id) === b.closest('[data-rid]').dataset.rid);
         if (curJump) curJump(t, reviewQuote(r, t), true);
-      };
-    });
-    reviewBox.querySelectorAll('[data-wv]').forEach((b) => {
-      b.onclick = () => {
-        const row = b.closest('.review-row');
-        const r = pend.find((x) => String(x.id) === row.dataset.rid);
-        if (!r || reviewSending) return;
-        const act = b.dataset.wv;
-        if (act === 'edit') return openWordEdit(row, r);
-        sendReview(r, act);
       };
     });
     reviewBox.querySelectorAll('[data-rv]').forEach((b) => {
@@ -2504,56 +2541,70 @@ async function renderDetail(id, preloaded) {
       sendReview(r, 'edit', v);
     };
   };
-  // 單字訂正卡的「自己改」：一行輸入框 → 送 edit（text 為替換文字）
-  const openWordEdit = (row, r) => {
-    const ops = row.querySelector('.review-ops');
-    ops.outerHTML = `<div class="review-edit word-edit"><input class="word-input" type="text" enterkeyhint="done" aria-label="改成">
-      <div class="seg-edit-ops"><button class="act-btn primary" type="button" data-re="save">送出</button><button class="act-btn" type="button" data-re="cancel">取消</button></div></div>`;
-    const inp = row.querySelector('.word-input');
-    inp.value = r.action === 'replace' && r.suggestion ? r.suggestion : r.span || '';
-    inp.focus();
-    row.querySelector('[data-re="cancel"]').onclick = () => drawReview();
-    const save = () => {
-      const v = inp.value.trim();
-      if (!v) {
-        alert('請填入要改成的文字');
-        return;
-      }
-      sendReview(r, 'edit', v);
-    };
-    row.querySelector('[data-re="save"]').onclick = save;
-    inp.onkeydown = (e) => {
-      if (e.key === 'Enter') save();
-    };
-  };
   let reviewSending = false;
-  const sendAcceptHigh = async () => {
+  // 重抓最新的會議重畫（404／409 時）
+  const refreshAfter = async (e, msg409, msg404) => {
+    noteFetchError(e);
+    if (e && (e.status === 404 || e.status === 409)) {
+      try {
+        const fresh = await api.getMeeting(id);
+        await cacheMeeting(fresh);
+        m = fresh;
+        toast(e.status === 409 ? msg409 : msg404);
+        if (currentDetailId() === id) renderDetail(id, fresh);
+        return true;
+      } catch (e2) {
+        noteFetchError(e2);
+      }
+    }
+    return false;
+  };
+  // 勾選清單的「確認」：勾選的照建議、沒勾的保留原文，一次送出
+  const sendBatch = async (accept, keep, nRows) => {
     if (reviewSending) return;
     reviewSending = true;
-    reviewBox.querySelectorAll('button').forEach((x) => (x.disabled = true));
+    reviewBox.querySelectorAll('button, input').forEach((x) => (x.disabled = true));
     try {
-      const r2 = await api.acceptHighReview(id);
+      const r2 = await api.applyReviewBatch(id, accept, keep);
       const applied = (r2 && typeof r2 === 'object' && r2.applied) || {};
       if (r2 && r2.applied) delete r2.applied;
       const fresh = r2 && typeof r2 === 'object' && r2.id ? r2 : await api.getMeeting(id);
       await cacheMeeting(fresh);
       m = fresh;
-      toast(`已套用 ${Number(applied.cards) || 0} 張：逐字稿 ${Number(applied.transcript) || 0} 處、摘要 ${Number(applied.items) || 0} 條`);
+      unchecked.clear();
+      toast(`已套用 ${nRows} 項：逐字稿 ${Number(applied.transcript) || 0} 處、摘要 ${Number(applied.items) || 0} 條`);
       if (currentDetailId() === id) renderDetail(id, fresh);
     } catch (e) {
-      noteFetchError(e);
-      if (e && (e.status === 404 || e.status === 409)) {
-        try {
-          const fresh = await api.getMeeting(id);
-          await cacheMeeting(fresh);
-          m = fresh;
-          toast(e.status === 409 ? '整理中，請稍後再確認' : '內容已更新，已重新整理清單');
-          if (currentDetailId() === id) renderDetail(id, fresh);
-          return;
-        } catch (e2) {
-          noteFetchError(e2);
-        }
+      if (await refreshAfter(e, '整理中，請稍後再確認', '內容已更新，已重新整理清單')) return;
+      alert('處理失敗：' + errText(e));
+      drawReview();
+    } finally {
+      reviewSending = false;
+    }
+  };
+  // 一列「自己改」：這一列的每張卡都改成使用者的字（span 裡的錯字換成輸入；刪除列＝整段換成輸入）
+  const sendRowEdit = async (row, value) => {
+    if (reviewSending) return;
+    reviewSending = true;
+    reviewBox.querySelectorAll('button, input').forEach((x) => (x.disabled = true));
+    const sum = { transcript: 0, items: 0 };
+    try {
+      let r2 = null;
+      for (const c of row.cards) {
+        const text = row.action === 'replace' && !row.from.endsWith('…') && c.span.includes(row.from) ? c.span.replace(row.from, value) : value;
+        r2 = await api.reviewAction(id, c.id, 'edit', text);
+        const a = (r2 && typeof r2 === 'object' && r2.applied) || {};
+        sum.transcript += Number(a.transcript) || 0;
+        sum.items += Number(a.items) || 0;
+        if (r2 && r2.applied) delete r2.applied;
       }
+      const fresh = r2 && typeof r2 === 'object' && r2.id ? r2 : await api.getMeeting(id);
+      await cacheMeeting(fresh);
+      m = fresh;
+      toast(scopeText(sum, '已改：'));
+      if (currentDetailId() === id) renderDetail(id, fresh);
+    } catch (e) {
+      if (await refreshAfter(e, '整理中，請稍後再確認', '這一項已經處理過或內容已更新，已重新整理清單')) return;
       alert('處理失敗：' + errText(e));
       drawReview();
     } finally {

@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .ai import AIThread, build_ai_router, on_ai_job_terminal
 from .importer import build_router as build_import_router
+from . import wordreview as W
 from .review import ACTIVE_JOB_STATES, build_review_router, verify_review
 from .jobs import JobQueue, build_jobs_router, load_worker_key
 from . import notify as tg_notify
@@ -96,6 +97,11 @@ def build_router(store: Store, get_jobs=None) -> APIRouter:
         m = _guard(lambda: store.get(mid))
         if m is None:
             raise HTTPException(404, "找不到這場會議")
+        if W.migrate_cards(m):  # older cards: AI keep -> auto-confirmed, word pairs added (saved once)
+            try:
+                m = store.update(mid, W.migrate_cards)
+            except KeyError:
+                raise HTTPException(404, "找不到這場會議")
         return m
 
     @r.put("/meetings/{mid}")

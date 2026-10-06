@@ -288,3 +288,58 @@ export function gapMinutes(gaps) {
   const sec = (Array.isArray(gaps) ? gaps : []).reduce((a, g) => a + Math.max(0, (Number(g && g.end) || 0) - (Number(g && g.start) || 0)), 0);
   return sec > 0 ? Math.max(1, Math.round(sec / 60)) : 0;
 }
+// ---- 待確認勾選清單（v107）：一列一組「錯字 → 正確」，同一組字的多張卡合成一列 ----
+// 與伺服器 wordreview.word_pair 同規則（伺服器已存 from／to，這裡只是舊資料的備援）
+const PAIR_MAX = 12;
+const clipPair = (s) => (s.length <= PAIR_MAX ? s : s.slice(0, PAIR_MAX - 1) + '…');
+const WORDISH = /[\p{L}\p{N}_]/u;
+export function wordPair(r) {
+  const span = String((r && r.span) || '');
+  const sug = String((r && r.suggestion) || '');
+  if (r && typeof r.from === 'string' && typeof r.to === 'string') return { from: r.from, to: r.to };
+  if (r && r.action === 'delete') return { from: clipPair(span), to: '（刪除）' };
+  if (!sug) return { from: clipPair(span), to: clipPair(span) };
+  if (span.length <= 4 && sug.length <= 4) return { from: span, to: sug };
+  const a = [...span];
+  const b = [...sug];
+  const n = Math.min(a.length, b.length);
+  let p = 0;
+  while (p < n && a[p] === b[p]) p++;
+  let s = 0;
+  while (s < n - p && a[a.length - 1 - s] === b[b.length - 1 - s]) s++;
+  let i = p;
+  let ja = a.length - s;
+  let jb = b.length - s;
+  while (ja - i < 2 || jb - i < 2) {
+    if (i > 0 && WORDISH.test(a[i - 1])) i--;
+    else if (s > 0 && WORDISH.test(a[ja])) {
+      ja++;
+      jb++;
+      s--;
+    } else break;
+  }
+  return { from: clipPair(a.slice(i, ja).join('')), to: clipPair(b.slice(i, jb).join('')) };
+}
+const RANK = { high: 3, medium: 2, low: 1 };
+const cardCount = (r) => (Array.isArray(r.targets) ? r.targets : []).reduce((a, x) => a + Math.max(0, Number(x && x.count) || 0), 0);
+// 待確認的 replace／delete 卡 → 列 [{id, from, to, action, cards:[卡], count, confidence}]（AI 判定「不是錯誤」的 keep 卡不列）
+export function reviewRows(m) {
+  const rows = new Map();
+  pendingReview(m)
+    .filter((r) => isWordReview(r) && (r.action === 'replace' || r.action === 'delete'))
+    .forEach((r) => {
+      const { from, to } = wordPair(r);
+      const key = from + '\u0000' + to;
+      let row = rows.get(key);
+      if (!row) {
+        row = { id: r.id, from, to, action: r.action, cards: [], count: 0, confidence: r.confidence || 'low' };
+        rows.set(key, row);
+      }
+      row.cards.push(r);
+      row.count += cardCount(r);
+      if ((RANK[r.confidence] || 1) < (RANK[row.confidence] || 1)) row.confidence = r.confidence || 'low';
+    });
+  return [...rows.values()];
+}
+// 舊格式（沒有 span）的待確認項目：維持舊卡片
+export const legacyPending = (m) => pendingReview(m).filter((r) => !isWordReview(r));

@@ -480,6 +480,43 @@ def accept_high(m: dict) -> dict:
     return out
 
 
+def _batch_cards(review_items: list, ids) -> list[dict]:
+    """Pending cards named by card id or checklist row id (W.review_rows), list order, no repeats."""
+    ids = [str(x) for x in ids or [] if isinstance(x, (str, int))]
+    rows = {row["id"]: row["cards"] for row in W.review_rows(review_items)}
+    want: list[str] = []
+    for x in ids:
+        for cid in rows.get(x, [x]):
+            if cid not in want:
+                want.append(cid)
+    by_id = {r["id"]: r for r in review_items if W.is_card(r) and r.get("state") == "pending"}
+    return [by_id[c] for c in want if c in by_id]
+
+
+def apply_batch(m: dict, accept, keep) -> dict:
+    """The checklist's one confirm: accept (single-accept logic) every card / row in `accept`, keep
+    (original is right) every one in `keep` (an id in both counts as accept). No re-verify here.
+    Returns {cards, kept, transcript, items}."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    items = [r for r in review.get("items") or [] if isinstance(r, dict)]
+    acc = _batch_cards(items, accept)
+    acc_ids = {r["id"] for r in acc}
+    kp = [r for r in _batch_cards(items, keep) if r["id"] not in acc_ids]
+    out = {"cards": 0, "kept": 0, "transcript": 0, "items": 0}
+    for r in acc:
+        if r.get("state") != "pending":  # settled meanwhile (cannot happen inside one batch, defensive)
+            continue
+        a = review_action(m, r["id"], "accept")
+        out["cards"] += 1
+        out["transcript"] += a.get("transcript", 0)
+        out["items"] += a.get("items", 0)
+    for r in kp:
+        if r.get("state") == "pending":
+            review_action(m, r["id"], "keep")
+            out["kept"] += 1
+    return out
+
+
 # ---------------------------------------------------------------- pipeline job start
 def start_reprocess(store: Store, jobs, mid: str, payload: dict | None = None, prepare=None) -> dict:
     """Enqueue an ai "reprocess" job as the meeting's pipeline job (status "summarizing", aiJobId).
@@ -531,6 +568,28 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
                 raise HTTPException(409, "整理中，請稍後再確認")
             got["applied"] = accept_high(m)
             if got["applied"]["cards"]:
+                m["review"] = verify_review(m, store.glossary_list())  # one pure re-verify
+        try:
+            saved = store.update(mid, apply)
+            return {**saved, "applied": got["applied"]}
+        except BadId:
+            raise HTTPException(400, "會議 id 不合法")
+        except KeyError:
+            raise HTTPException(404, "找不到這場會議")
+
+    @r.post("/meetings/{mid}/review/apply-batch")
+    def review_apply_batch(mid: str, body: dict = Body(...)):
+        accept, keep = body.get("accept") or [], body.get("keep") or []
+        if not isinstance(accept, list) or not isinstance(keep, list):
+            raise HTTPException(400, "accept / keep 必須是清單")
+        got: dict = {}
+
+        def apply(m):
+            cur = get_jobs().read(m.get("aiJobId")) if m.get("aiJobId") else None
+            if m.get("status") == "summarizing" and cur and cur.get("state") in ACTIVE_JOB_STATES:
+                raise HTTPException(409, "整理中，請稍後再確認")
+            got["applied"] = apply_batch(m, accept, keep)
+            if got["applied"]["cards"] or got["applied"]["kept"]:
                 m["review"] = verify_review(m, store.glossary_list())  # one pure re-verify
         try:
             saved = store.update(mid, apply)
@@ -613,4 +672,4 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
 
 
 __all__ = ["build_review_router", "start_reprocess", "merge_corrections", "verify_review", "slip_items",
-           "fix_src_times", "replace_term", "count_term", "set_entry_text", "review_action", "item_text"]
+           "fix_src_times", "replace_term", "count_term", "set_entry_text", "review_action", "apply_batch", "item_text"]

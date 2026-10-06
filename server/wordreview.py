@@ -61,6 +61,101 @@ def card_id(span: str, action: str, suggestion: str) -> str:
     return hash8(f"word|{span}|{action}|{suggestion}")
 
 
+# ---------------------------------------------------------------- checklist display (word pairs)
+PAIR_MAX = 12          # a word pair side is at most this many chars (longer: cut with …)
+PAIR_WHOLE = 4         # span and suggestion both this short: show them whole (already a word)
+DELETE_TO = "（刪除）"
+_WORDISH = re.compile(r"\w")
+
+
+def _clip(s: str, n: int = PAIR_MAX) -> str:
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
+def word_pair(span: str, suggestion: str = "", action: str = "replace") -> tuple[str, str]:
+    """(from, to) shown in the checklist: the minimal differing substrings of span / suggestion
+    (common prefix / suffix trimmed), widened to ≥ 2 chars per side with neighbouring word chars
+    (preceding first) when the change is a single char; ≤ PAIR_MAX chars. delete -> (span, （刪除）)."""
+    span, sug = str(span or ""), str(suggestion or "")
+    if action == "delete":
+        return _clip(span), DELETE_TO
+    if action != "replace" or not sug:
+        return _clip(span), _clip(span)
+    if len(span) <= PAIR_WHOLE and len(sug) <= PAIR_WHOLE:
+        return span, sug
+    n = min(len(span), len(sug))
+    p = 0
+    while p < n and span[p] == sug[p]:
+        p += 1
+    s = 0
+    while s < n - p and span[-1 - s] == sug[-1 - s]:
+        s += 1
+    i, ja, jb = p, len(span) - s, len(sug) - s
+    while ja - i < 2 or jb - i < 2:
+        if i > 0 and _WORDISH.match(span[i - 1]):
+            i -= 1
+        elif s > 0 and _WORDISH.match(span[ja]):
+            ja, jb, s = ja + 1, jb + 1, s - 1
+        else:
+            break
+    return _clip(span[i:ja]), _clip(sug[i:jb])
+
+
+def set_pair(r: dict) -> dict:
+    """Store card.from / card.to (the checklist's word pair)."""
+    r["from"], r["to"] = word_pair(r.get("span"), r.get("suggestion"), r.get("action"))
+    return r
+
+
+def row_id(frm: str, to: str) -> str:
+    return "row-" + hash8(f"row|{frm}|{to}")
+
+
+def card_count(r: dict) -> int:
+    return sum(int(t.get("count") or 0) for t in r.get("targets") or [] if isinstance(t, dict))
+
+
+def review_rows(items) -> list[dict]:
+    """Checklist rows (derived view): pending replace / delete cards with the same (from, to) form one
+    row {id, from, to, action, cards: [card ids], count (summed), confidence (lowest)}, list order."""
+    rows: dict[tuple, dict] = {}
+    for r in items or []:
+        if not (is_card(r) and r.get("state") == "pending" and r.get("action") in ("replace", "delete")):
+            continue
+        frm, to = word_pair(r["span"], r.get("suggestion"), r.get("action"))
+        row = rows.get((frm, to))
+        if row is None:
+            row = rows[(frm, to)] = {"id": row_id(frm, to), "from": frm, "to": to, "action": r["action"],
+                                     "cards": [], "count": 0, "confidence": r.get("confidence") or "low"}
+        row["cards"].append(r["id"])
+        row["count"] += card_count(r)
+        if _RANK.get(r.get("confidence"), 1) < _RANK.get(row["confidence"], 1):
+            row["confidence"] = r.get("confidence") or "low"
+    return list(rows.values())
+
+
+def auto_keep(r: dict) -> None:
+    """An AI "keep" card ("not an error") is settled by the AI itself: never pending / shown / counted."""
+    r.update(state="confirmed", resolvedBy="ai", resolution="keep", keepReason=r.get("reason") or "",
+             decidedAt=r.get("decidedAt") or now_ms())
+
+
+def migrate_cards(m: dict) -> bool:
+    """Open AI keep cards -> auto-confirmed; cards without from / to get them. True if m changed."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else None
+    changed = False
+    for r in (review or {}).get("items") or []:
+        if not is_card(r):
+            continue
+        if r.get("action") == "keep" and r.get("state") in OPEN_STATES:
+            auto_keep(r)
+            changed = True
+        if r.get("from") is None or r.get("to") is None:
+            set_pair(r)
+            changed = True
+    return changed
+
+
 # ---------------------------------------------------------------- span matching
 def _matches(text: str, span: str, guard: str = "") -> list[tuple[int, int]]:
     from .review import _matches as m  # Latin edges get word boundaries; never inside `guard`
@@ -217,7 +312,7 @@ def make_card(m: dict, span: str, action: str, suggestion: str, reason: str, con
         c["itemId"] = first_item["itemId"]
     if isinstance(t, (int, float)):
         c["t"] = float(t)
-    return c
+    return set_pair(c)
 
 
 _RANK = {"high": 3, "medium": 2, "low": 1}
@@ -333,6 +428,10 @@ def finalize_review(m: dict, items: list[dict], prev: list[dict] | None = None) 
     cards = {r["id"]: r for r in out if is_card(r)}
     for r in out:
         if is_card(r):
+            set_pair(r)
+            if r.get("action") == "keep" and r.get("state") in OPEN_STATES:
+                auto_keep(r)  # "not an error": the AI settles it, it never reaches the checklist
+                continue
             if r.get("state") in OPEN_STATES and r.get("origin") != "leftover":
                 tg = targets(m, r["span"], r["action"], r.get("suggestion") or "")
                 if tg:

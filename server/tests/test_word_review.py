@@ -255,7 +255,7 @@ def test_merged_flags_stay_merged_and_reopen_when_card_dropped():
     m = grounded_meeting()
     flags = [r for r in m["review"]["items"] if r["state"] == "pending"]
     assert flags
-    raw = [{"span": "黃任宗", "action": "keep", "suggestion": "", "reason": "r", "confidence": "low",
+    raw = [{"span": "黃任宗", "action": "replace", "suggestion": "黃任中", "reason": "r", "confidence": "low",
             "itemIds": [], "fromFlags": [f["id"] for f in flags]}]
     W.apply_ai_cards(m, raw)
     assert all(rv(m, f["id"])["state"] == "merged" for f in flags)
@@ -446,7 +446,8 @@ def test_accept_high_applies_only_high_non_name(app_client):
     r = c.post("/api/meetings/m1/review/accept-high")
     assert r.status_code == 200, r.text
     out = r.json()
-    assert out["applied"]["cards"] == 2 and out["applied"]["transcript"] == 3  # 台積店 x3 (30s, 100s x2)
+    # the keep card (股利所得) was auto-confirmed by the AI already: only 台積店 is applied
+    assert out["applied"]["cards"] == 1 and out["applied"]["transcript"] == 3  # 台積店 x3 (30s, 100s x2)
     assert out["transcript"][2]["text"].count("台積電") == 1 and "台積店" not in out["transcript"][3]["text"]
     assert rv(out, card(m, "台積店")["id"])["state"] == "confirmed"
     assert rv(out, card(m, "股利所得")["id"])["state"] == "confirmed"
@@ -463,13 +464,19 @@ def test_accept_high_no_resurrection_and_name_flag_excluded(app_client):
     app, c = app_client
     m, _ = with_cards(HIGH_RAW)
     for x in m["review"]["items"]:
-        if W.is_card(x) and x["span"] == "股利所得":
+        if W.is_card(x) and x["span"] == "台積店":
             x["sources"] = ["name"]
     app.state.store.save(m)
     out = c.post("/api/meetings/m1/review/accept-high").json()
-    assert out["applied"]["cards"] == 1
-    assert rv(out, card(m, "股利所得")["id"])["state"] == "pending"
+    assert out["applied"]["cards"] == 0
     tid = card(m, "台積店")["id"]
+    assert rv(out, tid)["state"] == "pending"
+    st = app.state.store.get("m1")
+    for x in st["review"]["items"]:
+        if x.get("id") == tid:
+            x["sources"] = ["term"]
+    app.state.store.save(st)
+    assert c.post("/api/meetings/m1/review/accept-high").json()["applied"]["cards"] == 1
     st = app.state.store.get("m1")
     got = c.put("/api/meetings/m1", json=st).json()
     assert rv(got, tid)["state"] == "confirmed"
@@ -481,4 +488,124 @@ def test_accept_high_409_while_job_active(app_client):
     app.state.store.save(m)
     assert c.post("/api/meetings/m1/ai", json={"action": "reprocess"}).status_code == 200
     r = c.post("/api/meetings/m1/review/accept-high")
+    assert r.status_code == 409 and r.json()["detail"] == "整理中，請稍後再確認"
+
+
+# ---------------------------------------------------------------- checklist (v107)
+def test_ai_keep_cards_auto_confirmed_not_counted():
+    from server.verify import pending_count
+    m, _ = with_cards()
+    for sp in ("股利所得", "怎麼死的"):
+        k = card(m, sp)
+        assert k["action"] == "keep" and k["state"] == "confirmed" and k["resolvedBy"] == "ai"
+        assert k["resolution"] == "keep" and k["keepReason"] == k["reason"]
+    assert all(r["action"] != "keep" for r in cards(m, "pending"))
+    assert len(cards(m, "pending")) == 3
+    assert pending_count(m["review"]) == len([r for r in m["review"]["items"] if r["state"] == "pending"])
+    assert not [row for row in W.review_rows(m["review"]["items"]) if row["from"] in ("股利所得", "怎麼死的")]
+    m["review"] = verify_review(m, [])  # a re-verify keeps them confirmed
+    assert card(m, "股利所得")["state"] == "confirmed"
+
+
+def test_existing_pending_keep_cards_migrated_on_read_and_reverify(app_client):
+    app, c = app_client
+    m, _ = with_cards()
+    for r in m["review"]["items"]:  # an old meeting: keep cards still pending, no word pairs
+        if W.is_card(r):
+            r.pop("from", None)
+            r.pop("to", None)
+            if r["action"] == "keep":
+                for k in ("resolvedBy", "resolution", "keepReason", "decidedAt"):
+                    r.pop(k, None)
+                r["state"] = "pending"
+    app.state.store.save(m)
+    assert len([r for r in cards(app.state.store.get("m1"), "pending") if r["action"] == "keep"]) == 2
+    got = c.get("/api/meetings/m1").json()
+    k = card(got, "股利所得")
+    assert k["state"] == "confirmed" and k["resolvedBy"] == "ai"
+    assert (card(got, "黃任宗")["from"], card(got, "黃任宗")["to"]) == ("黃任宗", "黃任中")
+    st = app.state.store.get("m1")  # saved, not only shown
+    assert card(st, "怎麼死的")["state"] == "confirmed"
+    # the pure re-verify path cleans an old meeting too
+    m2, _ = with_cards()
+    for r in m2["review"]["items"]:
+        if W.is_card(r) and r["action"] == "keep":
+            r["state"] = "pending"
+    m2["review"] = verify_review(m2, [])
+    assert card(m2, "股利所得")["state"] == "confirmed"
+
+
+@pytest.mark.parametrize("span,sug,action,want", [
+    ("討論稅", "逃漏稅", "replace", ("討論稅", "逃漏稅")),
+    ("李專", "理專", "replace", ("李專", "理專")),
+    ("所以選對專案你就自打嘴巴了", "所以選對專案你就打自己嘴巴了", "replace", ("自打", "打自己")),
+    ("我們今天要討論稅的問題喔", "我們今天要逃漏稅的問題喔", "replace", ("討論", "逃漏")),
+    ("黃任宗當初賣掉公司拿到", "黃任中當初賣掉公司拿到", "replace", ("任宗", "任中")),
+    ("選對專案你就自打嘴巴了真的", "", "delete", ("選對專案你就自打嘴巴了…", "（刪除）")),
+    ("嗯那個", "", "delete", ("嗯那個", "（刪除）")),
+])
+def test_word_pair_diff(span, sug, action, want):
+    frm, to = W.word_pair(span, sug, action)
+    assert (frm, to) == want and len(frm) <= 12 and len(to) <= 12
+
+
+def test_word_pair_stored_and_rows_merge_same_pair_across_spans():
+    m = grounded_meeting()
+    W.apply_ai_cards(m, [
+        {"span": "黃任宗當初", "action": "replace", "suggestion": "黃任中當初", "reason": "r1", "confidence": "high",
+         "itemIds": [], "fromFlags": []},
+        {"span": "黃任宗不想繳", "action": "replace", "suggestion": "黃任中不想繳", "reason": "r2", "confidence": "low",
+         "itemIds": [], "fromFlags": []},
+        {"span": "，前後數字不一致", "action": "delete", "suggestion": "", "reason": "r", "confidence": "high",
+         "itemIds": [], "fromFlags": []}])
+    a, b = card(m, "黃任宗當初"), card(m, "黃任宗不想繳")
+    assert (a["from"], a["to"]) == ("任宗", "任中") == (b["from"], b["to"])
+    rows = W.review_rows(m["review"]["items"])
+    row = next(x for x in rows if x["from"] == "任宗")
+    assert row["cards"] == [a["id"], b["id"]] and row["confidence"] == "low"
+    assert row["count"] == W.card_count(a) + W.card_count(b) and row["id"] == W.row_id("任宗", "任中")
+    d = next(x for x in rows if x["to"] == "（刪除）")
+    assert d["from"] == "，前後數字不一致" and d["action"] == "delete"
+
+
+def test_apply_batch_accept_and_keep_counts(app_client):
+    app, c = app_client
+    m = grounded_meeting()
+    W.apply_ai_cards(m, [
+        {"span": "黃任宗當初", "action": "replace", "suggestion": "黃任中當初", "reason": "r1", "confidence": "high",
+         "itemIds": [], "fromFlags": []},
+        {"span": "黃任宗不想繳", "action": "replace", "suggestion": "黃任中不想繳", "reason": "r2", "confidence": "high",
+         "itemIds": [], "fromFlags": []},
+        {"span": "Jefry", "action": "replace", "suggestion": "Jeffrey", "reason": "r", "confidence": "medium",
+         "itemIds": [], "fromFlags": []},
+        {"span": "，前後數字不一致", "action": "delete", "suggestion": "", "reason": "r", "confidence": "high",
+         "itemIds": [], "fromFlags": []}])
+    app.state.store.save(m)
+    row = next(x for x in W.review_rows(m["review"]["items"]) if x["from"] == "任宗")
+    jid, did = card(m, "Jefry")["id"], card(m, "，前後數字不一致")["id"]
+    r = c.post("/api/meetings/m1/review/apply-batch", json={"accept": [row["id"], did], "keep": [jid]})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["applied"] == {"cards": 3, "kept": 1, "transcript": 2, "items": 1}
+    assert out["transcript"][0]["text"].endswith("黃任中當初賣掉公司拿到60億")
+    assert out["transcript"][1]["text"].endswith("黃任中不想繳")
+    assert out["transcript"][2]["text"].startswith("Jefry")
+    assert out["summary"]["cases"][1]["text"] == "黃任宗成立境外公司"
+    for cid in row["cards"] + [did]:
+        assert rv(out, cid)["state"] == "confirmed" and rv(out, cid)["resolution"] == "accept"
+    assert rv(out, jid)["state"] == "confirmed" and rv(out, jid)["resolution"] == "keep"
+    assert not cards(out, "pending") and "applied" not in app.state.store.get("m1")
+    # unknown / already-settled ids are ignored
+    again = c.post("/api/meetings/m1/review/apply-batch", json={"accept": [jid, "nope"], "keep": []}).json()
+    assert again["applied"] == {"cards": 0, "kept": 0, "transcript": 0, "items": 0}
+    assert c.post("/api/meetings/m1/review/apply-batch", json={"accept": "x"}).status_code == 400
+    assert c.post("/api/meetings/m1/review/accept-high").status_code == 200  # old endpoint still there
+
+
+def test_apply_batch_409_while_job_active(app_client):
+    app, c = app_client
+    m, _ = with_cards(HIGH_RAW)
+    app.state.store.save(m)
+    assert c.post("/api/meetings/m1/ai", json={"action": "reprocess"}).status_code == 200
+    r = c.post("/api/meetings/m1/review/apply-batch", json={"accept": [card(m, "台積店")["id"]], "keep": []})
     assert r.status_code == 409 and r.json()["detail"] == "整理中，請稍後再確認"
