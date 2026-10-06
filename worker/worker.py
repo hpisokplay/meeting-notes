@@ -207,9 +207,7 @@ def gpu_process(api, job, audio):
         wave = np.concatenate([asr.load_audio(p) for p in paths])
         api.check()
         total = len(wave) / 16000.0
-        glossary = (job.get("payload") or {}).get("glossary") or []
-        words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""),
-                                     glossary=glossary)
+        words = asr.transcribe_words(wave, lambda f: api.progress("asr", f * 100, ""))
         asr.release()
         api.progress("diar", 0, "")
         turns = diar.diarize(wave)

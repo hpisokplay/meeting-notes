@@ -5,7 +5,7 @@ import types
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 import asr
-from pipeline import PROMPT, build_hotwords, fix_traditional, smooth_speakers
+from pipeline import PROMPT, fix_traditional, smooth_speakers
 
 
 def S(spk, text, t):
@@ -79,32 +79,6 @@ def test_fix_traditional():
     assert fix_traditional("隻有") == "只有"
 
 
-# ---- hotwords wiring
-def test_build_hotwords():
-    assert build_hotwords(None) is None
-    assert build_hotwords([]) is None
-    assert build_hotwords(["股利", " ", "ETF"]) == "股利 ETF"
-
-
-def test_hotwords_capped_by_size_and_warns(caplog):
-    import logging
-    with caplog.at_level(logging.WARNING, logger="worker"):
-        out = build_hotwords(["t%d" % i for i in range(300)])
-    assert len(out.split()) == 60
-    assert "dropped 240 of 300" in caplog.text
-    caplog.clear()
-    with caplog.at_level(logging.WARNING, logger="worker"):
-        out = build_hotwords(["一二三四五六七八九十"] * 10)  # 10 chars each -> 6 fit
-    assert len(out.split()) == 6 and "dropped 4 of 10" in caplog.text
-
-
-def test_hotwords_small_glossary_no_warning(caplog):
-    import logging
-    with caplog.at_level(logging.WARNING, logger="worker"):
-        assert build_hotwords(["Pilot line", "股利"]) == "Pilot line 股利"
-    assert caplog.text == ""
-
-
 def test_flicker_ababa_collapses():
     segs = [S("A", "正文很長", 0.0), S("B", "嗯", 5.0), S("A", "對", 6.0), S("B", "好", 7.0), S("A", "繼續", 8.0)]
     out = smooth_speakers(segs)
@@ -120,16 +94,8 @@ class FakePipe:
         return iter([]), types.SimpleNamespace(duration=1.0)
 
 
-def test_transcribe_passes_hotwords_and_prompt(monkeypatch):
-    fp = FakePipe()
-    monkeypatch.setattr(asr, "_model", object())
-    monkeypatch.setattr(asr, "_pipe", fp)
-    asr.transcribe_words([0.0], glossary=["股利", "CPO"])
-    assert fp.kw["hotwords"] == "股利 CPO"
-    assert fp.kw["initial_prompt"] == PROMPT
-
-
-def test_transcribe_without_glossary_omits_hotwords(monkeypatch):
+def test_transcribe_uses_neutral_prompt_never_hotwords(monkeypatch):
+    """Glossary terms (hotwords or in the prompt) measurably dropped words and punctuation."""
     fp = FakePipe()
     monkeypatch.setattr(asr, "_model", object())
     monkeypatch.setattr(asr, "_pipe", fp)

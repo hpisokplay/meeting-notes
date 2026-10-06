@@ -1,6 +1,5 @@
 """Pure functions: word/speaker alignment, segment building, cleanup. No GPU, no network."""
 import bisect
-import logging
 import re
 
 PROMPT = "以下是繁體中文的會議。"
@@ -129,31 +128,6 @@ def filter_hallucinations(segs, prompt):
             out.extend(kept[i:j + 1])
         i = j + 1
     return out
-
-
-HOTWORD_BUDGET = 60  # CJK chars + ASCII words; faster-whisper truncates hotwords at ~223 tokens
-_log = logging.getLogger("worker")
-_WORD_UNITS = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-_+]*|[^\sA-Za-z0-9]")
-
-
-def _units(term):
-    return len(_WORD_UNITS.findall(term))
-
-
-def build_hotwords(glossary):
-    """Glossary list -> faster-whisper `hotwords` string (None when empty).
-    Terms are kept in order until the size budget is reached; the rest are dropped (warned)."""
-    terms = [t.strip() for t in (glossary or []) if isinstance(t, str) and t.strip()]
-    kept, used = [], 0
-    for t in terms:
-        u = _units(t)
-        if used + u > HOTWORD_BUDGET:
-            break
-        kept.append(t)
-        used += u
-    if len(kept) < len(terms):
-        _log.warning("glossary too long for hotwords: dropped %d of %d terms", len(terms) - len(kept), len(terms))
-    return " ".join(kept) or None
 
 
 _NUM_BEFORE = "一二兩三四五六七八九十幾每這那半"
