@@ -5,8 +5,22 @@ import { getGroups, addGroup, renameGroup, removeGroup, groupName, groupColor, l
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord, splitQA } from './export.js';
+import {
+  itemText,
+  itemSrc,
+  fmtSec,
+  meetingMode,
+  summarySections,
+  ALL_SUMMARY_KEYS,
+  groupItems,
+  pendingReview,
+  reviewItems,
+  exportLockText,
+  REVIEW_KIND,
+  segIndexAt,
+} from './items.js';
 
-const APP_VERSION = 'v101';
+const APP_VERSION = 'v102';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -68,15 +82,37 @@ const PROGRESS_STAGE_TEXT = {
   summarizing: '摘要中',
   queued: '排隊中（等電腦轉錄器）',
   transcribing: '轉錄中',
+  // 重新整理（不重新轉錄）的各步驟
+  reprocess: '重新整理',
+  correction: '名詞校正中',
+  correct: '名詞校正中',
+  mode: '判斷講座／會議',
+  summary: '整理摘要中',
+  notes: '整理筆記中',
+  slips: '檢查講者口誤',
+  verify: '驗證中',
 };
 const GPU_STEPS = ['download', 'asr', 'diar', 'upload'];
+const REPROCESS_STEPS = ['correction', 'mode', 'summary', 'notes', 'verify'];
+// 伺服器回報的進度文字（progress.msg）→ 第幾步（stage 沒給時用文字判斷）
+const REPROCESS_MSG = ['名詞校正', '判斷講座', '整理摘要', '整理筆記', '驗證'];
 export function progressLabel(m) {
   const base = STAGE_TEXT[m && m.status] || (m && m.status) || '';
-  const stage = (m && m.progress && m.progress.stage) || '';
+  const p = (m && m.progress) || {};
+  let stage = p.stage || '';
+  if (stage === 'correct') stage = 'correction';
+  // 重新整理：stage 不明時從訊息文字認出是哪一步
+  if (!REPROCESS_STEPS.includes(stage) && !GPU_STEPS.includes(stage) && typeof p.msg === 'string') {
+    const i = REPROCESS_MSG.findIndex((w) => p.msg.includes(w));
+    if (i >= 0) stage = REPROCESS_STEPS[i];
+  }
   const sub = PROGRESS_STAGE_TEXT[stage];
   if (!sub || sub === base) return base;
-  const step = GPU_STEPS.indexOf(stage);
-  return `${base}・${sub}${step >= 0 ? `（第 ${step + 1}/${GPU_STEPS.length} 步）` : ''}`;
+  let step = GPU_STEPS.indexOf(stage);
+  if (step >= 0) return `${base}・${sub}（第 ${step + 1}/${GPU_STEPS.length} 步）`;
+  step = REPROCESS_STEPS.indexOf(stage);
+  if (step >= 0) return `${base}・${sub}（第 ${step + 1}/${REPROCESS_STEPS.length} 步）`;
+  return `${base}・${sub}`;
 }
 // 停止／取消要取消「正在跑的那個工作」：摘要中是 AI 工作，其餘是轉錄工作
 export function activeJobId(m) {
@@ -126,6 +162,10 @@ export function timeLabel(seg) {
   return h ? `${h}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
 }
 
+// 條目（字串或 {text} 物件）的文字轉換：物件只改 text，其他欄位（id、src、group）保留
+export const fixItem = (fix) => (x) =>
+  typeof x === 'string' ? fix(x) : x && typeof x === 'object' && typeof x.text === 'string' ? { ...x, text: fix(x.text) } : x;
+
 // 把字串轉換套用到學習筆記的每一個文字欄位（就地修改）。
 // 專有名詞訂正若只改逐字稿與摘要，筆記會留著錯字——那正是使用者複習時在看的東西。
 export function applyTermInNotes(notes, fix) {
@@ -134,7 +174,7 @@ export function applyTermInNotes(notes, fix) {
   (notes.outline || []).forEach((o) => {
     o.title = f(o.title);
     o.anchor = f(o.anchor);
-    o.points = (o.points || []).map(f);
+    o.points = (o.points || []).map(fixItem(fix));
   });
   (notes.concepts || []).forEach((c) => {
     c.term = f(c.term);
@@ -392,14 +432,15 @@ function detailBusy() {
 }
 
 // 在 NAS 跑一項 AI 工作並等它結束；回傳伺服器寫回結果後的最新會議（已存進快取）
+// action 可以是 AI 動作名稱，或是一個「送出請求並回傳伺服器回應」的函式（模式切換、還原原始逐字稿等）
 async function runServerAI(meetingId, key, initialLabel, action, params, onMsg) {
   const k = taskId(meetingId, key);
   const t = { label: initialLabel, jobId: null };
   detailTasks.set(k, t);
   paintDetailTasks();
   try {
-    t.jobId = await api.runAI(meetingId, action, params || {});
-    await api.waitJob(t.jobId, (p) => {
+    t.jobId = typeof action === 'function' ? api.jobIdOf(await action()) : await api.runAI(meetingId, action, params || {});
+    if (t.jobId) await api.waitJob(t.jobId, (p) => {
       const msg = p && (p.msg || (p.pct != null ? `${initialLabel.replace(/…$/, '')} ${p.pct}%` : ''));
       if (msg && msg !== t.label) {
         t.label = msg;
@@ -425,24 +466,30 @@ const EXPORT_SECTIONS = [
   { k: 'notes', label: '📚 學習筆記（含表格）' },
   { k: 'transcript', label: '🗣️ 逐字稿 Transcribe' },
 ];
-function getExportSections() {
+// 講座模式：沒有待辦，改為核心結論／講者建議／風險提醒／案例／重點／Q&A
+const EXPORT_SECTIONS_LECTURE = [
+  ...summarySections({ mode: 'lecture' }).map((s) => ({ k: s.k, label: s.label })),
+  ...EXPORT_SECTIONS.slice(3),
+];
+function getExportSections(list = EXPORT_SECTIONS) {
   try {
     const o = JSON.parse(localStorage.getItem(EXPORT_SEC_KEY)) || {};
-    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = s.k === 'notes' ? o.notes === true : o[s.k] !== false), a), {});
+    return list.reduce((a, s) => ((a[s.k] = s.k === 'notes' ? o.notes === true : o[s.k] !== false), a), {});
   } catch (_) {
-    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = s.k !== 'notes'), a), {});
+    return list.reduce((a, s) => ((a[s.k] = s.k !== 'notes'), a), {});
   }
 }
 // 匯出前選段落；回傳選項物件，取消則回傳 null
-function pickExportSections(kind) {
+function pickExportSections(kind, lecture) {
+  const list = lecture ? EXPORT_SECTIONS_LECTURE : EXPORT_SECTIONS;
   return new Promise((resolve) => {
-    const cur = getExportSections();
+    const cur = getExportSections(list);
     const ov = document.createElement('div');
     ov.className = 'sheet-ov';
     ov.innerHTML = `<div class="sheet">
       <div class="sheet-title">匯出${esc(kind)}：要包含哪些段落？</div>
-      ${EXPORT_SECTIONS.map(
-        (s) => `<label class="sheet-btn"><input type="checkbox" data-k="${s.k}"${cur[s.k] ? ' checked' : ''} style="margin-right:10px">${s.label}</label>`
+      ${list.map(
+        (s) => `<label class="sheet-btn"><input type="checkbox" data-k="${s.k}"${cur[s.k] ? ' checked' : ''} style="margin-right:10px">${esc(s.label)}</label>`
       ).join('')}
       <button class="sheet-btn primary" id="expGo">開始匯出</button>
       <button class="sheet-btn cancel" id="expCancel">取消</button>
@@ -463,7 +510,12 @@ function pickExportSections(kind) {
         alert('至少要選一個段落');
         return;
       }
-      localStorage.setItem(EXPORT_SEC_KEY, JSON.stringify(picked));
+      // 只覆寫這次清單上的鍵：講座與會議的選擇互不洗掉
+      let prev = {};
+      try {
+        prev = JSON.parse(localStorage.getItem(EXPORT_SEC_KEY)) || {};
+      } catch (_) {}
+      localStorage.setItem(EXPORT_SEC_KEY, JSON.stringify({ ...prev, ...picked }));
       close(picked);
     };
   });
@@ -613,8 +665,9 @@ async function renderList(groupId) {
   };
   const cardHtml = (m) => {
     const known = new Set(getGroups().map((g) => g.id));
-    const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
-    const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
+    const sm = m.summary || {};
+    const mp = (sm.conclusions && sm.conclusions.length ? sm.conclusions : sm.mainPoints || sm.keyPoints) || [];
+    const snip = mp.length ? mp.map(itemText).join('、') : transcriptToText(m.transcript).slice(0, 60);
     const gn = m.group && known.has(m.group) ? groupName(m.group) : '';
     const gc = gn ? esc(groupColor(m.group)) : '';
     return `<div class="card tap" data-id="${esc(m.id)}">
@@ -1179,26 +1232,56 @@ async function renderDetail(id, preloaded) {
 
   // del：編輯模式下附上刪除鈕；此時不掛 data-jump，避免點刪除誤觸「跳到出處」
   const delBtn = (key, i) => `<button class="item-del" data-del="${key}:${i}" type="button">✕</button>`;
-  const olHtml = (arr, key, del) =>
-    arr && arr.length
-      ? `<ol class="list${del ? ' editing' : ''}">${arr
-          .map((x, i) => `<li${del ? '' : ` data-jump="${key}:${i}"`}>${esc(x)}${del ? delBtn(key, i) : ''}</li>`)
-          .join('')}</ol>`
-      : `<div class="meta" style="padding-left:4px">（無）</div>`;
+  // 出處時間標記：每個 src 一顆小鈕，點了跳到逐字稿那一句（有錄音就從那裡播放）
+  const srcChips = (x, del) =>
+    del
+      ? ''
+      : itemSrc(x)
+          .map((s) => `<button class="src-chip" type="button" data-src-t="${s.t}" data-src-q="${esc(s.quote)}" title="${esc(s.quote)}">▶ ${esc(fmtSec(s.t))}</button>`)
+          .join('');
+  // 條目清單（字串或物件）；有 group 時依主題分組、編號連續；data-jump／刪除用原始索引
+  const olHtml = (arr, key, del) => {
+    if (!arr || !arr.length) return `<div class="meta" style="padding-left:4px">（無）</div>`;
+    let n = 0;
+    return groupItems(arr)
+      .map((g) => {
+        const start = n + 1;
+        n += g.items.length;
+        return (
+          (g.group ? `<div class="item-group">${esc(g.group)}</div>` : '') +
+          `<ol class="list${del ? ' editing' : ''}"${start > 1 ? ` start="${start}"` : ''}>${g.items
+            .map(([x, i]) => `<li${del ? '' : ` data-jump="${key}:${i}"`}>${esc(itemText(x))}${srcChips(x, del)}${del ? delBtn(key, i) : ''}</li>`)
+            .join('')}</ol>`
+        );
+      })
+      .join('');
+  };
   const qaHtml = (arr, del) =>
     arr && arr.length
       ? `<ol class="list qa${del ? ' editing' : ''}">${arr
           .map((x, i) => {
             const { q, a } = splitQA(x);
-            return `<li${del ? '' : ` data-jump="qa:${i}"`}><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}${del ? delBtn('qa', i) : ''}</li>`;
+            return `<li${del ? '' : ` data-jump="qa:${i}"`}><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}${srcChips(x, del)}${del ? delBtn('qa', i) : ''}</li>`;
           })
           .join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">無</div>`;
-  const numbered = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
+  const numbered = (arr) => {
+    let n = 0;
+    return groupItems(arr || [])
+      .map((g) => (g.group ? `【${g.group}】\n` : '') + g.items.map(([x]) => `${++n}. ${itemText(x)}`).join('\n'))
+      .join('\n');
+  };
   const qaText = (arr) =>
     arr && arr.length
       ? arr.map((x, i) => { const { q, a } = splitQA(x); return `${i + 1}. 問：${q}\n   答：${a}`; }).join('\n')
       : '無';
+  // 匯出把關：待確認清單沒清空前，分享／PDF／Word 都不能用
+  const exportBlocked = () => {
+    const n = pendingReview(m).length;
+    if (!n) return false;
+    alert(exportLockText(n));
+    return true;
+  };
 
   const contentFor = (l) => {
     if (l === 'orig') return { transcript: m.transcript || [], summary: m.summary || {}, notes: m.notes || null };
@@ -1220,7 +1303,7 @@ async function renderDetail(id, preloaded) {
   const stBanner = (!m.status || m.status === 'done') && !summaryFailed
     ? ''
     : isProcessing(m)
-      ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(statusText(m))}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
+      ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(statusText(m))}${m.progress && m.progress.msg ? `・${esc(m.progress.msg)}` : ''}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
       : `<div class="warn st-warn"><div class="err">❌ ${esc(summaryFailed ? `摘要失敗：${m.error}` : statusText(m))}</div>${hasTranscript ? '<button class="act-btn" id="reSummary" data-task="summary" style="margin-top:8px">🔄 重新產生摘要</button>' : ''}</div>`;
   const audioCard = audioParts.length
     ? `<div class="card" id="audioCard">
@@ -1252,15 +1335,17 @@ async function renderDetail(id, preloaded) {
         <button class="act-btn" id="pdfBtn">📄 PDF</button>
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
+      <div class="export-lock" id="exportLock" hidden></div>
       <div class="lang-toggle" id="modeToggle" style="margin-top:10px">
-        <button data-mode="meeting">📋 會議摘要</button>
+        <button data-mode="meeting">📋 ${meetingMode(m) === 'lecture' ? '講座摘要' : '會議摘要'}</button>
         <button data-mode="notes">📚 學習筆記</button>
       </div>
+      <div class="review-box" id="reviewCard" hidden></div>
       <div class="act-grid" id="enhGrid"></div>
     </div>
     <div class="card" id="termsCard">
-      <div class="section-title sec-head" data-sec="terms" style="margin-top:0"><span class="sec-t">📝 專有名詞訂正</span><span class="sec-right"><span class="chev" id="termsChev">▾</span></span></div>
-      <div class="sec-body" id="termsSecBody"><div id="termsBody"></div></div>
+      <div class="section-title sec-head" data-sec="terms" style="margin-top:0"><span class="sec-t">📝 專有名詞訂正<span class="corr-badge" id="corrBadge"></span></span><span class="sec-right"><span class="chev" id="termsChev">▾</span></span></div>
+      <div class="sec-body" id="termsSecBody"><div id="corrBody"></div><div id="termsBody"></div></div>
     </div>
     ${audioCard}
     <div id="detailBody"></div>
@@ -1369,7 +1454,7 @@ async function renderDetail(id, preloaded) {
       eg.innerHTML =
         mode === 'notes'
           ? NOTE_ENH.map((x) => `<button class="act-btn" data-nenh="${x.k}" data-task="nenh:${x.k}">${x.label}</button>`).join('')
-          : MEET_ENH.map((x) => `<button class="act-btn" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('');
+          : (meetingMode(m) === 'lecture' ? LECT_ENH : MEET_ENH).map((x) => `<button class="act-btn" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('');
       eg.hidden = mode === 'notes' && !m.notes; // 還沒產生筆記時沒有東西可加強
       wireEnhButtons();
     }
@@ -1381,6 +1466,8 @@ async function renderDetail(id, preloaded) {
     { k: 'mainPoints', label: '📌 加強重點' },
     { k: 'qa', label: '❓ 加強Q&A' },
   ];
+  // 講座模式沒有待辦
+  const LECT_ENH = MEET_ENH.filter((x) => x.k !== 'actionItems');
   const NOTE_ENH = [
     { k: 'outline', label: '📑 加強大綱' },
     { k: 'concepts', label: '💡 加強概念' },
@@ -1412,14 +1499,14 @@ async function renderDetail(id, preloaded) {
     const outline = (n.outline || [])
       .map(
         (o, i) =>
-          `<div class="nt-sec"${ed('nt-o') ? '' : ` data-jump="nt:${i}"`}><div class="nt-sec-t">${i + 1}. ${esc(o.title)}${ed('nt-o') ? delBtn('nt-o', i) : ''}</div>` +
-          `${(o.points || []).length ? `<ul class="list">${o.points.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : ''}</div>`
+          `<div class="nt-sec"${ed('nt-o') ? '' : ` data-jump="nt:${i}"`}><div class="nt-sec-t">${i + 1}. ${esc(o.title)}${srcChips(o, ed('nt-o'))}${ed('nt-o') ? delBtn('nt-o', i) : ''}</div>` +
+          `${(o.points || []).length ? `<ul class="list">${o.points.map((p) => `<li>${esc(itemText(p))}${srcChips(p, ed('nt-o'))}</li>`).join('')}</ul>` : ''}</div>`
       )
       .join('');
     const concepts = (n.concepts || [])
       .map(
         (x, i) =>
-          `<div class="nt-concept"><div class="nt-term">${esc(x.term)}${ed('nt-c') ? delBtn('nt-c', i) : ''}</div><div class="nt-plain">${esc(x.plain)}</div>` +
+          `<div class="nt-concept"><div class="nt-term">${esc(x.term)}${srcChips(x, ed('nt-c'))}${ed('nt-c') ? delBtn('nt-c', i) : ''}</div><div class="nt-plain">${esc(x.plain)}</div>` +
           `${x.why ? `<div class="nt-why">→ ${esc(x.why)}</div>` : ''}</div>`
       )
       .join('');
@@ -1447,14 +1534,14 @@ async function renderDetail(id, preloaded) {
               .map(
                 ([f, i]) =>
                   `<div class="fig-row"><span class="fig-l">${esc(f.label)}</span>` +
-                  `<span class="fig-v">${esc(f.value)}</span>${ed('nt-f') ? delBtn('nt-f', i) : ''}</div>`
+                  `<span class="fig-v">${esc(f.value)}</span>${srcChips(f, ed('nt-f'))}${ed('nt-f') ? delBtn('nt-f', i) : ''}</div>`
               )
               .join('')
         )
         .join('');
     }
     const quiz = (n.quiz || [])
-      .map((x, i) => `<div class="nt-quiz"><div class="nt-q">Q${i + 1}. ${esc(x.q)}${ed('nt-q') ? delBtn('nt-q', i) : ''}</div><div class="nt-a">${esc(x.a)}</div></div>`)
+      .map((x, i) => `<div class="nt-quiz"><div class="nt-q">Q${i + 1}. ${esc(x.q)}${srcChips(x, ed('nt-q'))}${ed('nt-q') ? delBtn('nt-q', i) : ''}</div><div class="nt-a">${esc(x.a)}</div></div>`)
       .join('');
     const none = '<div class="meta" style="padding-left:4px">（無）</div>';
     return `<div class="card mode-pane">
@@ -1474,6 +1561,7 @@ async function renderDetail(id, preloaded) {
   };
 
   let editSec = null; // 目前處於編輯模式的區塊代碼（一次只開一區）
+  let curJump = null; // drawBody 設定：(秒數, 原句) → 跳到逐字稿那一句（待確認清單的時間鈕也用）
 
   const drawBody = (l) => {
     const c = contentFor(l);
@@ -1485,6 +1573,8 @@ async function renderDetail(id, preloaded) {
     const actionItems = s.actionItems || [];
     const mainPoints = s.mainPoints || s.keyPoints || [];
     const qa = s.qa || [];
+    const lecture = meetingMode(m) === 'lecture';
+    const SECS = summarySections(m); // 講座／會議各自的區塊
     const colors = speakerColors(c.transcript);
     const isOrig = l === 'orig';
     // 時間標記：約每分鐘插一個，畫面才不會被時間塞滿。多檔錄音各自從 0 分開始計。
@@ -1538,6 +1628,7 @@ async function renderDetail(id, preloaded) {
     // 區塊代碼 → 實際的資料位置，供「兩版切換／合併／編輯」使用
     const SEC_SRC = {
       ai: ['summary', 'actionItems'], mp: ['summary', 'mainPoints'], qa: ['summary', 'qa'],
+      lc: ['summary', 'conclusions'], la: ['summary', 'advice'], lr: ['summary', 'risks'], lk: ['summary', 'cases'],
       'nt-o': ['notes', 'outline'], 'nt-c': ['notes', 'concepts'], 'nt-t': ['notes', 'tables'],
       'nt-f': ['notes', 'figures'], 'nt-q': ['notes', 'quiz'],
     };
@@ -1554,14 +1645,22 @@ async function renderDetail(id, preloaded) {
     };
 
     // 會議摘要三區 vs 學習筆記五區：只有這張卡片隨模式切換，逐字稿以下兩模式共用
+    // 講座／會議切換＋重新整理（只在原文顯示；有逐字稿才能重整）
+    const kindRow =
+      isOrig && hasTranscript
+        ? `<div class="kind-row"><span class="kind-l">類型</span>
+            <span class="kind-toggle"><button type="button" class="act-btn${lecture ? ' on' : ''}" data-kind="lecture" data-task="kind:lecture">🎤 講座</button><button type="button" class="act-btn${lecture ? '' : ' on'}" data-kind="meeting" data-task="kind:meeting">👥 會議</button></span>
+            <button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess">🔁 重新整理（不重新轉錄）</button></div>`
+        : '';
+    const secItems = (sec) => (sec.k === 'mainPoints' ? mainPoints : s[sec.k] || []);
     const meetingCard = `
       <div class="card mode-pane">
-        ${secHead('ai', '✅ 待辦事項 Action Item', 'ai', 'margin-top:0')}
-        <div class="sec-body" data-secbody="ai"${coll.ai ? ' hidden' : ''}>${olHtml(actionItems, 'ai', editSec === 'ai')}</div>
-        ${secHead('mp', '📌 會議重點 Main Point', 'mp')}
-        <div class="sec-body" data-secbody="mp"${coll.mp ? ' hidden' : ''}>${olHtml(mainPoints, 'mp', editSec === 'mp')}</div>
-        ${secHead('qa', '❓ 會議提問 Q&amp;A', 'qa')}
-        <div class="sec-body" data-secbody="qa"${coll.qa ? ' hidden' : ''}>${qaHtml(qa, editSec === 'qa')}</div>
+        ${kindRow}
+        ${SECS.map(
+          (sec, n) =>
+            `${secHead(sec.code, esc(sec.label), sec.code, n === 0 && !kindRow ? 'margin-top:0' : '')}
+        <div class="sec-body" data-secbody="${sec.code}"${coll[sec.code] ? ' hidden' : ''}>${sec.k === 'qa' ? qaHtml(qa, editSec === 'qa') : olHtml(secItems(sec), sec.code, editSec === sec.code)}</div>`
+        ).join('')}
         <div class="hint" style="margin-top:10px">點各區標題可摺疊／展開；<b>點任一條內容</b>可跳到它在逐字稿中的出處</div>
       </div>`;
 
@@ -1609,18 +1708,48 @@ async function renderDetail(id, preloaded) {
       setTimeout(() => target.classList.remove('flash'), 2400);
     };
     // 學習筆記的章節用「原話錨點」定位（逐字稿沒有時間戳），錨點不可靠時退回用標題比對
-    const noteAnchors = ((c.notes || m.notes || {}).outline || []).map((o) => o.anchor || o.title);
-    const arrMap = { ai: actionItems, mp: mainPoints, qa, 'nt': noteAnchors };
+    const noteOutline = (c.notes || m.notes || {}).outline || [];
+    const noteAnchors = noteOutline.map((o) => o.anchor || o.title);
+    const arrMap = {
+      ai: actionItems, mp: mainPoints, qa, lc: s.conclusions || [], la: s.advice || [], lr: s.risks || [], lk: s.cases || [],
+      'nt': noteAnchors,
+    };
+    const srcMap = { ...arrMap, nt: noteOutline };
+    // 有出處（src）的條目直接跳到那個時間點的那一句
+    const jumpToSrc = (t, quote) => {
+      const idx = segIndexAt(t, c.transcript || []);
+      if (idx < 0) {
+        toast('找不到明確的逐字稿出處');
+        return;
+      }
+      jumpTo(idx, quote);
+    };
+    curJump = jumpToSrc;
+    bodyEl.querySelectorAll('.src-chip').forEach((b) => {
+      b.onclick = (e) => {
+        e.stopPropagation(); // 別觸發條目本身的跳轉或區塊摺疊
+        const t = Number(b.dataset.srcT);
+        jumpToSrc(t, b.dataset.srcQ || '');
+        if (audioParts.length) seekTo({ t });
+      };
+    });
     bodyEl.querySelectorAll('[data-jump]').forEach((li) => {
       li.onclick = () => {
         const [k, iStr] = li.dataset.jump.split(':');
-        const itemText = (arrMap[k] || [])[+iStr] || '';
-        const idx = bestSegIndex(itemText, c.transcript || []);
+        const item = (srcMap[k] || [])[+iStr];
+        const src = itemSrc(item);
+        if (src.length) {
+          jumpToSrc(src[0].t, src[0].quote);
+          toast(`出處約在 ${fmtSec(src[0].t)}`);
+          return;
+        }
+        const itemText_ = itemText((arrMap[k] || [])[+iStr]);
+        const idx = bestSegIndex(itemText_, c.transcript || []);
         if (idx < 0) {
           toast('找不到明確的逐字稿出處');
           return;
         }
-        jumpTo(idx, itemText);
+        jumpTo(idx, itemText_);
         const seg = (c.transcript || [])[idx];
         if (seg && seg.t != null) toast(`出處約在 ${timeLabel(seg)}`);
       };
@@ -1631,8 +1760,12 @@ async function renderDetail(id, preloaded) {
       ai: numbered(actionItems),
       mp: numbered(mainPoints),
       qa: qaText(qa),
+      lc: numbered(s.conclusions),
+      la: numbered(s.advice),
+      lr: numbered(s.risks),
+      lk: numbered(s.cases),
       tr: transcriptToText(c.transcript),
-      'nt-o': (nt.outline || []).map((o, i) => `${i + 1}. ${o.title}\n${(o.points || []).map((p) => `   - ${p}`).join('\n')}`).join('\n'),
+      'nt-o': (nt.outline || []).map((o, i) => `${i + 1}. ${o.title}\n${(o.points || []).map((p) => `   - ${itemText(p)}`).join('\n')}`).join('\n'),
       'nt-c': (nt.concepts || []).map((x) => `${x.term}：${x.plain}${x.why ? `（${x.why}）` : ''}`).join('\n'),
       'nt-t': (nt.tables || [])
         .map((t) => [t.title, t.headers.join('\t'), ...t.rows.map((r) => r.join('\t'))].filter(Boolean).join('\n'))
@@ -1709,6 +1842,10 @@ async function renderDetail(id, preloaded) {
     if (gn) gn.onclick = () => doGenNotes();
     const rgn = document.getElementById('regenNotes');
     if (rgn) rgn.onclick = () => doGenNotes();
+    bodyEl.querySelectorAll('[data-kind]').forEach((b) => (b.onclick = () => doSetKind(b.dataset.kind)));
+    const rp = document.getElementById('reprocessBtn');
+    if (rp) rp.onclick = () => doReprocess();
+    paintDetailTasks(); // 重繪後把仍在跑的作業畫回按鈕
 
     if (isOrig) {
       // 點段落 → 直接編輯逐字稿文字
@@ -1798,13 +1935,15 @@ async function renderDetail(id, preloaded) {
   document.querySelectorAll('#langToggle button').forEach((b) => (b.onclick = () => setLang(b.dataset.l)));
 
   document.getElementById('pdfBtn').onclick = async () => {
-    const opts = await pickExportSections('PDF');
+    if (exportBlocked()) return;
+    const opts = await pickExportSections('PDF', meetingMode(m) === 'lecture');
     if (!opts) return;
     // iOS 主畫面 App 無法控制列印檔名 → 改開 Safari 分頁，需要告知使用者接下來怎麼做
     if (exportPdf(viewMeeting(), opts) === 'newtab') toast('已在 Safari 開啟，請用分享鈕 → 列印 → 儲存 PDF');
   };
   document.getElementById('wordBtn').onclick = async () => {
-    const opts = await pickExportSections('Word');
+    if (exportBlocked()) return;
+    const opts = await pickExportSections('Word', meetingMode(m) === 'lecture');
     if (opts) exportWord(viewMeeting(), opts);
   };
 
@@ -1840,8 +1979,9 @@ async function renderDetail(id, preloaded) {
   const applyTerm = (fresh, oldV, newV) => {
     (fresh.transcript || []).forEach((s) => { s.text = protectedReplace(s.text, oldV, newV); });
     const s = fresh.summary || {};
-    ['actionItems', 'mainPoints', 'keyPoints', 'qa'].forEach((k) => {
-      if (Array.isArray(s[k])) s[k] = s[k].map((x) => protectedReplace(x, oldV, newV));
+    const fix = fixItem((x) => protectedReplace(x, oldV, newV));
+    ALL_SUMMARY_KEYS.forEach((k) => {
+      if (Array.isArray(s[k])) s[k] = s[k].map(fix);
     });
     // 學習筆記也要一起訂正，否則逐字稿改對了、複習時看的筆記還是錯字
     if (fresh.notes) applyTermInNotes(fresh.notes, (x) => protectedReplace(x, oldV, newV));
@@ -2017,6 +2157,190 @@ async function renderDetail(id, preloaded) {
   };
   drawTerms();
 
+  // ---- 自動名詞校正（伺服器在摘要前已套用的高信心校正）＋ 還原原始逐字稿 ----
+  const drawCorr = () => {
+    const box = document.getElementById('corrBody');
+    const badge = document.getElementById('corrBadge');
+    const items = ((m.corrections && m.corrections.items) || []).filter((x) => x && x.wrong);
+    const applied = items.filter((x) => x.state === 'applied');
+    const pend = items.filter((x) => x.state === 'pending').length;
+    badge.textContent = applied.length ? `・已自動校正 ${applied.length} 個` : '';
+    if (!applied.length && !m.transcriptRaw) {
+      box.innerHTML = '';
+      return;
+    }
+    box.innerHTML = `<div class="corr-box">
+      <div class="corr-t">🤖 自動校正（已套用到逐字稿）</div>
+      ${applied.length
+        ? `<div class="term-list">${applied
+            .map(
+              (x) =>
+                `<div class="term-row done corr-row"><span class="term-pair"><span class="term-old">${esc(x.wrong)}</span><span class="term-arrow">→</span><span class="term-new">${esc(x.right)}</span></span><span class="corr-n">${x.count != null ? `${esc(x.count)} 處` : ''}</span></div>`
+            )
+            .join('')}</div>`
+        : '<div class="hint" style="margin-top:0">沒有自動套用的校正。</div>'}
+      ${pend ? `<div class="hint">另有 ${pend} 個沒把握的校正，列在上方「待確認清單」。</div>` : ''}
+      ${m.transcriptRaw ? '<button class="act-btn" id="restoreRaw" data-task="restoreRaw" style="margin-top:8px">↩ 還原原始逐字稿</button>' : ''}
+    </div>`;
+    const rb = document.getElementById('restoreRaw');
+    if (rb) rb.onclick = () => doRestoreRaw();
+  };
+
+  // 等伺服器重新整理完 → 重繪整頁（摘要、清單都可能變）
+  const runAndReload = async (key, label, action, params, doneMsg) => {
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
+    try {
+      const fresh = await runServerAI(id, key, label, action, params);
+      if (currentDetailId() === id) renderDetail(id, fresh);
+      if (doneMsg) toast(doneMsg);
+    } catch (e) {
+      alert(label.replace(/中…$/, '') + '失敗：' + errText(e));
+    }
+  };
+  const doRestoreRaw = () => {
+    if (!confirm('還原成轉錄器產出的原始逐字稿？自動校正會全部取消（改回待確認），並重新整理摘要。手動改過的逐字稿也會被蓋掉。')) return;
+    runAndReload('restoreRaw', '還原中…', () => api.restoreRaw(id), null, '已還原原始逐字稿並重新整理 ✓');
+  };
+  const doReprocess = () => {
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法重新整理');
+      return;
+    }
+    if (!confirm('用目前的逐字稿重新整理？會依序做：名詞校正 → 判斷講座／會議 → 整理摘要（有筆記也會重做）→ 驗證，舊版會留著可以換回來。不會重新轉錄。')) return;
+    runAndReload('reprocess', '重新整理中…', 'reprocess', {}, '重新整理完成 ✓');
+  };
+  const doSetKind = (kind) => {
+    if (kind === meetingMode(m)) return;
+    const name = kind === 'lecture' ? '講座' : '會議';
+    if (!confirm(`改成「${name}」模式並重新整理摘要？（${kind === 'lecture' ? '核心結論／講者建議／風險提醒／案例／重點／Q&A' : '待辦／重點／Q&A'}；舊版會留著）`)) return;
+    runAndReload('kind:' + kind, `改成${name}中…`, () => api.setMeetingMode(id, kind), null, `已改成${name}模式 ✓`);
+  };
+
+  // ---- ⚠️ 待確認清單：程式驗證找不到依據的條目＋沒把握的名詞校正；清空前不能匯出 ----
+  const reviewBox = document.getElementById('reviewCard');
+  const paintExportLock = () => {
+    const n = pendingReview(m).length;
+    const lock = document.getElementById('exportLock');
+    ['shareBtn', 'pdfBtn', 'wordBtn'].forEach((bid) => {
+      const b = document.getElementById(bid);
+      if (!b) return;
+      b.classList.toggle('locked', n > 0);
+      if (n > 0) {
+        b.setAttribute('aria-disabled', 'true');
+        b.title = exportLockText(n);
+      } else {
+        b.removeAttribute('aria-disabled');
+        b.removeAttribute('title');
+      }
+    });
+    lock.hidden = !n;
+    lock.textContent = n ? `🔒 ${exportLockText(n)}` : '';
+  };
+  let reviewOpen = true;
+  const drawReview = () => {
+    const all = reviewItems(m);
+    paintExportLock();
+    if (!all.length) {
+      reviewBox.hidden = true;
+      reviewBox.innerHTML = '';
+      return;
+    }
+    reviewBox.hidden = false;
+    const pend = pendingReview(m);
+    if (!pend.length) {
+      reviewBox.className = 'review-box ok';
+      reviewBox.innerHTML = `<div class="review-head">✅ 待確認清單：全部確認完成</div>`;
+      return;
+    }
+    reviewBox.className = 'review-box';
+    const rows = pend
+      .map(
+        (r) => `<div class="review-row" data-rid="${esc(r.id)}">
+          <div class="review-top"><span class="review-kind k-${esc(r.kind)}">${esc(REVIEW_KIND[r.kind] || r.kind || '待確認')}</span>${r.t != null && isFinite(Number(r.t)) ? `<button class="src-chip" type="button" data-rt="${Number(r.t)}">▶ ${esc(fmtSec(r.t))}</button>` : ''}</div>
+          <div class="review-text">${esc(r.text)}</div>
+          ${r.detail ? `<div class="review-detail">${esc(r.detail)}</div>` : ''}
+          ${r.suggestion ? `<div class="review-sugg">建議：${esc(r.suggestion)}</div>` : ''}
+          <div class="review-ops">
+            <button class="act-btn" type="button" data-rv="confirm">✅ 確認</button>
+            <button class="act-btn" type="button" data-rv="edit">✏️ 改正</button>
+            <button class="act-btn" type="button" data-rv="delete">🗑 刪除</button>
+          </div>
+        </div>`
+      )
+      .join('');
+    reviewBox.innerHTML = `<div class="review-head" id="reviewHead">⚠️ 待確認清單（<span id="reviewCount">${pend.length}</span>）<span class="chev">${reviewOpen ? '▾' : '▸'}</span></div>
+      <div class="review-list"${reviewOpen ? '' : ' hidden'}>
+        <div class="hint" style="margin:0 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>
+        ${rows}
+      </div>`;
+    document.getElementById('reviewHead').onclick = () => {
+      reviewOpen = !reviewOpen;
+      drawReview();
+    };
+    reviewBox.querySelectorAll('[data-rt]').forEach((b) => {
+      b.onclick = () => {
+        const t = Number(b.dataset.rt);
+        if (curJump) curJump(t, '');
+        if (audioParts.length) seekTo({ t });
+      };
+    });
+    reviewBox.querySelectorAll('[data-rv]').forEach((b) => {
+      b.onclick = () => {
+        const row = b.closest('.review-row');
+        const r = pend.find((x) => String(x.id) === row.dataset.rid);
+        if (!r) return;
+        const act = b.dataset.rv;
+        if (act === 'edit') return openReviewEdit(row, r);
+        if (act === 'delete' && !confirm(`刪除這一條？\n\n${r.text}\n\n（會移到備份區，不會真的消失）`)) return;
+        sendReview(r, act);
+      };
+    });
+  };
+  const openReviewEdit = (row, r) => {
+    const ops = row.querySelector('.review-ops');
+    ops.outerHTML = `<div class="review-edit"><textarea class="seg-edit" rows="3"></textarea>
+      <div class="seg-edit-ops"><button class="act-btn primary" type="button" data-re="save">儲存改正</button><button class="act-btn" type="button" data-re="cancel">取消</button></div></div>`;
+    const ta = row.querySelector('textarea');
+    ta.value = r.suggestion || r.text || '';
+    ta.focus();
+    row.querySelector('[data-re="cancel"]').onclick = () => drawReview();
+    row.querySelector('[data-re="save"]').onclick = () => {
+      const v = ta.value.trim();
+      if (!v) {
+        alert('請填入改正後的文字');
+        return;
+      }
+      sendReview(r, 'edit', v);
+    };
+  };
+  let reviewSending = false;
+  const sendReview = async (r, action, text) => {
+    if (reviewSending) return;
+    reviewSending = true;
+    reviewBox.querySelectorAll('button').forEach((x) => (x.disabled = true));
+    try {
+      const r2 = await api.reviewAction(id, r.id, action, text);
+      // 伺服器回傳更新後的會議；沒有的話重抓
+      const fresh = r2 && typeof r2 === 'object' && r2.id ? r2 : await api.getMeeting(id);
+      await cacheMeeting(fresh);
+      m = fresh;
+      toast(action === 'confirm' ? '已確認 ✓' : action === 'edit' ? '已改正 ✓' : '已刪除 ✓');
+      // 條目內容可能變了（改正／刪除）→ 整頁重繪
+      if (currentDetailId() === id) renderDetail(id, fresh);
+    } catch (e) {
+      noteFetchError(e);
+      alert('處理失敗：' + errText(e));
+      drawReview();
+    } finally {
+      reviewSending = false;
+    }
+  };
+  drawReview();
+  drawCorr();
+
   // 加強某一區塊（分段掃整份逐字稿抓完整清單）
   const doEnhance = async (section, btn) => {
     if (!(m.transcript && m.transcript.length)) {
@@ -2047,13 +2371,21 @@ async function renderDetail(id, preloaded) {
   wireEnhButtons();
 
   document.getElementById('shareBtn').onclick = async () => {
+    if (exportBlocked()) return;
     const v = viewMeeting();
     const s = v.summary || {};
-    const num = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
+    const num = (arr) => (arr || []).map((x, i) => `${i + 1}. ${itemText(x)}`).join('\n');
+    const head = `【${v.title}】\n${formatDate(v.createdAt)}\n\n`;
     const text =
-      `【${v.title}】\n${formatDate(v.createdAt)}\n\n` +
-      `■ 待辦事項\n${num(s.actionItems) || '（無）'}\n\n` +
-      `■ 會議重點\n${num(s.mainPoints || s.keyPoints) || '（無）'}`;
+      meetingMode(v) === 'lecture'
+        ? head +
+          summarySections(v)
+            .filter((sec) => sec.k !== 'qa' && sec.k !== 'cases')
+            .map((sec) => `■ ${sec.short}\n${num(s[sec.k]) || '（無）'}`)
+            .join('\n\n')
+        : head +
+          `■ 待辦事項\n${num(s.actionItems) || '（無）'}\n\n` +
+          `■ 會議重點\n${num(s.mainPoints || s.keyPoints) || '（無）'}`;
     if (navigator.share) {
       try {
         await navigator.share({ title: v.title, text });
@@ -2254,10 +2586,13 @@ function renderSettings() {
       <p style="margin-top:0"><b>⚙️ 處理設定</b>（存在 NAS，所有裝置共用）</p>
       <p style="margin-bottom:6px"><b>Claude 型號</b>（摘要、加強、筆記、問答、掃詞、翻譯）</p>
       <select id="claudeModel" style="width:100%" disabled>
-        <option value="sonnet">Sonnet（預設，品質與速度平衡）</option>
-        <option value="opus">Opus（最好，較慢、較吃額度）</option>
+        <option value="opus">Opus（預設，品質最好，較慢、較吃額度）</option>
+        <option value="sonnet">Sonnet（品質與速度平衡）</option>
         <option value="haiku">Haiku（最快，品質較低）</option>
       </select>
+      <p style="margin-bottom:6px"><b>轉錄詞庫</b>（一行一個詞：人名、公司、術語…）</p>
+      <textarea id="glossary" class="set-ta" rows="8" placeholder="股利&#10;複委託&#10;BVI" disabled></textarea>
+      <div class="hint" style="margin-top:4px">轉錄時提示語音辨識這些詞，也用來校正與驗證摘要。改完點框外就會存到 NAS。</div>
       <label class="set-row"><input type="checkbox" id="fallbackEnabled" disabled /> <span>NAS 備援轉錄（電腦沒開時，NAS 自己慢慢轉；不分說話者）</span></label>
       <div class="set-row"><span>等電腦幾分鐘沒接手才啟動備援：</span><input type="number" id="fallbackMinutes" min="1" max="1440" style="width:80px" disabled /> 分鐘</div>
       <label class="set-row"><input type="checkbox" id="tgNotify" disabled /> <span>Telegram 通知（轉好時傳訊息給你）</span></label>
@@ -2315,13 +2650,22 @@ function renderSettings() {
     fallbackEnabled: document.getElementById('fallbackEnabled'),
     fallbackMinutes: document.getElementById('fallbackMinutes'),
     tgNotify: document.getElementById('tgNotify'),
+    glossary: document.getElementById('glossary'),
   };
+  // 詞庫：一行一詞，去頭尾空白與空行
+  const cleanGlossary = (s) =>
+    String(s || '')
+      .split(/\r?\n/)
+      .map((x) => x.trim())
+      .filter(Boolean)
+      .join('\n');
   const setHint = document.getElementById('setHint');
   let settings = null;
   (async () => {
     try {
       settings = await api.getSettings();
-      els.claudeModel.value = settings.claudeModel || 'sonnet';
+      els.claudeModel.value = settings.claudeModel || 'opus';
+      els.glossary.value = Array.isArray(settings.glossary) ? settings.glossary.join('\n') : settings.glossary || '';
       els.fallbackEnabled.checked = !!settings.fallbackEnabled;
       els.fallbackMinutes.value = settings.fallbackMinutes != null ? settings.fallbackMinutes : 20;
       els.tgNotify.checked = !!settings.tgNotify;
@@ -2344,6 +2688,8 @@ function renderSettings() {
       fallbackMinutes: mins,
       tgNotify: els.tgNotify.checked,
     };
+    // 伺服器沒給詞庫、使用者也沒動過 → 不送（避免用空字串蓋掉伺服器內建詞庫）
+    if (settings.glossary != null || glossaryTouched) next.glossary = cleanGlossary(els.glossary.value);
     try {
       const r = await api.saveSettings(next);
       settings = r && typeof r === 'object' ? { ...next, ...r } : next;
@@ -2356,6 +2702,12 @@ function renderSettings() {
   els.fallbackEnabled.onchange = saveSet;
   els.fallbackMinutes.onchange = saveSet;
   els.tgNotify.onchange = saveSet;
+  let glossaryTouched = false;
+  els.glossary.onchange = () => {
+    // textarea 失焦且內容有變時觸發
+    glossaryTouched = true;
+    saveSet();
+  };
 
   document.getElementById('copyUrl').onclick = async (e) => {
     const b = e.target;

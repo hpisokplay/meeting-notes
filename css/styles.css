@@ -386,3 +386,41 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
   border: none; background: transparent; color: var(--muted); font-size: 18px; padding: 6px;
 }
 .time-mark.seekable { color: var(--brand); cursor: pointer; }
+
+/* ===== 董事長版：出處時間、講座分組、待確認清單、匯出把關 ===== */
+.src-chip {
+  display: inline-block; margin: 0 0 0 6px; padding: 1px 7px; border: 1px solid var(--brand); border-radius: 999px;
+  background: transparent; color: var(--brand); font-size: 11px; font-weight: 700; line-height: 1.6; vertical-align: 1px;
+  font-variant-numeric: tabular-nums; cursor: pointer;
+}
+.item-group { font-weight: 800; font-size: 14px; margin: 10px 0 2px; padding-left: 4px; border-left: 3px solid var(--brand); }
+.kind-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-bottom: 6px; }
+.kind-l { font-size: 13px; color: var(--muted); font-weight: 600; }
+.kind-toggle { display: flex; gap: 4px; }
+.kind-toggle .act-btn { min-width: 72px; }
+.act-btn.on { background: var(--brand); color: #fff; border-color: var(--brand); }
+#reprocessBtn { flex: 1 1 180px; }
+.export-lock { margin-top: 8px; font-size: 13px; font-weight: 700; color: #b35900; }
+.act-btn.locked { opacity: 0.45; }
+.review-box {
+  margin-top: 10px; border: 1.5px solid #ff9500; border-radius: 12px; padding: 10px 12px;
+  background: color-mix(in srgb, #ff9500 8%, var(--card));
+}
+.review-box.ok { border-color: #34c759; background: color-mix(in srgb, #34c759 8%, var(--card)); }
+.review-head { font-weight: 800; font-size: 15px; display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.review-head .chev { margin-left: auto; color: var(--muted); }
+.review-list { margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.review-row { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 10px; }
+.review-top { display: flex; align-items: center; gap: 6px; margin-bottom: 4px; }
+.review-kind { font-size: 11px; font-weight: 800; color: #b35900; border: 1px solid #ff9500; border-radius: 999px; padding: 1px 8px; }
+.review-text { font-size: 15px; line-height: 1.55; word-break: break-word; white-space: pre-wrap; }
+.review-detail { font-size: 13px; color: var(--muted); margin-top: 4px; }
+.review-sugg { font-size: 13px; margin-top: 4px; color: #1f9d55; font-weight: 600; }
+.review-ops { display: flex; gap: 6px; margin-top: 8px; }
+.review-ops .act-btn { min-width: 0; }
+.review-edit { margin-top: 8px; }
+.corr-badge { font-size: 12px; font-weight: 600; color: var(--muted); margin-left: 4px; }
+.corr-box { margin-bottom: 12px; padding-bottom: 10px; border-bottom: 1px dashed var(--line); }
+.corr-t { font-weight: 700; font-size: 14px; margin-bottom: 8px; }
+.corr-n { flex: 0 0 auto; font-size: 12px; color: var(--muted); }
+.set-ta { width: 100%; font-size: 15px; padding: 10px; border: 1px solid var(--line); border-radius: 10px; background: var(--card); color: var(--ink); font-family: inherit; }
