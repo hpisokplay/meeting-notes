@@ -223,3 +223,16 @@ def test_non_string_title_400(client):
     uid = _upload(client, "a.m4a", b"abc")
     assert client.post("/api/meetings", json={"title": 5, "uploads": [uid]}).status_code == 400
     assert client.post("/api/meetings", json={"group": ["x"], "uploads": [uid]}).status_code == 400
+
+
+def test_retranscribe_clears_old_error(client):
+    uid = _upload(client, "a.m4a", b"abc")
+    m = client.post("/api/meetings", json={"uploads": [uid]}).json()
+    store = client.app.state.store
+    store.update(m["id"], lambda x: x.update(status="failed", error="轉錄失敗：GPU 記憶體不足"))
+    jobs = client.app.state.jobs
+    jobs.queue_dir.joinpath(f"{m['jobId']}.json").unlink()
+    r = client.post(f"/api/meetings/{m['id']}/retranscribe")
+    assert r.status_code == 200
+    assert r.json()["status"] == "queued" and not r.json().get("error")
+    assert not store.get(m["id"]).get("error")

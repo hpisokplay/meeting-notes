@@ -30,7 +30,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v108';
+const APP_VERSION = 'v109';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -418,6 +418,9 @@ function toast(msg) {
 // 所以工作狀態存在畫面之外，重繪後再畫回去（按鈕上顯示進度、點一下可取消）。
 const detailTasks = new Map(); // `${meetingId}|${taskKey}` → { label, jobId }
 const taskId = (meetingId, key) => `${meetingId}|${key}`;
+// 詳情頁的介面狀態：校對面板開關、編輯模式。存檔／AI 完成會整頁重繪，狀態要留著；換到別場會議才重置。
+// toTranscript：校對確認後重繪完要直接捲到逐字稿
+const detailUi = { id: '', panel: false, edit: false, toTranscript: false };
 
 function currentDetailId() {
   return location.hash.startsWith('#/m/') ? decodeURIComponent(location.hash.slice(4)) : '';
@@ -512,6 +515,9 @@ function paintDetailTasks() {
   });
   // 有工作在跑就停用其他動作鈕，避免同時開第二個；執行中的那顆保持可按（用來取消）
   document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = (busy && x !== runningBtn) || x.hasAttribute('data-locked')));
+  // 執行中的按鈕在收合的選單／面板裡（加強選單、校對面板）→ 展開，才看得到進度、按得到取消
+  const host = runningBtn && runningBtn.closest('[data-autoshow]');
+  if (host) host.hidden = false;
 }
 function detailBusy() {
   const id = currentDetailId();
@@ -1458,9 +1464,10 @@ async function renderDetail(id, preloaded) {
     : isProcessing(m)
       ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(bannerStatus(m))}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
       : `<div class="warn st-warn"><div class="err">❌ ${esc(summaryFailed ? `摘要失敗：${m.error}` : statusText(m))}</div>${hasTranscript ? '<button class="act-btn" id="reSummary" data-task="summary" style="margin-top:8px">🔄 重新產生摘要</button>' : ''}</div>`;
+  // 錄音放在逐字稿正上方（點時間標記播放）；不在 drawBody 重畫範圍內，切模式／存檔時播放不會中斷
   const audioCard = audioParts.length
     ? `<div class="card" id="audioCard">
-      <div class="section-title" style="margin-top:0"><span>🎧 錄音</span><button class="copy" id="retrBtn" type="button">🔁 重新轉錄</button></div>
+      <div class="section-title" style="margin-top:0"><span>🎧 錄音</span></div>
       ${audioParts
         .map(
           (a, n) =>
@@ -1471,39 +1478,73 @@ async function renderDetail(id, preloaded) {
       <div class="hint">點逐字稿裡的<b>時間標記</b>可以從那裡開始播放。</div>
     </div>`
     : '';
+  if (detailUi.id !== id) Object.assign(detailUi, { id, panel: false, edit: false, toTranscript: false });
+  const lectureNow = meetingMode(m) === 'lecture';
+  const warnHtml = (Array.isArray(m.warnings) ? m.warnings : []).filter((w) => typeof w === 'string' && w).map((w) => `<div class="export-warn">⚠️ ${esc(w)}</div>`).join('');
+  // 講座／會議切換（有逐字稿才能重整）
+  const kindSeg = hasTranscript
+    ? `<div class="kind-row"><span class="kind-l">類型</span>
+        <span class="kind-toggle"><button type="button" class="act-btn${lectureNow ? ' on' : ''}" data-kind="lecture" data-task="kind:lecture">🎤 講座</button><button type="button" class="act-btn${lectureNow ? '' : ' on'}" data-kind="meeting" data-task="kind:meeting">👥 會議</button></span></div>`
+    : '';
 
+  // 版面：標題 → 工具列（所有按鈕依功能分四組）→ 校對面板（按「校對」才展開）→ 狀態列 → 內容 → 錄音＋逐字稿 → 問答
   view.innerHTML = `
-    <div class="card">
+    <div class="card detail-head">
       <input type="text" id="titleInput" value="${esc(m.title)}" />
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
-      ${stBanner}
-      <div class="lang-toggle" id="langToggle">
-        <button data-l="orig" class="active">原文</button>
-        <button data-l="zh">中文</button>
-        <button data-l="en">English</button>
-        <button data-l="ja">日本語</button>
+    </div>
+    <div class="card toolbar" id="toolbar">
+      <div class="tb-group" data-group="export">
+        <div class="tb-label">📤 匯出</div>
+        <div class="tb-row tb-4">
+          <button class="act-btn primary" id="shareBtn" type="button">📤 分享</button>
+          <button class="act-btn" id="pdfBtn" type="button">📄 PDF</button>
+          <button class="act-btn" id="wordBtn" type="button">📝 Word</button>
+          <button class="act-btn" id="copyAllBtn" type="button">📋 複製全文</button>
+        </div>
+        <div class="export-lock" id="exportLock" hidden></div>
       </div>
-      <div class="act-grid">
-        <button class="act-btn primary" id="shareBtn">📤 分享</button>
-        <button class="act-btn" id="pdfBtn">📄 PDF</button>
-        <button class="act-btn" id="wordBtn">📝 Word</button>
+      <div class="tb-group" data-group="view">
+        <div class="tb-label">👁 檢視</div>
+        <div class="lang-toggle" id="langToggle">
+          <button data-l="orig" class="active" type="button">原文</button>
+          <button data-l="zh" type="button">中文</button>
+          <button data-l="en" type="button">English</button>
+          <button data-l="ja" type="button">日本語</button>
+        </div>
+        <div class="lang-toggle" id="modeToggle">
+          <button data-mode="meeting" type="button">📋 ${lectureNow ? '講座摘要' : '會議摘要'}</button>
+          <button data-mode="notes" type="button">📚 學習筆記</button>
+        </div>
+        ${kindSeg}
       </div>
-      <div class="export-lock" id="exportLock" hidden></div>
-      ${gapsLineHtml(m)}
-      ${(Array.isArray(m.warnings) ? m.warnings : []).filter((w) => typeof w === 'string' && w).map((w) => `<div class="export-warn">⚠️ ${esc(w)}</div>`).join('')}
-      <div class="lang-toggle" id="modeToggle" style="margin-top:10px">
-        <button data-mode="meeting">📋 ${meetingMode(m) === 'lecture' ? '講座摘要' : '會議摘要'}</button>
-        <button data-mode="notes">📚 學習筆記</button>
+      <div class="tb-group" data-group="review">
+        <div class="tb-label">✅ 校對</div>
+        <button class="tb-btn" id="reviewBtn" type="button" aria-controls="reviewPanel" aria-expanded="false"></button>
+        ${gapsLineHtml(m)}
       </div>
+      <div class="tb-group" data-group="ai">
+        <div class="tb-label">🤖 AI 處理</div>
+        <div class="tb-row tb-2">
+          ${hasTranscript ? '<button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess">🔁 重新整理（不重新轉錄）</button>' : ''}
+          <button type="button" class="act-btn" id="enhBtn" aria-controls="enhGrid" aria-expanded="false">⚡ 加強 ▾</button>
+          ${audioParts.length ? '<button type="button" class="act-btn" id="retrBtn">🎙 重新轉錄</button>' : ''}
+          <button type="button" class="tb-btn" id="editModeBtn" aria-pressed="false">✏️ 編輯模式</button>
+        </div>
+        <div class="enh-menu" id="enhGrid" data-autoshow hidden></div>
+      </div>
+    </div>
+    <div class="card review-panel" id="reviewPanel" data-autoshow hidden>
       <div class="review-box" id="reviewCard" hidden></div>
-      <div class="act-grid" id="enhGrid"></div>
+      <div id="corrBody"></div>
+      <div class="terms-sub" id="termsSub">
+        <div class="panel-sub-t">📝 專有名詞（手動訂正）</div>
+        <div id="termsBody"></div>
+      </div>
     </div>
-    <div class="card" id="termsCard">
-      <div class="section-title sec-head" data-sec="terms" style="margin-top:0"><span class="sec-t">📝 專有名詞訂正<span class="corr-badge" id="corrBadge"></span></span><span class="sec-right"><span class="chev" id="termsChev">▾</span></span></div>
-      <div class="sec-body" id="termsSecBody"><div id="corrBody"></div><div id="termsBody"></div></div>
-    </div>
-    ${audioCard}
-    <div id="detailBody"></div>
+    ${stBanner}
+    ${warnHtml}
+    <div id="detailBody"><div id="sumBody"></div>${audioCard}<div id="trBody"></div></div>
     <div class="card" id="chatCard">
       <div class="section-title" style="margin-top:0">💬 問這場會議 <button class="copy" id="chatClear" hidden>清除紀錄</button></div>
       <div id="chatLog"></div>
@@ -1513,7 +1554,9 @@ async function renderDetail(id, preloaded) {
     </div>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
-  const bodyEl = document.getElementById('detailBody');
+  const bodyEl = document.getElementById('detailBody'); // 內容＋錄音＋逐字稿的外框（跳轉、摺疊都在這裡面找）
+  const sumBody = document.getElementById('sumBody'); // 摘要／筆記卡（隨模式、語言重畫）
+  const trBody = document.getElementById('trBody'); // 逐字稿（隨語言重畫）
 
   // ===== 錄音播放 =====
   // 點時間標記：找出是第幾支、第幾秒，該支浮到畫面下方播放（不用捲回頂端找播放器）
@@ -1598,19 +1641,20 @@ async function renderDetail(id, preloaded) {
   const setMode = (v, force) => {
     const next = v === 'notes' ? 'notes' : 'meeting';
     // 模式沒變就別重繪：重繪會把表格的橫向捲動位置歸零，看起來像「滑一下就彈回去」
-    if (!force && next === mode && bodyEl.childElementCount) return;
+    if (!force && next === mode && sumBody.childElementCount) return;
     mode = next;
     const mm = getModeMap();
     mm[id] = mode;
     localStorage.setItem(MODE_KEY, JSON.stringify(mm));
     document.querySelectorAll('#modeToggle button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+    // 「加強 ▾」選單：依目前模式列出可加強的區塊；學習筆記另有產生／重新產生
     const eg = document.getElementById('enhGrid');
     if (eg) {
+      const genNotesBtn = `<button class="act-btn" type="button" data-gen-notes data-task="notes">📚 ${m.notes ? '重新產生學習筆記' : '產生學習筆記'}</button>`;
       eg.innerHTML =
         mode === 'notes'
-          ? NOTE_ENH.map((x) => `<button class="act-btn" data-nenh="${x.k}" data-task="nenh:${x.k}">${x.label}</button>`).join('')
-          : (meetingMode(m) === 'lecture' ? LECT_ENH : MEET_ENH).map((x) => `<button class="act-btn" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('');
-      eg.hidden = mode === 'notes' && !m.notes; // 還沒產生筆記時沒有東西可加強
+          ? (m.notes ? NOTE_ENH.map((x) => `<button class="act-btn" type="button" data-nenh="${x.k}" data-task="nenh:${x.k}">${x.label}</button>`).join('') : '') + genNotesBtn
+          : (meetingMode(m) === 'lecture' ? LECT_ENH : MEET_ENH).map((x) => `<button class="act-btn" type="button" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('');
       wireEnhButtons();
     }
     drawBody(lang);
@@ -1646,7 +1690,7 @@ async function renderDetail(id, preloaded) {
     if (!n) {
       return `<div class="card mode-pane">
         <div class="hint" style="margin-top:0">學習筆記把研討會／課程的內容重整成<b>複習用</b>的形式：章節大綱、重要概念、對照表、關鍵數據、自我測驗。</div>
-        <div class="warn" style="margin-top:8px">建議<b>先做完專有名詞訂正並套用</b>再產生——筆記的品質完全取決於逐字稿。</div>
+        <div class="warn" style="margin-top:8px">建議<b>先做完上方「校對」</b>再產生——筆記的品質完全取決於逐字稿。</div>
         <button class="big" id="genNotes" data-task="notes">📚 產生學習筆記</button>
       </div>`;
     }
@@ -1710,18 +1754,19 @@ async function renderDetail(id, preloaded) {
       <div class="sec-body" data-secbody="nt-f"${coll['nt-f'] ? ' hidden' : ''}>${figures || none}</div>
       ${secHead('nt-q', '✍️ 自我測驗 Quiz', 'nt-q')}
       <div class="sec-body" data-secbody="nt-q"${coll['nt-q'] ? ' hidden' : ''}>${quiz || none}</div>
-      <div class="hint" style="margin-top:10px">點章節可跳到它在逐字稿中的出處；標題可摺疊／展開。
-        <button class="copy" id="regenNotes" style="margin-left:6px">重新產生</button></div>
+      <div class="hint" style="margin-top:10px">點章節可跳到它在逐字稿中的出處；標題可摺疊／展開。重新產生在上方「加強 ▾」。</div>
     </div>`;
   };
 
   let editSec = null; // 目前處於編輯模式的區塊代碼（一次只開一區）
+  let copyAllText = () => ''; // drawBody 設定：目前畫面的全文
   let curJump = null; // drawBody 設定：(秒數, 原句) → 跳到逐字稿那一句（待確認清單的時間鈕也用）
 
   const drawBody = (l) => {
     const c = contentFor(l);
     if (!c) {
-      bodyEl.innerHTML = `<div class="card"><div class="progress"><div class="spinner"></div><div id="tprogmsg">翻譯中…</div></div></div>`;
+      sumBody.innerHTML = `<div class="card"><div class="progress"><div class="spinner"></div><div id="tprogmsg">翻譯中…</div></div></div>`;
+      trBody.innerHTML = '';
       return;
     }
     const s = c.summary || {};
@@ -1793,38 +1838,34 @@ async function renderDetail(id, preloaded) {
       const editable = src && isOrig;
       const hasAlt = editable && hasAltVersion(m, src[0], src[1]);
       const inEdit = editable && editSec === k;
-      const tools =
-        (hasAlt ? `<button class="copy" data-swap="${k}">↩ 換版</button><button class="copy" data-mergev="${k}">⊕ 合併</button>` : '') +
-        (editable ? `<button class="copy${inEdit ? ' on' : ''}" data-edit="${k}">${inEdit ? '完成' : '✏️ 編輯'}</button>` : '');
-      return `<div class="section-title sec-head" data-sec="${k}"${extra ? ` style="${extra}"` : ''}><span class="sec-t">${title}</span><span class="sec-right">${tools}<button class="copy" data-copy="${copyKey}">複製</button><span class="chev">${coll[k] ? '▸' : '▾'}</span></span></div>`;
+      // 換版／合併／編輯／複製只在「編輯模式」出現；平常只留摺疊箭頭，畫面乾淨
+      const tools = detailUi.edit
+        ? (hasAlt ? `<button class="copy" data-swap="${k}">↩ 換版</button><button class="copy" data-mergev="${k}">⊕ 合併</button>` : '') +
+          (editable ? `<button class="copy${inEdit ? ' on' : ''}" data-edit="${k}">${inEdit ? '完成' : '✏️ 編輯'}</button>` : '') +
+          `<button class="copy" data-copy="${copyKey}">複製</button>`
+        : '';
+      return `<div class="section-title sec-head" data-sec="${k}"${extra ? ` style="${extra}"` : ''}><span class="sec-t">${title}</span><span class="sec-right">${tools}<span class="chev">${coll[k] ? '▸' : '▾'}</span></span></div>`;
     };
 
     // 會議摘要三區 vs 學習筆記五區：只有這張卡片隨模式切換，逐字稿以下兩模式共用
-    // 講座／會議切換＋重新整理（只在原文顯示；有逐字稿才能重整）
-    const kindRow =
-      isOrig && hasTranscript
-        ? `<div class="kind-row"><span class="kind-l">類型</span>
-            <span class="kind-toggle"><button type="button" class="act-btn${lecture ? ' on' : ''}" data-kind="lecture" data-task="kind:lecture">🎤 講座</button><button type="button" class="act-btn${lecture ? '' : ' on'}" data-kind="meeting" data-task="kind:meeting">👥 會議</button></span>
-            <button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess">🔁 重新整理（不重新轉錄）</button></div>`
-        : '';
     const secItems = (sec) => (sec.k === 'mainPoints' ? mainPoints : s[sec.k] || []);
     const meetingCard = `
       <div class="card mode-pane">
-        ${kindRow}
         ${SECS.map(
           (sec, n) =>
-            `${secHead(sec.code, esc(sec.label), sec.code, n === 0 && !kindRow ? 'margin-top:0' : '')}
+            `${secHead(sec.code, esc(sec.label), sec.code, n === 0 ? 'margin-top:0' : '')}
         <div class="sec-body" data-secbody="${sec.code}"${coll[sec.code] ? ' hidden' : ''}>${sec.k === 'qa' ? qaHtml(qa, editSec === 'qa') : olHtml(secItems(sec), sec.code, editSec === sec.code)}</div>`
         ).join('')}
         <div class="hint" style="margin-top:10px">點各區標題可摺疊／展開；<b>點任一條內容</b>可跳到它在逐字稿中的出處</div>
       </div>`;
 
-    bodyEl.innerHTML = `
-      ${mode === 'notes' ? notesCardHtml(c, secHead, coll) : meetingCard}
+    const editing = detailUi.edit && isOrig; // 逐字稿改字、講者改名只在編輯模式
+    sumBody.innerHTML = mode === 'notes' ? notesCardHtml(c, secHead, coll) : meetingCard;
+    trBody.innerHTML = `
       ${secHead('tr', '🗣️ 逐字稿', 'tr')}
       <div class="sec-body" data-secbody="tr"${coll.tr ? ' hidden' : ''}>
-        ${isOrig ? `<div class="hint" style="margin:0 4px 6px">點語者可改名；<b>點段落文字可直接修改錯字</b></div>` : ''}
-        ${chipsHtml || ''}
+        ${editing ? `<div class="hint" style="margin:0 4px 6px">點語者可改名；<b>點段落文字可直接修改錯字</b></div>` : ''}
+        ${editing ? chipsHtml : ''}
         <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
       </div>`;
 
@@ -1933,6 +1974,20 @@ async function renderDetail(id, preloaded) {
       'nt-f': (nt.figures || []).map((f) => `${f.group ? `[${f.group}] ` : ''}${f.label}：${f.value}`).join('\n'),
       'nt-q': (nt.quiz || []).map((x, i) => `Q${i + 1}. ${x.q}\nA. ${x.a}`).join('\n\n'),
     };
+    // 「複製全文」：目前畫面（語言＋模式）的各區文字，跟各區「複製」一樣的格式串起來
+    copyAllText = () => {
+      const parts = [];
+      if (mode === 'notes') {
+        if (c.notes || m.notes)
+          [['nt-o', '📑 章節大綱'], ['nt-c', '💡 重要概念'], ['nt-t', '📊 對照表'], ['nt-f', '🔢 關鍵數據'], ['nt-q', '✍️ 自我測驗']].forEach(([k, label]) =>
+            parts.push(`■ ${label}\n${texts[k] || '（無）'}`)
+          );
+      } else {
+        SECS.forEach((sec) => parts.push(`■ ${sec.label}\n${texts[sec.code] || '（無）'}`));
+      }
+      parts.push(`■ 🗣️ 逐字稿\n${texts.tr || '（無）'}`);
+      return `【${m.title}】\n${formatDate(m.createdAt)}\n\n` + parts.join('\n\n');
+    };
     bodyEl.querySelectorAll('[data-copy]').forEach((b) => {
       b.onclick = async () => {
         if (exportBlocked()) return; // 複製也是對外交付，待確認清單沒清空前不行
@@ -2003,11 +2058,6 @@ async function renderDetail(id, preloaded) {
 
     const gn = document.getElementById('genNotes');
     if (gn) gn.onclick = () => doGenNotes();
-    const rgn = document.getElementById('regenNotes');
-    if (rgn) rgn.onclick = () => doGenNotes();
-    bodyEl.querySelectorAll('[data-kind]').forEach((b) => (b.onclick = () => doSetKind(b.dataset.kind)));
-    const rp = document.getElementById('reprocessBtn');
-    if (rp) rp.onclick = () => doReprocess();
     paintDetailTasks(); // 重繪後把仍在跑的作業畫回按鈕
     if (locked()) {
       // 整理期間：換版／合併／編輯／刪除／講者改名全部停用，並在上方提示
@@ -2017,10 +2067,10 @@ async function renderDetail(id, preloaded) {
         b.title = LOCK_MSG;
       });
       bodyEl.querySelectorAll('.seg[data-i]').forEach((el) => el.classList.add('locked'));
-      if (!bodyEl.querySelector('.lock-note')) bodyEl.insertAdjacentHTML('afterbegin', lockNote());
+      if (!sumBody.querySelector('.lock-note')) sumBody.insertAdjacentHTML('afterbegin', lockNote());
     }
 
-    if (isOrig) {
+    if (editing) {
       // 點段落 → 直接編輯逐字稿文字
       bodyEl.querySelectorAll('.seg[data-i]').forEach((el) => {
         el.onclick = () => {
@@ -2093,7 +2143,8 @@ async function renderDetail(id, preloaded) {
         if (lang === l) drawBody(l);
       } catch (e) {
         if (lang !== l) return; // 使用者已切走
-        bodyEl.innerHTML = `<div class="card"><div class="err">❌ 翻譯失敗：${esc(e && e.message ? e.message : e)}</div>
+        trBody.innerHTML = '';
+        sumBody.innerHTML = `<div class="card"><div class="err">❌ 翻譯失敗：${esc(e && e.message ? e.message : e)}</div>
           <button class="big" id="retryTr" style="margin-top:10px">重試翻譯</button>
           <button class="big secondary" id="backZh" style="margin-top:8px">返回原文</button></div>`;
         document.getElementById('retryTr').onclick = () => {
@@ -2122,23 +2173,9 @@ async function renderDetail(id, preloaded) {
     if (opts) exportWord(viewMeeting(), opts);
   };
 
-  // ---- 專有名詞訂正 ----
-  // 摺疊狀態（沿用逐字稿等區塊的 localStorage 'sec_collapsed'）；此區預設收合
-  const termsSecBody = document.getElementById('termsSecBody');
-  const termsChev = document.getElementById('termsChev');
+  // ---- 專有名詞訂正（併在「校對」面板裡：掃描／手動新增是次要動作，詞表收在可展開的清單裡）----
   const termsBody = document.getElementById('termsBody');
-  const collState = () => {
-    try { return JSON.parse(localStorage.getItem('sec_collapsed')) || {}; } catch (_) { return {}; }
-  };
-  const setTermsCollapsed = (v) => {
-    const c = collState();
-    c.terms = v ? 1 : 0;
-    localStorage.setItem('sec_collapsed', JSON.stringify(c));
-    termsSecBody.hidden = !!v;
-    termsChev.textContent = v ? '▸' : '▾';
-  };
-  setTermsCollapsed(collState().terms === undefined ? true : !!collState().terms);
-  document.querySelector('#termsCard .sec-head').onclick = () => setTermsCollapsed(!collState().terms);
+  let termsListOpen = false;
 
   // 保護式全文替換：先把已正確的 newV 藏起來，只換掉落單的 oldV，再還原
   // → 避免「台積 → 台積電」把原本就正確的「台積電」變成「台積電電」
@@ -2181,10 +2218,15 @@ async function renderDetail(id, preloaded) {
   const drawTerms = () => {
     const data = m.terms;
     if (!data || !data.items) {
-      termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字改對（會同時更新逐字稿、會議摘要與學習筆記）。<br>可以先<b>逐一改好、最後按一次「套用全部訂正」</b>統一生效。</div>
-        <button class="big" id="scanTerms" data-task="terms">🔍 自動挑出專有名詞</button>`;
+      termsBody.innerHTML = `<div class="term-actions">
+          <button class="act-btn" id="scanTerms" data-task="terms" type="button">🔍 挑出專有名詞</button>
+          <button class="act-btn" id="addTerm" type="button">＋ 手動新增</button>
+        </div>
+        <div class="hint" style="margin-top:0">把人名、公司、產品等聽錯的字改對（逐字稿、摘要、筆記一起改）。</div>`;
       const sb = document.getElementById('scanTerms');
       if (sb) sb.onclick = () => doScanTerms(sb);
+      document.getElementById('addTerm').onclick = () => openTermEditor(-1);
+      if (locked()) lockTerms();
       return;
     }
     const items = data.items || [];
@@ -2205,33 +2247,40 @@ async function renderDetail(id, preloaded) {
         return `<div class="term-row" data-i="${i}">${chip}<span class="term-word">${esc(it.t)}${alt}</span><span class="term-go">訂正 ›</span></div>`;
       })
       .join('');
+    // 詞表平常收起來（一長串人名公司名很佔版面）；有待套用的草稿時自動展開
+    const listOpen = termsListOpen || pendingCount > 0;
     termsBody.innerHTML = `
       <div class="term-actions">
-        <button class="act-btn" id="rescanTerms" data-task="terms">🔄 重新掃描</button>
-        <button class="act-btn" id="addTerm">＋ 手動新增</button>
+        <button class="act-btn" id="rescanTerms" data-task="terms" type="button">🔄 重新掃描</button>
+        <button class="act-btn" id="addTerm" type="button">＋ 手動新增</button>
       </div>
-      ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
+      ${items.length
+        ? `<details class="terms-list-d" id="termsListD"${listOpen ? ' open' : ''}><summary>專有名詞清單（${items.length}）</summary><div class="term-list">${rows}</div></details>`
+        : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
       ${pendingCount ? `<button class="big" id="applyTerms" style="margin-top:12px">✅ 套用全部訂正（${pendingCount}）</button><div class="hint" style="margin-top:6px">按下後才會一次改動逐字稿、會議摘要與學習筆記，並存回 NAS。</div>` : ''}`;
     document.getElementById('rescanTerms').onclick = (e) => doScanTerms(e.target);
     document.getElementById('addTerm').onclick = () => openTermEditor(-1);
+    const ld = document.getElementById('termsListD');
+    if (ld) ld.ontoggle = () => (termsListOpen = ld.open);
     termsBody.querySelectorAll('.term-row').forEach((r) => {
       r.onclick = () => openTermEditor(+r.dataset.i);
     });
     const ap = document.getElementById('applyTerms');
     if (ap) ap.onclick = () => applyAllTerms();
-    if (locked()) {
-      // 整理期間：套用／手動新增／逐筆訂正都停用
-      termsBody.querySelectorAll('#applyTerms,#addTerm,#rescanTerms').forEach((b) => {
-        b.disabled = true;
-        b.setAttribute('data-locked', '');
-        b.title = LOCK_MSG;
-      });
-      termsBody.querySelectorAll('.term-row').forEach((r) => {
-        r.onclick = () => toast(LOCK_MSG);
-        r.classList.add('locked');
-      });
-      termsBody.insertAdjacentHTML('afterbegin', lockNote());
-    }
+    if (locked()) lockTerms();
+  };
+  // 整理期間：套用／手動新增／掃描／逐筆訂正都停用
+  const lockTerms = () => {
+    termsBody.querySelectorAll('#applyTerms,#addTerm,#rescanTerms,#scanTerms').forEach((b) => {
+      b.disabled = true;
+      b.setAttribute('data-locked', '');
+      b.title = LOCK_MSG;
+    });
+    termsBody.querySelectorAll('.term-row').forEach((r) => {
+      r.onclick = () => toast(LOCK_MSG);
+      r.classList.add('locked');
+    });
+    termsBody.insertAdjacentHTML('afterbegin', lockNote());
   };
 
   // 開啟訂正輸入（idx=-1 表示手動新增）；只「暫存草稿」，不立即改動全文
@@ -2347,30 +2396,24 @@ async function renderDetail(id, preloaded) {
   drawTerms();
 
   // ---- 自動名詞校正（伺服器在摘要前已套用的高信心校正）＋ 還原原始逐字稿 ----
+  // 只顯示一行「已自動校正 N 個詞」，點「查看」才列出（不再一張張卡片）；還原原始逐字稿也收在裡面
   const drawCorr = () => {
     const box = document.getElementById('corrBody');
-    const badge = document.getElementById('corrBadge');
     const items = ((m.corrections && m.corrections.items) || []).filter((x) => x && x.wrong);
     const applied = items.filter((x) => x.state === 'applied');
-    const pend = items.filter((x) => x.state === 'pending').length;
-    badge.textContent = applied.length ? `・已自動校正 ${applied.length} 個` : '';
     if (!applied.length && !m.transcriptRaw) {
       box.innerHTML = '';
       return;
     }
-    box.innerHTML = `<div class="corr-box">
-      <div class="corr-t">🤖 自動校正（已套用到逐字稿）</div>
+    box.innerHTML = `<details class="corr-line" id="corrLine">
+      <summary>🤖 ${applied.length ? `已自動校正 ${applied.length} 個詞` : '自動校正'}<span class="corr-more">查看</span></summary>
       ${applied.length
-        ? `<div class="term-list">${applied
-            .map(
-              (x) =>
-                `<div class="term-row done corr-row"><span class="term-pair"><span class="term-old">${esc(x.wrong)}</span><span class="term-arrow">→</span><span class="term-new">${esc(x.right)}</span></span><span class="corr-n">${x.count != null ? `${esc(x.count)} 處` : ''}</span></div>`
-            )
+        ? `<div class="corr-list">${applied
+            .map((x) => `<span class="corr-pair">${esc(x.wrong)} → ${esc(x.right)}${x.count != null ? `<span class="corr-n">（${esc(x.count)} 處）</span>` : ''}</span>`)
             .join('')}</div>`
-        : '<div class="hint" style="margin-top:0">沒有自動套用的校正。</div>'}
-      ${pend ? `<div class="hint">另有 ${pend} 個沒把握的校正，列在上方「待確認清單」。</div>` : ''}
-      ${m.transcriptRaw ? '<button class="act-btn" id="restoreRaw" data-task="restoreRaw" style="margin-top:8px">↩ 還原原始逐字稿</button>' : ''}
-    </div>`;
+        : '<div class="hint" style="margin-top:4px">沒有自動套用的校正。</div>'}
+      ${m.transcriptRaw ? '<button class="act-btn" id="restoreRaw" data-task="restoreRaw" type="button" style="margin-top:8px">↩ 還原原始逐字稿</button>' : ''}
+    </details>`;
     const rb = document.getElementById('restoreRaw');
     if (rb) rb.onclick = () => doRestoreRaw();
   };
@@ -2425,8 +2468,32 @@ async function renderDetail(id, preloaded) {
         b.removeAttribute('title');
       }
     });
+    const copyAll = document.getElementById('copyAllBtn');
+    if (copyAll) {
+      copyAll.classList.toggle('locked', n > 0);
+      if (n > 0) copyAll.setAttribute('aria-disabled', 'true');
+      else copyAll.removeAttribute('aria-disabled');
+    }
     lock.hidden = !n;
     lock.textContent = n ? `🔒 ${exportLockText(n)}` : '';
+  };
+  // 「校對」按鈕：有待確認就顯示項數；沒有就「已校對」（淡色，但還是可以點開重新掃描／手動新增）
+  const reviewBtn = document.getElementById('reviewBtn');
+  const reviewPanel = document.getElementById('reviewPanel');
+  const reviewTotal = () => reviewRows(m).length + legacyPending(m).length;
+  const paintReviewBtn = () => {
+    const n = reviewTotal();
+    reviewBtn.textContent = n ? `✅ 校對（${n} 項）` : '✅ 已校對';
+    reviewBtn.classList.toggle('done', !n);
+    reviewBtn.classList.toggle('attn', n > 0);
+    reviewBtn.classList.toggle('on', detailUi.panel);
+    reviewBtn.setAttribute('aria-expanded', String(detailUi.panel));
+    reviewPanel.hidden = !detailUi.panel;
+  };
+  reviewBtn.onclick = () => {
+    detailUi.panel = !detailUi.panel;
+    if (detailUi.panel) drawReview();
+    else paintReviewBtn();
   };
   // 待確認項目的時間鈕要找哪一句：優先用它指向的條目在該秒數附近的出處原句，否則用項目文字比對
   const reviewQuote = (r, t) => {
@@ -2439,11 +2506,11 @@ async function renderDetail(id, preloaded) {
     const src = itemSrc(target).sort((a, b) => Math.abs(a.t - t) - Math.abs(b.t - t))[0];
     return (src && src.quote) || r.text || '';
   };
-  let reviewOpen = true;
   const unchecked = new Set(); // 勾選清單裡被取消勾選的列（= 保留原文）
   const drawReviewInner = () => {
     const all = reviewItems(m).filter((r) => r && r.state !== 'merged' && r.state !== 'stale'); // 已併進別張卡／原文已不存在的不顯示、不計數
     paintExportLock();
+    paintReviewBtn();
     if (!all.length) {
       reviewBox.hidden = true;
       reviewBox.innerHTML = '';
@@ -2453,7 +2520,7 @@ async function renderDetail(id, preloaded) {
     const pend = pendingReview(m);
     if (!pend.length) {
       reviewBox.className = 'review-box ok';
-      reviewBox.innerHTML = `<div class="review-head">✅ 待確認清單：全部確認完成</div>`;
+      reviewBox.innerHTML = `<div class="review-head">✅ 待確認：全部確認完成</div>`;
       return;
     }
     reviewBox.className = 'review-box';
@@ -2487,16 +2554,12 @@ async function renderDetail(id, preloaded) {
     const legacyHint = legacy.length
       ? `<div class="hint" style="margin:${rows.length ? '10px' : '0'} 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>`
       : '';
-    reviewBox.innerHTML = `<div class="review-head" id="reviewHead">⚠️ 待確認（<span id="reviewCount">${total}</span> 項）<span class="chev">${reviewOpen ? '▾' : '▸'}</span></div>
-      <div class="review-list"${reviewOpen ? '' : ' hidden'}>
+    reviewBox.innerHTML = `<div class="review-head">⚠️ 待確認（<span id="reviewCount">${total}</span> 項）</div>
+      <div class="review-list">
         ${list}
         ${legacyHint}
         ${legacyHtml}
       </div>`;
-    document.getElementById('reviewHead').onclick = () => {
-      reviewOpen = !reviewOpen;
-      drawReview();
-    };
     const confirmBtn = document.getElementById('wlConfirm');
     const paintConfirm = () => {
       if (!confirmBtn) return;
@@ -2612,6 +2675,9 @@ async function renderDetail(id, preloaded) {
       await cacheMeeting(fresh);
       m = fresh;
       unchecked.clear();
+      // 確認完：收起校對面板，直接帶到逐字稿
+      detailUi.panel = false;
+      detailUi.toTranscript = true;
       toast(`已套用 ${nRows} 項：逐字稿 ${Number(applied.transcript) || 0} 處、摘要 ${Number(applied.items) || 0} 條`);
       if (currentDetailId() === id) renderDetail(id, fresh);
     } catch (e) {
@@ -2723,8 +2789,43 @@ async function renderDetail(id, preloaded) {
   function wireEnhButtons() {
     document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
     document.querySelectorAll('[data-nenh]').forEach((b) => (b.onclick = () => doEnhanceNotes(b.dataset.nenh)));
+    document.querySelectorAll('[data-gen-notes]').forEach((b) => (b.onclick = () => doGenNotes()));
   }
   wireEnhButtons();
+
+  // ---- 工具列：AI 處理／檢視 ----
+  const enhBtn = document.getElementById('enhBtn');
+  const enhGrid = document.getElementById('enhGrid');
+  enhBtn.onclick = () => {
+    enhGrid.hidden = !enhGrid.hidden;
+    enhBtn.setAttribute('aria-expanded', String(!enhGrid.hidden));
+    enhBtn.textContent = enhGrid.hidden ? '⚡ 加強 ▾' : '⚡ 加強 ▴';
+  };
+  const editModeBtn = document.getElementById('editModeBtn');
+  const paintEditMode = () => {
+    editModeBtn.classList.toggle('on', detailUi.edit);
+    editModeBtn.setAttribute('aria-pressed', String(detailUi.edit));
+    editModeBtn.textContent = detailUi.edit ? '✏️ 編輯中（點此結束）' : '✏️ 編輯模式';
+  };
+  paintEditMode();
+  editModeBtn.onclick = () => {
+    detailUi.edit = !detailUi.edit;
+    editSec = null;
+    paintEditMode();
+    drawBody(lang);
+  };
+  document.querySelectorAll('#toolbar [data-kind]').forEach((b) => (b.onclick = () => doSetKind(b.dataset.kind)));
+  const rp = document.getElementById('reprocessBtn');
+  if (rp) rp.onclick = () => doReprocess();
+  document.getElementById('copyAllBtn').onclick = async () => {
+    if (exportBlocked()) return; // 跟分享／匯出一樣：待確認沒清空前不能複製
+    try {
+      await navigator.clipboard.writeText(copyAllText());
+      toast('已複製全文 ✓');
+    } catch (_) {
+      alert('複製失敗，請手動選取');
+    }
+  };
 
   document.getElementById('shareBtn').onclick = async () => {
     if (exportBlocked()) return;
@@ -2897,7 +2998,8 @@ async function renderDetail(id, preloaded) {
   bodyEl.addEventListener('touchstart', (e) => {
     const t = e.touches && e.touches[0];
     if (!t) return;
-    sx = inScrollableX(e.target) ? -1 : t.clientX; // -1 → 這次不判定為切換手勢
+    // -1 → 這次不判定為切換手勢（可橫捲的表格、錄音播放器上的拖曳不算）
+    sx = inScrollableX(e.target) || (e.target.closest && e.target.closest('#audioCard')) ? -1 : t.clientX;
     sy = t.clientY;
   }, { passive: true });
   bodyEl.addEventListener('touchend', (e) => {
@@ -2912,6 +3014,14 @@ async function renderDetail(id, preloaded) {
   setMode(mode, true); // 套用記住的模式（同時會畫出內容）
   // 重繪後把仍在跑的作業狀態畫回按鈕（離開再回來時才看得出它還在跑）
   paintDetailTasks();
+  // 校對確認後：直接帶到逐字稿（展開、捲過去）
+  if (detailUi.toTranscript) {
+    detailUi.toTranscript = false;
+    const trHead = bodyEl.querySelector('.sec-head[data-sec="tr"]');
+    const trSec = bodyEl.querySelector('[data-secbody="tr"]');
+    if (trHead && trSec && trSec.hidden) trHead.click();
+    if (trHead && trHead.scrollIntoView) trHead.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }
 }
 
 // 「幾分鐘前」：轉錄器最後一次輪詢時間（秒或毫秒或 ISO 字串都吃）
@@ -3116,7 +3226,10 @@ function router() {
   renderGen++;
   const h = location.hash || '#/';
   refreshBanner(); // 每次換頁都重算橫幅：上傳中離開上傳頁時才會有回去的入口
-  if (h.startsWith('#/m/')) return renderDetail(decodeURIComponent(h.slice(4)));
+  if (h.startsWith('#/m/')) {
+    detailUi.id = ''; // 從別頁進來：校對面板收起、編輯模式關閉（頁內重繪不經過這裡，狀態會保留）
+    return renderDetail(decodeURIComponent(h.slice(4)));
+  }
   if (h.startsWith('#/job/')) return renderProgress(decodeURIComponent(h.slice(6)));
   if (h === '#/new') return renderNew();
   if (h === '#/settings') return renderSettings();

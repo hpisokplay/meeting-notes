@@ -124,6 +124,11 @@ const go = async (hash) => {
   window.dispatchEvent(new Event('hashchange'));
   await tick();
 };
+// 詳情頁：打開「編輯模式」（各區換版／合併／編輯／複製、逐字稿改字、講者改名都在編輯模式裡）
+const editOn = async () => {
+  document.getElementById('editModeBtn').click();
+  await tick();
+};
 
 const MEETING = {
   id: 'test-1',
@@ -191,7 +196,7 @@ describe('app（整合，假 NAS）', () => {
     expect(html).toContain('📤 分享');
     expect(html).toContain('加強待辦');
     expect(html).toContain('data-enh="qa"');
-    expect(html).toContain('spk-chip');
+    expect(html).not.toContain('spk-chip'); // 講者改名只在編輯模式
     expect(html).toContain('English');
     expect(html).toContain('data-i="0"');
     expect(html).toContain('data-sec="ai"');
@@ -200,7 +205,7 @@ describe('app（整合，假 NAS）', () => {
     expect(html).toContain('data-jump="ai:0"');
     expect(html).toContain('問這場會議');
     expect(html).toContain('chatAsk');
-    expect(html).toContain('專有名詞訂正');
+    expect(html).toContain('專有名詞');
     expect(html).toContain('scanTerms');
     // 不再有任何金鑰相關提示
     expect(html).not.toContain('Gemini');
@@ -214,29 +219,107 @@ describe('app（整合，假 NAS）', () => {
     expect(gHtml).toContain('未分類');
   });
 
-  it('專有名詞訂正在加強按鈕下方、錄音上方（兩種模式都一樣；沒錄音時緊接加強按鈕）', async () => {
-    const pos = (h, s) => h.indexOf(s);
+  it('版面：所有按鈕集中在最上面的工具列，依「匯出／檢視／校對／AI 處理」分組；錄音在逐字稿正上方、問答在最下面', async () => {
+    const pos = (h, x) => h.indexOf(x);
     await go('#/m/test-1');
+    const groups = [...document.querySelectorAll('#toolbar .tb-group')];
+    expect(groups.map((g) => g.dataset.group)).toEqual(['export', 'view', 'review', 'ai']);
+    expect(groups.map((g) => g.querySelector('.tb-label').textContent)).toEqual(['📤 匯出', '👁 檢視', '✅ 校對', '🤖 AI 處理']);
+    const inGroup = (g, sel) => !!document.querySelector(`#toolbar [data-group="${g}"] ${sel}`);
+    ['#shareBtn', '#pdfBtn', '#wordBtn', '#copyAllBtn', '#exportLock'].forEach((x) => expect(inGroup('export', x)).toBe(true));
+    ['#langToggle', '#modeToggle', '[data-kind="lecture"]', '[data-kind="meeting"]'].forEach((x) => expect(inGroup('view', x)).toBe(true));
+    expect(inGroup('review', '#reviewBtn')).toBe(true);
+    ['#reprocessBtn', '#enhBtn', '#retrBtn', '#editModeBtn', '#enhGrid'].forEach((x) => expect(inGroup('ai', x)).toBe(true));
+    // 舊的分散卡片都不在了
+    expect(document.getElementById('termsCard')).toBeNull();
+    expect(document.getElementById('reviewHead')).toBeNull();
+    expect(document.querySelector('#audioCard #retrBtn')).toBeNull();
+    // 內容區沒有按鈕列：工具列 → 內容 → 錄音 → 逐字稿 → 問答
     let h = document.getElementById('view').innerHTML;
-    const order = [pos(h, 'id="enhGrid"'), pos(h, 'id="termsCard"'), pos(h, 'id="audioCard"'), pos(h, 'id="detailBody"'), pos(h, 'id="chatCard"')];
+    const order = [pos(h, 'id="toolbar"'), pos(h, 'id="reviewPanel"'), pos(h, 'id="sumBody"'), pos(h, 'id="audioCard"'), pos(h, 'data-sec="tr"'), pos(h, 'id="chatCard"')];
     expect(order.every((n) => n >= 0)).toBe(true);
     expect([...order].sort((a, b) => a - b)).toEqual(order);
-    expect(h).toContain('問這場會議');
-    // 學習筆記模式位置不變
+    expect(document.querySelector('#sumBody .kind-row')).toBeNull();
+    expect(document.querySelector('#sumBody #reprocessBtn')).toBeNull();
+    // 學習筆記模式：錄音仍在逐字稿正上方
     document.querySelector('#modeToggle [data-mode="notes"]').click();
     await tick();
     h = document.getElementById('view').innerHTML;
-    expect(pos(h, 'id="enhGrid"')).toBeLessThan(pos(h, 'id="termsCard"'));
-    expect(pos(h, 'id="termsCard"')).toBeLessThan(pos(h, 'id="audioCard"'));
+    expect(pos(h, 'id="audioCard"')).toBeLessThan(pos(h, 'data-sec="tr"'));
+    expect(pos(h, 'id="sumBody"')).toBeLessThan(pos(h, 'id="audioCard"'));
     document.querySelector('#modeToggle [data-mode="meeting"]').click();
     await tick();
-    // 沒錄音
+    // 沒錄音：沒有播放器、沒有重新轉錄
     nas.meetings['test-na'] = Object.assign(JSON.parse(JSON.stringify(MEETING)), { id: 'test-na', audio: [] });
     await go('#/m/test-na');
-    h = document.getElementById('view').innerHTML;
-    expect(pos(h, 'id="audioCard"')).toBe(-1);
-    expect(pos(h, 'id="enhGrid"')).toBeLessThan(pos(h, 'id="termsCard"'));
-    expect(pos(h, 'id="termsCard"')).toBeLessThan(pos(h, 'id="detailBody"'));
+    expect(document.getElementById('audioCard')).toBeNull();
+    expect(document.getElementById('retrBtn')).toBeNull();
+  });
+
+  it('編輯模式：平常各區只有摺疊箭頭；打開後才有換版／編輯／複製、講者改名、逐字稿改字', async () => {
+    nas.meetings['test-1'].alt = { 'summary:mainPoints': ['舊版重點'] };
+    await go('#/m/test-1');
+    const view = document.getElementById('view');
+    expect(view.querySelector('[data-edit],[data-copy],[data-swap],[data-mergev]')).toBeNull();
+    expect(view.querySelector('.sec-head[data-sec="mp"] .chev')).toBeTruthy();
+    expect(view.querySelector('.spk-chip')).toBeNull();
+    view.querySelector('.seg[data-i]').click();
+    expect(view.querySelector('.seg-edit')).toBeNull(); // 平常點段落不會進入改字
+    await editOn();
+    expect(document.getElementById('editModeBtn').getAttribute('aria-pressed')).toBe('true');
+    expect(view.querySelector('[data-edit="mp"]')).toBeTruthy();
+    expect(view.querySelector('[data-copy="mp"]')).toBeTruthy();
+    expect(view.querySelector('[data-swap="mp"]')).toBeTruthy();
+    expect(view.querySelector('.spk-chip')).toBeTruthy();
+    view.querySelector('.seg[data-i]').click();
+    expect(view.querySelector('.seg-edit')).toBeTruthy();
+    // 再按一次結束
+    await editOn();
+    expect(view.querySelector('[data-edit]')).toBeNull();
+    expect(document.getElementById('editModeBtn').getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('加強 ▾：選單平常收起，點開列出目前模式的加強項目，點了送 runAI', async () => {
+    await go('#/m/test-1');
+    const grid = document.getElementById('enhGrid');
+    expect(grid.hidden).toBe(true);
+    document.getElementById('enhBtn').click();
+    expect(grid.hidden).toBe(false);
+    expect([...grid.querySelectorAll('[data-enh]')].map((b) => b.dataset.enh)).toEqual(['actionItems', 'mainPoints', 'qa']);
+    grid.querySelector('[data-enh="qa"]').click();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['runAI', 'test-1', 'enhance', { section: 'qa' }]);
+    // 學習筆記模式（還沒產生）：選單只有「產生學習筆記」
+    document.querySelector('#modeToggle [data-mode="notes"]').click();
+    await tick();
+    const g2 = document.getElementById('enhGrid');
+    expect(g2.querySelector('[data-nenh]')).toBeNull();
+    expect(g2.querySelector('[data-gen-notes]').textContent).toContain('產生學習筆記');
+    document.querySelector('#modeToggle [data-mode="meeting"]').click();
+    await tick();
+  });
+
+  it('複製全文：目前畫面的各區＋逐字稿串起來；待確認沒清空前擋下', async () => {
+    const writes = [];
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (t) => writes.push(t) }, configurable: true });
+    await go('#/m/test-1');
+    document.getElementById('copyAllBtn').click();
+    await tick(20);
+    expect(writes.length).toBe(1);
+    expect(writes[0]).toContain('【產品週會】');
+    expect(writes[0]).toContain('待辦事項');
+    expect(writes[0]).toContain('會議重點');
+    expect(writes[0]).toContain('■ 🗣️ 逐字稿');
+    expect(writes[0]).toContain('討論上線時程');
+    nas.meetings['lec-1'] = lectureMeeting();
+    await go('#/m/lec-1');
+    const alerts = [];
+    window.alert = (msg) => alerts.push(msg);
+    expect(document.getElementById('copyAllBtn').classList.contains('locked')).toBe(true);
+    document.getElementById('copyAllBtn').click();
+    await tick(20);
+    expect(alerts).toEqual(['還有 2 項待確認，處理完才能匯出']);
+    expect(writes.length).toBe(1);
   });
 
   it('詳情頁有錄音播放器（每支一個、preload=none）與重新轉錄；點時間標記播放對的那一支', async () => {
@@ -260,8 +343,9 @@ describe('app（整合，假 NAS）', () => {
     document.querySelector('[data-enh="mainPoints"]').click();
     await tick(120);
     expect(nas.calls).toContainEqual(['runAI', 'test-1', 'enhance', { section: 'mainPoints' }]);
+    expect(document.getElementById('view').innerHTML).toContain('加強後的重點一');
+    await editOn();
     const html = document.getElementById('view').innerHTML;
-    expect(html).toContain('加強後的重點一');
     expect(html).toContain('data-swap="mp"');
     // 換版是前端改完整份存回 NAS
     document.querySelector('[data-swap="mp"]').click();
@@ -400,6 +484,7 @@ describe('app（整合，假 NAS）', () => {
   it('編輯模式刪除：NAS 上的內容已變（那一條不在了）→ 不刪別條，提示再操作一次', async () => {
     nas.meetings['test-1'].summary.mainPoints = ['重點甲', '重點乙'];
     await go('#/m/test-1');
+    await editOn();
     document.querySelector('[data-edit="mp"]').click();
     await tick();
     // 別台裝置剛把「重點甲」改掉了
@@ -519,14 +604,25 @@ describe('app（整合，假 NAS）', () => {
     expect(nas.calls).toContainEqual(['runAI', 'test-1', 'reprocess', {}]);
   });
 
-  it('待確認清單：在模式切換正下方、加強按鈕上方；列出 pending 項目與數量', async () => {
+  it('校對：一顆「校對（N 項）」按鈕，點開面板（工具列正下方）列出 pending 項目，專有名詞訂正也在面板裡', async () => {
     nas.meetings['lec-1'] = lectureMeeting();
     await go('#/m/lec-1');
     const h = document.getElementById('view').innerHTML;
     const pos = (s) => h.indexOf(s);
-    expect(pos('id="modeToggle"')).toBeLessThan(pos('id="reviewCard"'));
-    expect(pos('id="reviewCard"')).toBeLessThan(pos('id="enhGrid"'));
-    expect(pos('id="enhGrid"')).toBeLessThan(pos('id="termsCard"'));
+    expect(pos('id="toolbar"')).toBeLessThan(pos('id="reviewPanel"'));
+    expect(pos('id="reviewPanel"')).toBeLessThan(pos('id="detailBody"'));
+    const btn = document.getElementById('reviewBtn');
+    const panel = document.getElementById('reviewPanel');
+    expect(btn.textContent).toBe('✅ 校對（2 項）');
+    expect(panel.hidden).toBe(true); // 平常收起
+    btn.click();
+    expect(panel.hidden).toBe(false);
+    expect(btn.getAttribute('aria-expanded')).toBe('true');
+    expect(panel.querySelector('#reviewCard')).toBeTruthy();
+    expect(panel.querySelector('#termsBody #scanTerms')).toBeTruthy();
+    expect(panel.querySelector('#addTerm')).toBeTruthy();
+    btn.click();
+    expect(panel.hidden).toBe(true);
     const box = document.getElementById('reviewCard');
     expect(box.hidden).toBe(false);
     expect(document.getElementById('reviewCount').textContent).toBe('2');
@@ -556,6 +652,7 @@ describe('app（整合，假 NAS）', () => {
     const html = document.getElementById('view').innerHTML;
     expect(html).toContain('不要自行換算匯率');
     expect(document.getElementById('reviewCard').textContent).toContain('全部確認完成');
+    expect(document.getElementById('reviewBtn').textContent).toBe('✅ 已校對');
     expect(document.getElementById('exportLock').hidden).toBe(true);
     expect(document.getElementById('pdfBtn').classList.contains('locked')).toBe(false);
   });
@@ -624,16 +721,17 @@ describe('app（整合，假 NAS）', () => {
       },
     });
     await go('#/m/test-1');
-    const card = document.getElementById('termsCard');
-    expect(card.innerHTML).toContain('已自動校正 1 個');
-    expect(card.innerHTML).toContain('附委託');
-    expect(card.innerHTML).toContain('複委託');
-    expect(card.innerHTML).toContain('3 處');
-    expect(card.innerHTML).toContain('另有 1 個沒把握的校正');
-    // 專有名詞訂正卡片仍在加強按鈕下方、錄音上方
-    const h = document.getElementById('view').innerHTML;
-    expect(h.indexOf('id="enhGrid"')).toBeLessThan(h.indexOf('id="termsCard"'));
-    expect(h.indexOf('id="termsCard"')).toBeLessThan(h.indexOf('id="audioCard"'));
+    const line = document.querySelector('#reviewPanel #corrLine');
+    // 只有一行摘要，點「查看」才展開（不是一張張卡片）
+    expect(line.tagName).toBe('DETAILS');
+    expect(line.open).toBe(false);
+    expect(line.querySelector('summary').textContent).toContain('已自動校正 1 個詞');
+    expect(line.querySelector('summary').textContent).toContain('查看');
+    expect(line.querySelector('.term-row')).toBeNull();
+    expect(line.innerHTML).toContain('附委託');
+    expect(line.innerHTML).toContain('複委託');
+    expect(line.innerHTML).toContain('3 處');
+    expect(document.getElementById('termsCard')).toBeNull();
     document.getElementById('restoreRaw').click();
     await tick(120);
     expect(nas.calls).toContainEqual(['restoreRaw', 'test-1']);
@@ -713,6 +811,7 @@ describe('app（整合，假 NAS）', () => {
     nas.meetings['lec-1'] = lectureMeeting();
     await go('#/m/lec-1');
     expect(document.getElementById('reviewCount').textContent).toBe('2');
+    await editOn();
     document.querySelector('[data-edit="lr"]').click();
     await tick();
     document.querySelector('[data-del="lr:0"]').click(); // 刪掉「小心 CRS 申報」（rv000001 指向它）
@@ -762,6 +861,7 @@ describe('app（整合，假 NAS）', () => {
     const alerts = [];
     window.alert = (msg) => alerts.push(msg);
     expect(document.getElementById('exportLock').hidden).toBe(true);
+    await editOn();
     document.querySelector('[data-swap="mp"]').click();
     await tick(150);
     expect(nas.meetings['lec-1'].summary.mainPoints).toEqual(['AI 自己補的一句', '另一句沒有出處']);
@@ -822,6 +922,7 @@ describe('app（整合，假 NAS）', () => {
     window.alert = (msg) => alerts.push(msg);
     const writes = [];
     Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (t) => writes.push(t) }, configurable: true });
+    await editOn();
     document.querySelector('[data-copy="mp"]').click();
     await tick(20);
     expect(alerts).toEqual(['還有 2 項待確認，處理完才能匯出']);
@@ -832,6 +933,7 @@ describe('app（整合，假 NAS）', () => {
     nas.meetings['lec-1'] = m;
     await go('#/');
     await go('#/m/lec-1');
+    await editOn();
     document.querySelector('[data-copy="mp"]').click();
     await tick(20);
     expect(writes[0]).toContain('【稅務】');
@@ -845,8 +947,9 @@ describe('app（整合，假 NAS）', () => {
     api.waitJob.mockImplementationOnce(() => new Promise((r) => (release = () => r({ state: 'done' }))));
     document.getElementById('reprocessBtn').click();
     await tick();
-    document.getElementById('reviewHead').click(); // 收起
-    document.getElementById('reviewHead').click(); // 展開 → 重畫
+    document.getElementById('reviewBtn').click(); // 展開 → 重畫
+    document.getElementById('reviewBtn').click(); // 收起
+    document.getElementById('reviewBtn').click(); // 再展開 → 再重畫
     const btns = document.querySelectorAll('#reviewCard [data-rv]');
     expect(btns.length).toBe(6);
     expect([...btns].every((b) => b.disabled)).toBe(true);
@@ -877,6 +980,7 @@ describe('app（整合，假 NAS）', () => {
     nas.meetings['test-1'].status = 'summarizing';
     nas.meetings['test-1'].aiJobId = 'ja-1';
     await go('#/m/test-1');
+    await editOn();
     const view = document.getElementById('view');
     expect(view.textContent).toContain('整理中，完成後再修改');
     expect(view.querySelector('.spk-chip').disabled).toBe(true);
@@ -897,6 +1001,7 @@ describe('app（整合，假 NAS）', () => {
     api.saveMeeting.mockImplementationOnce(async () => {
       throw Object.assign(new Error('整理中，完成後再修改'), { status: 409 });
     });
+    await editOn();
     api.getMeeting.mockClear();
     document.querySelector('.seg[data-i]').click();
     const ta = document.querySelector('.seg-edit');
@@ -1012,6 +1117,52 @@ describe('app（整合，假 NAS）', () => {
     expect(document.querySelector('.wl-row')).toBeNull();
     expect(document.getElementById('reviewCount').textContent).toBe('1'); // 只剩舊卡
     expect(document.getElementById('view').innerHTML).toContain('（已改）');
+  });
+
+  it('校對面板：確認成功 → 面板收起、按鈕變「已校對」、帶到逐字稿；再點可重開（重新掃描／手動新增）', async () => {
+    const m = checklistMeeting();
+    // 只有字詞列（伺服器會把 AI 判定「不是錯誤」的 keep 自動結案，這裡也拿掉）
+    m.review.items = m.review.items.filter((x) => x.id !== 'rv000009' && x.id !== 'rw000002');
+    nas.meetings['w-1'] = m;
+    await go('#/m/w-1');
+    const btn = document.getElementById('reviewBtn');
+    expect(btn.textContent).toBe('✅ 校對（3 項）');
+    expect(document.getElementById('exportLock').hidden).toBe(false); // 匯出整組鎖住
+    expect(document.getElementById('shareBtn').classList.contains('locked')).toBe(true);
+    btn.click();
+    expect(document.getElementById('reviewPanel').hidden).toBe(false);
+    api.applyReviewBatch.mockImplementationOnce(async (id, accept, keep) => {
+      const mm = nas.meetings[id];
+      mm.review.items.forEach((x) => {
+        if (accept.includes(x.id) || keep.includes(x.id)) x.state = 'confirmed';
+      });
+      mm.updatedAt += 1;
+      return { ...JSON.parse(JSON.stringify(mm)), applied: { transcript: 6, items: 1 } };
+    });
+    const scrolled = [];
+    Element.prototype.scrollIntoView = function () {
+      scrolled.push(this);
+    };
+    document.getElementById('wlConfirm').click();
+    await tick(120);
+    const btn2 = document.getElementById('reviewBtn');
+    expect(btn2.textContent).toBe('✅ 已校對');
+    expect(btn2.classList.contains('done')).toBe(true);
+    expect(document.getElementById('reviewPanel').hidden).toBe(true);
+    expect(document.getElementById('exportLock').hidden).toBe(true);
+    expect(scrolled.some((el) => el.matches('.sec-head[data-sec="tr"]'))).toBe(true);
+    delete Element.prototype.scrollIntoView;
+    // 已校對仍可點開
+    btn2.click();
+    expect(document.getElementById('reviewPanel').hidden).toBe(false);
+    expect(document.getElementById('scanTerms')).toBeTruthy();
+    expect(document.getElementById('addTerm')).toBeTruthy();
+  });
+
+  it('沒有待確認：一進來就是「已校對」，面板收起', async () => {
+    await go('#/m/test-1');
+    expect(document.getElementById('reviewBtn').textContent).toBe('✅ 已校對');
+    expect(document.getElementById('reviewPanel').hidden).toBe(true);
   });
 
   it('勾選清單：自己改把這一列每張卡都送 edit（span 裡的錯字換成輸入）', async () => {

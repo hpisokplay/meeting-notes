@@ -475,3 +475,48 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
 .file-row .fr-name { flex: 1; min-width: 0; word-break: break-all; }
 .file-row .fr-btn { min-width: 44px; min-height: 44px; padding: 0; font-size: 20px; line-height: 1; }
 .file-row .fr-btn:disabled { opacity: 0.3; }
+
+/* ---- 詳情頁工具列（v109）：所有按鈕集中在最上面，依「匯出／檢視／校對／AI 處理」分組 ---- */
+.toolbar { padding: 12px 14px; }
+.tb-group + .tb-group { margin-top: 12px; padding-top: 10px; border-top: 1px solid var(--line); }
+.tb-label { font-size: 12px; font-weight: 800; color: var(--muted); letter-spacing: .04em; margin-bottom: 6px; }
+.tb-row { display: grid; gap: 6px; }
+.tb-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.tb-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.toolbar .act-btn, .tb-btn { min-width: 0; min-height: 44px; white-space: normal; line-height: 1.25; padding: 6px 6px; }
+.tb-btn {
+  width: 100%; border: 1px solid var(--line); border-radius: 9px; background: var(--btn2); color: var(--ink);
+  font-size: 13px; font-weight: 700;
+}
+.tb-btn.on { background: var(--brand); color: #fff; border-color: var(--brand); }
+#reviewBtn { font-size: 15px; }
+#reviewBtn.attn { background: color-mix(in srgb, #ff9500 16%, var(--card)); border-color: #ff9500; color: var(--ink); }
+#reviewBtn.done { background: var(--card); color: var(--muted); font-weight: 600; } /* 已校對：淡色，但仍可點開 */
+#reviewBtn.on { box-shadow: inset 0 0 0 2px var(--brand); }
+.toolbar .lang-toggle { margin-top: 0; }
+.toolbar .lang-toggle + .lang-toggle, .toolbar .kind-row { margin-top: 6px; }
+.toolbar .lang-toggle button { min-height: 44px; padding: 6px 4px; font-size: 13px; }
+.toolbar .kind-row { margin-bottom: 0; flex-wrap: nowrap; }
+.toolbar .kind-toggle { flex: 1; }
+.toolbar .kind-toggle .act-btn { flex: 1; }
+.toolbar #reprocessBtn { flex: initial; }
+.enh-menu { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 6px; margin-top: 6px; padding: 8px; border-radius: 10px; background: var(--bg); }
+.enh-menu[hidden] { display: none; }
+.toolbar .export-lock { margin-top: 6px; }
+.toolbar .gaps-line { margin-top: 4px; }
+.toolbar .gaps-line summary { min-height: 44px; }
+#view > .warn, #view > .export-warn { margin: 0 0 12px; }
+
+/* 校對面板：待確認清單＋自動校正一行＋專有名詞（次要動作） */
+.review-panel { padding: 12px 14px; border: 1.5px solid var(--brand); }
+.review-panel .review-box { margin-top: 0; }
+.review-panel .review-head { cursor: default; }
+.corr-line { margin-top: 10px; font-size: 14px; }
+.corr-line summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; gap: 8px; font-weight: 700; }
+.corr-more { color: var(--brand); font-weight: 600; font-size: 13px; }
+.corr-list { display: flex; flex-wrap: wrap; gap: 6px 12px; font-size: 13px; line-height: 1.6; }
+.corr-pair { white-space: nowrap; }
+.terms-sub { margin-top: 10px; padding-top: 10px; border-top: 1px dashed var(--line); }
+.panel-sub-t { font-size: 13px; font-weight: 800; color: var(--muted); margin-bottom: 6px; }
+.terms-sub .term-actions .act-btn { min-height: 44px; }
+.terms-list-d > summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; font-size: 14px; font-weight: 700; }

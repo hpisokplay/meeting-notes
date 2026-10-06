@@ -349,7 +349,8 @@ def build_router(store: Store, get_jobs) -> APIRouter:
                 raise HTTPException(409, "已在轉錄中")
             jid = jobs.enqueue("transcribe", mid, {"glossary": store.glossary_list()})
             made.append(jid)
-            x.update(status="queued", jobId=jid,
+            # 舊的「轉錄失敗：…」不能在排隊期間還掛在畫面上
+            x.update(status="queued", jobId=jid, error=None,
                      progress={"stage": "queued", "pct": 0, "msg": "", "engine": ""})
         try:
             return store.update(mid, apply)
