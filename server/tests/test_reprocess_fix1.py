@@ -202,7 +202,10 @@ def test_review_409_while_job_active(app_client):
     r = c.post(f"/api/meetings/m1/review/{r0['id']}", json={"action": "confirm"})
     assert r.status_code == 409 and r.json()["detail"] == "整理中，請稍後再確認"
     assert c.post(f"/api/jobs/{jid}/cancel").status_code == 200  # listener puts the meeting back to done
-    assert c.post(f"/api/meetings/m1/review/{r0['id']}", json={"action": "confirm"}).status_code == 200
+    # the listener re-verified: the review now reflects the stored content (M1)
+    cur = [r for r in store.get("m1")["review"]["items"] if r["state"] == "pending"]
+    assert cur
+    assert c.post(f"/api/meetings/m1/review/{cur[0]['id']}", json={"action": "confirm"}).status_code == 200
 
 
 # ---------------------------------------------------------------- 7. all pending pairs with that wrong

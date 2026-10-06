@@ -71,6 +71,16 @@ def read_json(path: Path, default=None):
         return default
 
 
+PENDING_MD_LINE = "⚠️ 尚有 {n} 項待確認，內容未經確認，請勿轉交"
+
+
+def pending_review_count(m: dict) -> int:
+    """Pending items of meeting.review (the export gate)."""
+    rv = m.get("review") if isinstance(m, dict) else None
+    items = rv.get("items") if isinstance(rv, dict) else None
+    return sum(1 for r in items or [] if isinstance(r, dict) and r.get("state") == "pending")
+
+
 class Store:
     def __init__(self, root: Path):
         self.root = Path(root)
@@ -133,12 +143,26 @@ class Store:
         return m
 
     def _write_derived(self, mid: str, m: dict) -> None:
-        """md / docx are best-effort: the json is already safely saved."""
+        """md / docx are best-effort: the json is already safely saved.
+
+        Export gate (same as the web page): while the 待確認清單 has pending items there is NO
+        exports/<id>.docx (a stale one is removed: derived, regenerated once all are handled) and
+        the md starts with a do-not-forward warning line.
+        """
+        n = pending_review_count(m)
         try:
-            atomic_write_bytes(self.path("meetings", f"{mid}.md"),
-                               meeting_to_markdown(m).encode("utf-8"))
+            md = meeting_to_markdown(m)
+            if n:
+                md = PENDING_MD_LINE.format(n=n) + "\n\n" + md
+            atomic_write_bytes(self.path("meetings", f"{mid}.md"), md.encode("utf-8"))
         except Exception:
             log.exception("markdown render failed for %s", mid)
+        if n:
+            try:
+                self.path("exports", f"{mid}.docx").unlink(missing_ok=True)
+            except OSError:
+                log.exception("stale docx removal failed for %s", mid)
+            return
         docx_tmp = self.path("exports", f"{mid}.docx.{secrets.token_hex(3)}.tmp")
         try:
             docx_tmp.parent.mkdir(parents=True, exist_ok=True)

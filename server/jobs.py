@@ -293,6 +293,11 @@ def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dic
                 m.pop("corrections", None)
                 if dur is not None:
                     m["durationSec"] = dur
+                if isinstance(m.get("review"), dict):
+                    # stale doubts about the old transcript go (term items with the corrections);
+                    # confirmed / edited states are kept by id; the reprocess job verifies again
+                    from .review import verify_review
+                    m["review"] = verify_review(m, store.glossary_list())
                 m["status"] = "summarizing"
                 m["progress"] = {"stage": "summarizing", "pct": 0, "msg": "", "engine": engine,
                                  "action": "reprocess"}

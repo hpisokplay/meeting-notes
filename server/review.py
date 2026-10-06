@@ -206,17 +206,27 @@ def fix_src_times(entries: list, tx: TranscriptIndex) -> list:
     return entries
 
 
-def verify_review(m: dict, glossary, extra: list | None = None, *, replace_slips: bool = False) -> dict:
+def is_grounded(m: dict) -> bool:
+    """The meeting has been through the grounded pipeline (it has a review or a mode)."""
+    return isinstance(m.get("review"), dict) or m.get("mode") in MODES
+
+
+def verify_review(m: dict, glossary, extra: list | None = None, *, replace_slips: bool = False,
+                  legacy: bool | None = None) -> dict:
     """meeting.review after program verification (states of handled items carried over).
 
     replace_slips: the slip list is being regenerated (`extra`), so old slip items are not carried.
     verify_meeting does the state merge (by id, and by kind/section/itemId for confirmed/edited).
+    legacy: None = automatic: a meeting already through the grounded pipeline (is_grounded) is
+    strict (every entry without a quote is flagged); a legacy meeting never reprocessed is not.
     """
+    if legacy is None:
+        legacy = not is_grounded(m)
     prev = m.get("review") if isinstance(m.get("review"), dict) else {}
     prev_items = [r for r in prev.get("items") or [] if isinstance(r, dict)]
     if not replace_slips:  # keep the current slip list: hand it back as `extra`
         extra = [r for r in prev_items if r.get("kind") == "slip"] + list(extra or [])
-    items = verify_meeting(m, glossary, extra=list(extra or []))
+    items = verify_meeting(m, glossary, extra=list(extra or []), legacy=legacy)
     for r in items:
         if r.get("kind") == "term" and r.get("state") == "pending":
             r["detail"] = term_detail(m, r)
@@ -385,7 +395,8 @@ def _reject_term(m: dict, wrong: str) -> None:
 
 
 def review_action(m: dict, rid: str, action: str, text: str | None = None) -> None:
-    """Mutate meeting m for one review action. KeyError if the review item does not exist."""
+    """Mutate meeting m for one review action. KeyError if the review item does not exist;
+    ValueError for edit / delete on an item without a target entry (slip etc., term excepted)."""
     review = m.get("review") if isinstance(m.get("review"), dict) else {}
     items = [r for r in review.get("items") or [] if isinstance(r, dict)]
     r = next((x for x in items if x.get("id") == rid), None)
@@ -408,9 +419,9 @@ def review_action(m: dict, rid: str, action: str, text: str | None = None) -> No
     elif action == "confirm":
         r["state"] = "confirmed"
     elif not item_id or not section.startswith(("summary.", "notes.")):  # slip etc.: no target entry
-        r["state"] = "edited" if action == "edit" else "deleted"
-        if action == "edit":
-            r["editedText"] = text
+        # nothing to edit or delete: 「改正」 / 「刪除」 would only hide the doubt (the transcript and
+        # the summary stay as they are), so the only answer is 「知道了」 (confirm)
+        raise ValueError("這一項只能按「知道了」")
     else:
         hit = _find(m, section, item_id)
         siblings = [x for x in items if x is not r and x.get("section") == section
@@ -493,7 +504,10 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
             cur = get_jobs().read(m.get("aiJobId")) if m.get("aiJobId") else None
             if m.get("status") == "summarizing" and cur and cur.get("state") in ACTIVE_JOB_STATES:
                 raise HTTPException(409, "整理中，請稍後再確認")
-            review_action(m, rid, action, text)
+            try:
+                review_action(m, rid, action, text)
+            except ValueError as e:
+                raise HTTPException(400, str(e))
         try:
             return store.update(mid, apply)
         except BadId:
@@ -518,6 +532,8 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
             raw = m.get("transcriptRaw")
             if not (isinstance(raw, list) and raw):
                 raise HTTPException(409, "沒有原始逐字稿可以還原")
+            # one slot holding the latest pre-restore transcript (user edits / applied terms)
+            m.setdefault("alt", {})["transcript:beforeRestore"] = copy.deepcopy(m.get("transcript") or [])
             m["transcript"] = copy.deepcopy(raw)
             corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else None
             if corr:

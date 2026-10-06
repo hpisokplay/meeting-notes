@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .ai import AIThread, build_ai_router, on_ai_job_terminal
 from .importer import build_router as build_import_router
-from .review import build_review_router
+from .review import build_review_router, verify_review
 from .jobs import JobQueue, build_jobs_router, load_worker_key
 from . import notify as tg_notify
 from .storage import BadId, Store, read_json
@@ -26,6 +26,8 @@ STATIC_DIRS = {"css", "js", "icons"}
 # owned by the server (job pipeline): a client PUT never changes them
 SERVER_OWNED = ("status", "progress", "jobId", "aiJobId", "audio", "error",
                 "transcriptRaw", "corrections", "review", "mode", "warnings")
+# a client PUT that changes any of these re-runs program verification (review.verify_review)
+VERIFIED_CONTENT = ("summary", "notes", "transcript")
 
 
 def _guard(fn):
@@ -100,6 +102,10 @@ def build_router(store: Store) -> APIRouter:
                             body[k] = stored[k]
                         else:
                             body.pop(k, None)
+                    # the server is the source of truth for the 待確認清單: a client change to the
+                    # content (swap / merge versions, manual delete, transcript edit) is re-verified
+                    if any(body.get(k) != stored.get(k) for k in VERIFIED_CONTENT):
+                        body["review"] = verify_review(body, store.glossary_list())
                 return store.save(body)
         return _guard(save)
 

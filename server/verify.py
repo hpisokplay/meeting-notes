@@ -576,7 +576,7 @@ def check_entry(section: str, item_id: str, text: str, src: list, tx: Transcript
         out.append(review_item("quote", section, item_id, text, detail, t=t0))
     elif not legacy and not any(norm(s.get("quote") or "") for s in src):
         out.append(review_item("quote", section, item_id, text,
-                               "這一條沒有附逐字稿原句，無法確認出處。", t=t0))
+                               "沒有附逐字稿原句，請確認。", t=t0))
     if t0 is None and anchors:
         t0 = anchors[0]
 
@@ -666,7 +666,7 @@ def _section_spans(meeting: dict) -> dict[tuple[str, str], tuple[float, float]]:
 
 
 def verify_meeting(meeting: dict, glossary=None, extra: list[dict] | None = None,
-                   recomputed_kinds: set | None = None) -> list[dict]:
+                   recomputed_kinds: set | None = None, *, legacy: bool = True) -> list[dict]:
     """All ReviewItems for a meeting, merged with meeting.review (handled states kept).
 
     glossary: list or newline string (settings.glossary).
@@ -675,6 +675,9 @@ def verify_meeting(meeting: dict, glossary=None, extra: list[dict] | None = None
     `recomputed_kinds` (default: kinds present in extra plus "slip") are recomputed too: old pending
     items of those kinds are dropped. Handled items (confirmed/edited/deleted) are never dropped and
     their state is carried onto matching new items. With extra=None, old items of other kinds stay.
+    legacy=True: an entry that never had sources (plain string / notes object without a src key) is
+    not flagged for its missing quote. legacy=False (a meeting already through the grounded
+    pipeline): every entry without a quote is flagged kind "quote".
     """
     tx = TranscriptIndex(meeting.get("transcript"), meeting.get("durationSec"))
     gl = _glossary_list(glossary)
@@ -686,7 +689,7 @@ def verify_meeting(meeting: dict, glossary=None, extra: list[dict] | None = None
     for section, raw, item_id, text, src in iter_items(meeting):
         if not str(text).strip():
             continue
-        new.extend(check_entry(section, item_id, text, src, tx, gl, rights, legacy=_is_legacy(raw),
+        new.extend(check_entry(section, item_id, text, src, tx, gl, rights, legacy=legacy and _is_legacy(raw),
                                span=spans.get((section, item_id))))
     new.extend(term_items(corr))
 
