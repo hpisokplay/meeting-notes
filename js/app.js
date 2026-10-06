@@ -17,7 +17,8 @@ import {
   reviewItems,
   exportLockText,
   REVIEW_KIND,
-  segIndexAt,
+  srcSegIndex,
+  itemIdOf,
 } from './items.js';
 
 const APP_VERSION = 'v102';
@@ -82,42 +83,73 @@ const PROGRESS_STAGE_TEXT = {
   summarizing: '摘要中',
   queued: '排隊中（等電腦轉錄器）',
   transcribing: '轉錄中',
-  // 重新整理（不重新轉錄）的各步驟
-  reprocess: '重新整理',
+};
+const GPU_STEPS = ['download', 'asr', 'diar', 'upload'];
+// 重新整理（不重新轉錄）的各步驟：只在確定是 reprocess 工作時才編號，一般摘要／筆記工作維持舊標籤
+const REPROCESS_STAGE_TEXT = {
   correction: '名詞校正中',
-  correct: '名詞校正中',
   mode: '判斷講座／會議',
   summary: '整理摘要中',
   notes: '整理筆記中',
   slips: '檢查講者口誤',
   verify: '驗證中',
 };
-const GPU_STEPS = ['download', 'asr', 'diar', 'upload'];
 const REPROCESS_STEPS = ['correction', 'mode', 'summary', 'notes', 'verify'];
-// 伺服器回報的進度文字（progress.msg）→ 第幾步（stage 沒給時用文字判斷）
-const REPROCESS_MSG = ['名詞校正', '判斷講座', '整理摘要', '整理筆記', '驗證'];
-export function progressLabel(m) {
+// 只有 reprocess 才會出現的步驟：看過其中之一，就能確定這是 reprocess 工作
+const REPROCESS_ONLY = ['correction', 'mode', 'slips', 'verify'];
+// 伺服器回報的進度文字（progress.msg）→ 步驟（stage 沒給時用文字判斷）
+const REPROCESS_MSG = [
+  ['名詞校正', 'correction'],
+  ['判斷講座', 'mode'],
+  ['整理摘要', 'summary'],
+  ['整理筆記', 'notes'],
+  ['口誤', 'slips'],
+  ['驗證', 'verify'],
+];
+// 這次進度屬於重新整理的哪一步（認不出回 ''）
+export function reprocessStage(m) {
+  const p = (m && m.progress) || {};
+  let stage = p.stage === 'correct' ? 'correction' : p.stage || '';
+  if (REPROCESS_STAGE_TEXT[stage]) return stage;
+  if (typeof p.msg === 'string') {
+    const hit = REPROCESS_MSG.find(([w]) => p.msg.includes(w));
+    if (hit) return hit[1];
+  }
+  return '';
+}
+// 是不是 reprocess 工作：伺服器有標動作就照動作；沒標就要看過 reprocess 專屬步驟（seen 由呼叫端記住）
+export function isReprocessJob(m, seen) {
+  const p = (m && m.progress) || {};
+  const action = p.action || (m && m.aiAction) || '';
+  if (action) return action === 'reprocess';
+  return !!seen || REPROCESS_ONLY.includes(reprocessStage(m));
+}
+export function progressLabel(m, seenReprocess) {
   const base = STAGE_TEXT[m && m.status] || (m && m.status) || '';
   const p = (m && m.progress) || {};
-  let stage = p.stage || '';
-  if (stage === 'correct') stage = 'correction';
-  // 重新整理：stage 不明時從訊息文字認出是哪一步
-  if (!REPROCESS_STEPS.includes(stage) && !GPU_STEPS.includes(stage) && typeof p.msg === 'string') {
-    const i = REPROCESS_MSG.findIndex((w) => p.msg.includes(w));
-    if (i >= 0) stage = REPROCESS_STEPS[i];
+  if (isReprocessJob(m, seenReprocess)) {
+    const rs = reprocessStage(m);
+    if (rs) {
+      const step = REPROCESS_STEPS.indexOf(rs);
+      return `${base}・${REPROCESS_STAGE_TEXT[rs]}${step >= 0 ? `（第 ${step + 1}/${REPROCESS_STEPS.length} 步）` : ''}`;
+    }
   }
+  const stage = p.stage || '';
   const sub = PROGRESS_STAGE_TEXT[stage];
   if (!sub || sub === base) return base;
-  let step = GPU_STEPS.indexOf(stage);
-  if (step >= 0) return `${base}・${sub}（第 ${step + 1}/${GPU_STEPS.length} 步）`;
-  step = REPROCESS_STEPS.indexOf(stage);
-  if (step >= 0) return `${base}・${sub}（第 ${step + 1}/${REPROCESS_STEPS.length} 步）`;
-  return `${base}・${sub}`;
+  const step = GPU_STEPS.indexOf(stage);
+  return `${base}・${sub}${step >= 0 ? `（第 ${step + 1}/${GPU_STEPS.length} 步）` : ''}`;
 }
 // 停止／取消要取消「正在跑的那個工作」：摘要中是 AI 工作，其餘是轉錄工作
 export function activeJobId(m) {
   if (!m) return null;
   return (m.status === 'summarizing' ? m.aiJobId : m.jobId) || null;
+}
+// 詳情頁頂端狀態：狀態文字＋伺服器的進度訊息（訊息跟狀態重複時不重複顯示）
+export function bannerStatus(m) {
+  const st = statusText(m);
+  const msg = String((m && m.progress && m.progress.msg) || '').trim();
+  return msg && !st.includes(msg) ? `${st}・${msg}` : st;
 }
 export function isProcessing(m) {
   const st = m && m.status;
@@ -1056,13 +1088,17 @@ async function renderProgress(id) {
     </div>`;
   let m = null;
   let opsKey = '';
+  let seenReprocessJob = null; // 這個進度頁看過的 reprocess 工作（換成別的 AI 工作就忘掉）
   const paint = () => {
     const c = document.getElementById('jobprog');
     if (!c || !m) return;
     document.getElementById('pgTitle').textContent = m.title || '';
     const p = m.progress || {};
     const pct = m.status === 'failed' ? 0 : Math.max(0, Math.min(100, Number(p.pct) || 0));
-    const stage = progressLabel(m);
+    // 看過 reprocess 專屬步驟後，同一個工作的「整理摘要／整理筆記」也照 reprocess 編號
+    if (REPROCESS_ONLY.includes(reprocessStage(m))) seenReprocessJob = m.aiJobId || m.jobId || true;
+    else if (seenReprocessJob && seenReprocessJob !== true && m.aiJobId && m.aiJobId !== seenReprocessJob) seenReprocessJob = null;
+    const stage = progressLabel(m, !!seenReprocessJob);
     c.innerHTML = `
       ${m.status === 'failed' ? `<div class="err">❌ ${esc(statusText(m))}</div>` : `<div class="prog-bar"><div class="prog-fill" style="width:${pct}%"></div></div>
       <div class="prog-label">${esc(stage)}${p.pct != null ? ` ${Math.round(pct)}%` : ''}</div>`}
@@ -1303,7 +1339,7 @@ async function renderDetail(id, preloaded) {
   const stBanner = (!m.status || m.status === 'done') && !summaryFailed
     ? ''
     : isProcessing(m)
-      ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(statusText(m))}${m.progress && m.progress.msg ? `・${esc(m.progress.msg)}` : ''}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
+      ? `<div class="warn st-warn" id="stBanner">⏳ ${esc(bannerStatus(m))}${m.progress && m.progress.pct != null ? ` ${Math.round(m.progress.pct)}%` : ''}　<b>點此看進度</b></div>`
       : `<div class="warn st-warn"><div class="err">❌ ${esc(summaryFailed ? `摘要失敗：${m.error}` : statusText(m))}</div>${hasTranscript ? '<button class="act-btn" id="reSummary" data-task="summary" style="margin-top:8px">🔄 重新產生摘要</button>' : ''}</div>`;
   const audioCard = audioParts.length
     ? `<div class="card" id="audioCard">
@@ -1716,21 +1752,26 @@ async function renderDetail(id, preloaded) {
     };
     const srcMap = { ...arrMap, nt: noteOutline };
     // 有出處（src）的條目直接跳到那個時間點的那一句
-    const jumpToSrc = (t, quote) => {
-      const idx = segIndexAt(t, c.transcript || []);
+    // 先找出真正的那一段（多支錄音時每支 t 從 0 開始），再跳逐字稿；play=true 時用那段的 fi 播放
+    const jumpToSrc = (t, quote, play) => {
+      const tr = c.transcript || [];
+      const idx = srcSegIndex(t, quote, tr);
       if (idx < 0) {
         toast('找不到明確的逐字稿出處');
         return;
       }
       jumpTo(idx, quote);
+      if (play && audioParts.length) {
+        const seg = tr[idx];
+        const near = Math.abs(segSeconds(seg.t) - (Number(t) || 0)) <= 30;
+        seekTo(near ? { fi: seg.fi, t: Number(t) || 0 } : seg);
+      }
     };
     curJump = jumpToSrc;
     bodyEl.querySelectorAll('.src-chip').forEach((b) => {
       b.onclick = (e) => {
         e.stopPropagation(); // 別觸發條目本身的跳轉或區塊摺疊
-        const t = Number(b.dataset.srcT);
-        jumpToSrc(t, b.dataset.srcQ || '');
-        if (audioParts.length) seekTo({ t });
+        jumpToSrc(Number(b.dataset.srcT), b.dataset.srcQ || '', true);
       };
     });
     bodyEl.querySelectorAll('[data-jump]').forEach((li) => {
@@ -1773,8 +1814,9 @@ async function renderDetail(id, preloaded) {
       'nt-f': (nt.figures || []).map((f) => `${f.group ? `[${f.group}] ` : ''}${f.label}：${f.value}`).join('\n'),
       'nt-q': (nt.quiz || []).map((x, i) => `Q${i + 1}. ${x.q}\nA. ${x.a}`).join('\n\n'),
     };
-    bodyEl.querySelectorAll('.copy').forEach((b) => {
+    bodyEl.querySelectorAll('[data-copy]').forEach((b) => {
       b.onclick = async () => {
+        if (exportBlocked()) return; // 複製也是對外交付，待確認清單沒清空前不行
         try {
           await navigator.clipboard.writeText(texts[b.dataset.copy] || '');
           const old = b.textContent;
@@ -1806,6 +1848,7 @@ async function renderDetail(id, preloaded) {
             { edit: true }
           );
           drawBody(lang);
+          drawReview(); // 刪掉的條目若有待確認項目 → 視為已處理
           return;
         }
         const src = SEC_SRC[k];
@@ -1819,6 +1862,7 @@ async function renderDetail(id, preloaded) {
           return done ? undefined : STALE;
         }, { edit: true });
         drawBody(lang);
+        drawReview(); // 換版／合併後條目可能不同 → 待確認清單跟著變
         if (ok) toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
       };
     });
@@ -2239,8 +2283,17 @@ async function renderDetail(id, preloaded) {
     lock.hidden = !n;
     lock.textContent = n ? `🔒 ${exportLockText(n)}` : '';
   };
+  // 待確認項目的時間鈕要找哪一句：優先用它指向的條目在該秒數附近的出處原句，否則用項目文字比對
+  const reviewQuote = (r, t) => {
+    if (!r) return '';
+    const [box, key] = String(r.section || '').split('.');
+    const arr = ((m[box] || {})[key]) || [];
+    const target = r.itemId ? arr.find((x) => itemIdOf(x) === String(r.itemId)) : null;
+    const src = itemSrc(target).sort((a, b) => Math.abs(a.t - t) - Math.abs(b.t - t))[0];
+    return (src && src.quote) || r.text || '';
+  };
   let reviewOpen = true;
-  const drawReview = () => {
+  const drawReviewInner = () => {
     const all = reviewItems(m);
     paintExportLock();
     if (!all.length) {
@@ -2283,8 +2336,8 @@ async function renderDetail(id, preloaded) {
     reviewBox.querySelectorAll('[data-rt]').forEach((b) => {
       b.onclick = () => {
         const t = Number(b.dataset.rt);
-        if (curJump) curJump(t, '');
-        if (audioParts.length) seekTo({ t });
+        const r = pend.find((x) => String(x.id) === b.closest('.review-row').dataset.rid);
+        if (curJump) curJump(t, reviewQuote(r, t), true);
       };
     });
     reviewBox.querySelectorAll('[data-rv]').forEach((b) => {
@@ -2298,6 +2351,11 @@ async function renderDetail(id, preloaded) {
         sendReview(r, act);
       };
     });
+  };
+  // 有 AI 作業在跑時，待確認清單的按鈕也要停用（作業結束會重寫條目，這時改會打架）
+  const drawReview = () => {
+    drawReviewInner();
+    paintDetailTasks();
   };
   const openReviewEdit = (row, r) => {
     const ops = row.querySelector('.review-ops');
@@ -2332,6 +2390,19 @@ async function renderDetail(id, preloaded) {
       if (currentDetailId() === id) renderDetail(id, fresh);
     } catch (e) {
       noteFetchError(e);
+      if (e && (e.status === 404 || e.status === 409)) {
+        // 那一條已不存在或已被處理（別台裝置、手動刪除、伺服器自動結案）→ 換成最新版重畫
+        try {
+          const fresh = await api.getMeeting(id);
+          await cacheMeeting(fresh);
+          m = fresh;
+          toast('這一項已經處理過或內容已更新，已重新整理清單');
+          if (currentDetailId() === id) renderDetail(id, fresh);
+          return;
+        } catch (e2) {
+          noteFetchError(e2);
+        }
+      }
       alert('處理失敗：' + errText(e));
       drawReview();
     } finally {

@@ -643,6 +643,124 @@ describe('app（整合，假 NAS）', () => {
     expect('glossary' in api.saveSettings.mock.calls[0][0]).toBe(false);
   });
 
+  // ---- 修正第 1 輪 ----
+  const twoFile = () => ({
+    ...JSON.parse(JSON.stringify(MEETING)),
+    id: 'two-1',
+    updatedAt: Date.now() + Math.random(),
+    transcript: [
+      { speaker: 'A', text: '第一支開場白大家好', t: 10, fi: 0 },
+      { speaker: 'B', text: '第一支講稅務', t: 100, fi: 0 },
+      { speaker: 'A', text: '第二支講信託安排的細節', t: 12, fi: 1 },
+      { speaker: 'B', text: '第二支結尾', t: 100, fi: 1 },
+    ],
+    summary: {
+      actionItems: [],
+      mainPoints: [{ id: 'mp000001', text: '信託要先安排', src: [{ t: 15, quote: '信託安排' }] }],
+      qa: [],
+    },
+    review: { items: [{ id: 'rv0000t1', kind: 'quote', section: 'summary.mainPoints', itemId: 'mp000001', text: '信託要先安排', detail: 'x', t: 15, state: 'pending' }] },
+  });
+
+  it('多支錄音：時間鈕依原句找到第二支的段落，跳逐字稿並播放第二支', async () => {
+    nas.meetings['two-1'] = twoFile();
+    await go('#/m/two-1');
+    document.querySelector('.src-chip[data-src-t="15"]').click();
+    expect(document.querySelector('.seg[data-seg="2"]').classList.contains('flash')).toBe(true);
+    expect(document.querySelector('.seg[data-seg="0"]').classList.contains('flash')).toBe(false);
+    const parts = document.querySelectorAll('#audioCard .audio-part');
+    expect(parts[1].classList.contains('floating')).toBe(true);
+    expect(parts[0].classList.contains('floating')).toBe(false);
+    expect(document.querySelector('.seg[data-seg="2"] mark.hit')).toBeTruthy();
+  });
+
+  it('多支錄音：待確認清單的時間鈕用條目出處原句定位到第二支', async () => {
+    nas.meetings['two-1'] = twoFile();
+    await go('#/m/two-1');
+    document.querySelector('.review-row [data-rt="15"]').click();
+    expect(document.querySelector('.seg[data-seg="2"]').classList.contains('flash')).toBe(true);
+    expect(document.querySelectorAll('#audioCard .audio-part')[1].classList.contains('floating')).toBe(true);
+  });
+
+  it('手動刪掉有待確認項目的條目 → 該項不再算待確認，匯出鎖跟著更新', async () => {
+    nas.meetings['lec-1'] = lectureMeeting();
+    await go('#/m/lec-1');
+    expect(document.getElementById('reviewCount').textContent).toBe('2');
+    document.querySelector('[data-edit="lr"]').click();
+    await tick();
+    document.querySelector('[data-del="lr:0"]').click(); // 刪掉「小心 CRS 申報」（rv000001 指向它）
+    await tick(120);
+    expect(nas.meetings['lec-1'].summary.risks).toEqual([]);
+    expect(document.getElementById('reviewCount').textContent).toBe('1');
+    expect(document.getElementById('exportLock').textContent).toContain('還有 1 項待確認');
+    expect(document.querySelector('.review-row[data-rid="rv000001"]')).toBeNull();
+  });
+
+  it('待確認動作回 404／409 → 重抓會議重畫，不跳錯誤', async () => {
+    nas.meetings['lec-1'] = lectureMeeting();
+    await go('#/m/lec-1');
+    const alerts = [];
+    window.alert = (msg) => alerts.push(msg);
+    // 別台裝置已經確認過這一項
+    nas.meetings['lec-1'].review.items[0].state = 'confirmed';
+    nas.meetings['lec-1'].updatedAt += 1;
+    api.reviewAction.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('已處理'), { status: 409 });
+    });
+    document.querySelector('.review-row[data-rid="rv000001"] [data-rv="confirm"]').click();
+    await tick(120);
+    expect(alerts).toEqual([]);
+    expect(document.getElementById('reviewCount').textContent).toBe('1');
+    expect(document.getElementById('toast').textContent).toContain('已重新整理清單');
+  });
+
+  it('各區「複製」也受匯出把關', async () => {
+    nas.meetings['lec-1'] = lectureMeeting();
+    await go('#/m/lec-1');
+    const alerts = [];
+    window.alert = (msg) => alerts.push(msg);
+    const writes = [];
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (t) => writes.push(t) }, configurable: true });
+    document.querySelector('[data-copy="mp"]').click();
+    await tick(20);
+    expect(alerts).toEqual(['還有 2 項待確認，處理完才能匯出']);
+    expect(writes).toEqual([]);
+    // 清空後可以複製
+    const m = lectureMeeting();
+    m.review.items.forEach((r) => (r.state = 'confirmed'));
+    nas.meetings['lec-1'] = m;
+    await go('#/');
+    await go('#/m/lec-1');
+    document.querySelector('[data-copy="mp"]').click();
+    await tick(20);
+    expect(writes[0]).toContain('【稅務】');
+    expect(writes[0]).toContain('1. 稅務重點甲');
+  });
+
+  it('AI 作業進行中：待確認清單重畫後按鈕仍停用', async () => {
+    nas.meetings['lec-1'] = lectureMeeting();
+    await go('#/m/lec-1');
+    let release;
+    api.waitJob.mockImplementationOnce(() => new Promise((r) => (release = () => r({ state: 'done' }))));
+    document.getElementById('reprocessBtn').click();
+    await tick();
+    document.getElementById('reviewHead').click(); // 收起
+    document.getElementById('reviewHead').click(); // 展開 → 重畫
+    const btns = document.querySelectorAll('#reviewCard [data-rv]');
+    expect(btns.length).toBe(6);
+    expect([...btns].every((b) => b.disabled)).toBe(true);
+    release();
+    await tick(120);
+  });
+
+  it('bannerStatus：進度訊息跟狀態重複時不重複', async () => {
+    const { bannerStatus } = await import('../js/app.js');
+    expect(bannerStatus({ status: 'summarizing', progress: { msg: '摘要中' } })).toBe('摘要中');
+    expect(bannerStatus({ status: 'summarizing', progress: { msg: '摘要' } })).toBe('摘要中');
+    expect(bannerStatus({ status: 'summarizing', progress: { msg: '名詞校正中' } })).toBe('摘要中・名詞校正中');
+    expect(bannerStatus({ status: 'summarizing', progress: {} })).toBe('摘要中');
+  });
+
   it('專有名詞套用到物件條目只改 text，保留 id／src', async () => {
     nas.meetings['test-1'].summary = { actionItems: [], mainPoints: [it8('bbbbbbbb', '台積的重點', 300)], qa: [] };
     nas.meetings['test-1'].terms = { items: [{ t: '台積', cat: 'org', fix: '', draft: '台積電' }] };
@@ -679,7 +797,15 @@ describe('播放與狀態的純函式', () => {
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction' } })).toBe('摘要中・名詞校正中（第 1/5 步）');
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'verify' } })).toBe('摘要中・驗證中（第 5/5 步）');
     expect(progressLabel({ status: 'summarizing', progress: { msg: '判斷講座／會議' } })).toBe('摘要中・判斷講座／會議（第 2/5 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } })).toBe('摘要中・整理摘要中（第 3/5 步）');
+    // 「整理摘要」本身分不出是 reprocess 還是一般摘要 → 沒看過 reprocess 專屬步驟、沒標動作時維持舊標籤
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } })).toBe('摘要中');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'summary' } })).toBe('摘要中');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'notes', msg: '整理筆記中' } })).toBe('摘要中');
+    // 看過專屬步驟（seen）或伺服器標了 action=reprocess → 編號
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } }, true)).toBe('摘要中・整理摘要中（第 3/5 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'notes', action: 'reprocess' } })).toBe('摘要中・整理筆記中（第 4/5 步）');
+    // 伺服器標了別的動作 → 就算訊息像 reprocess 也不編號
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', action: 'summary', msg: '驗證中' } })).toBe('摘要中');
     expect(activeJobId({ status: 'summarizing', jobId: 't', aiJobId: 'a' })).toBe('a');
     expect(activeJobId({ status: 'transcribing', jobId: 't', aiJobId: 'a' })).toBe('t');
     expect(activeJobId({ status: 'queued' })).toBeNull();

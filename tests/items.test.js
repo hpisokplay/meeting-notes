@@ -10,6 +10,9 @@ import {
   pendingReview,
   segIndexAt,
   exportLockText,
+  sha1Hex,
+  itemIdOf,
+  srcSegIndex,
 } from '../js/items.js';
 import { meetingToHtmlBody, splitQA } from '../js/export.js';
 import { buildDocxBytes } from '../js/docx.js';
@@ -57,6 +60,50 @@ describe('items：字串與物件條目都吃', () => {
     expect(segIndexAt(500, tr)).toBe(2);
     expect(segIndexAt(0, tr)).toBe(0);
     expect(segIndexAt(5, [])).toBe(-1);
+  });
+  it('sha1Hex 與 itemIdOf（舊字串條目的 id = sha1 前 8 碼，跟伺服器一致）', () => {
+    expect(sha1Hex('abc')).toBe('a9993e364706816aba3e25717850c26c9cd0d89d');
+    expect(sha1Hex('')).toBe('da39a3ee5e6b4b0d3255bfef95601890afd80709');
+    expect(sha1Hex('中文')).toBe('7be2d2d20c106eee0836c9bc2b939890a78e8fb3');
+    expect(itemIdOf('abc')).toBe('a9993e36');
+    expect(itemIdOf({ id: 'x1', text: 'abc' })).toBe('x1');
+  });
+  it('待確認項目指向的條目已不存在（手動刪除／換版）→ 不算待確認', () => {
+    const m = {
+      summary: { mainPoints: [{ id: 'k1', text: 'a' }, 'abc'], qa: [] },
+      notes: { outline: [{ id: 'o1', title: 't' }] },
+      review: {
+        items: [
+          { id: 'r1', section: 'summary.mainPoints', itemId: 'k1', state: 'pending' },
+          { id: 'r2', section: 'summary.mainPoints', itemId: 'gone', state: 'pending' },
+          { id: 'r3', section: 'summary.mainPoints', itemId: 'a9993e36', state: 'pending' }, // 舊字串條目
+          { id: 'r4', section: 'summary.risks', itemId: 'k9', state: 'pending' }, // 整區都沒了
+          { id: 'r5', section: 'notes.outline', itemId: 'o1', state: 'pending' },
+          { id: 'r6', section: 'notes.outline', itemId: 'o2', state: 'pending' },
+          { id: 'r7', kind: 'term', section: 'transcript', state: 'pending' }, // 不指向條目
+        ],
+      },
+    };
+    expect(pendingReview(m).map((r) => r.id)).toEqual(['r1', 'r3', 'r5', 'r7']);
+    expect(pendingCount(m)).toBe(4);
+  });
+  it('srcSegIndex：多支錄音每支 t 從 0 開始 → 用原句在 ±30 秒的候選裡挑；沒原句取檔案順序最前', () => {
+    const tr = [
+      { speaker: 'A', text: '第一支開場白大家好', t: 10, fi: 0 },
+      { speaker: 'B', text: '第一支講稅務', t: 100, fi: 0 },
+      { speaker: 'A', text: '第二支講信託安排的細節', t: 12, fi: 1 },
+      { speaker: 'B', text: '第二支結尾', t: 100, fi: 1 },
+    ];
+    expect(srcSegIndex(15, '信託安排', tr)).toBe(2);
+    expect(srcSegIndex(15, '開場白', tr)).toBe(0);
+    expect(srcSegIndex(15, '', tr)).toBe(0);
+    expect(srcSegIndex(15, '完全無關xyz', tr)).toBe(0);
+    expect(srcSegIndex(95, '結尾', tr)).toBe(3);
+    // 單支：取涵蓋該秒數的段落
+    const one = [{ text: 'a', t: 0 }, { text: 'b', t: 20 }, { text: 'c', t: 40 }];
+    expect(srcSegIndex(25, '', one)).toBe(1);
+    expect(srcSegIndex(500, '', one)).toBe(2); // 沒有候選 → 退回最後一段 t ≤ 秒數
+    expect(srcSegIndex(5, 'x', [])).toBe(-1);
   });
   it('splitQA 吃物件', () => {
     expect(splitQA(obj('問：何時？\n答：下週'))).toEqual({ q: '何時？', a: '下週' });
