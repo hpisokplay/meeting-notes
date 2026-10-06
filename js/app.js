@@ -30,7 +30,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v110';
+const APP_VERSION = 'v111';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -540,7 +540,8 @@ function detailBusy() {
 
 // 在 NAS 跑一項 AI 工作並等它結束；回傳伺服器寫回結果後的最新會議（已存進快取）
 // action 可以是 AI 動作名稱，或是一個「送出請求並回傳伺服器回應」的函式（模式切換、還原原始逐字稿等）
-async function runServerAI(meetingId, key, initialLabel, action, params, onMsg) {
+// labelPrefix：伺服器回報的進度訊息前面加這段（全部加強用來保留「全部加強 2/3…」）
+async function runServerAI(meetingId, key, initialLabel, action, params, onMsg, labelPrefix) {
   const k = taskId(meetingId, key);
   const t = { label: initialLabel, jobId: null };
   detailTasks.set(k, t);
@@ -548,7 +549,8 @@ async function runServerAI(meetingId, key, initialLabel, action, params, onMsg) 
   try {
     t.jobId = typeof action === 'function' ? api.jobIdOf(await action()) : await api.runAI(meetingId, action, params || {});
     if (t.jobId) await api.waitJob(t.jobId, (p) => {
-      const msg = p && (p.msg || (p.pct != null ? `${initialLabel.replace(/…$/, '')} ${p.pct}%` : ''));
+      const raw = p && (p.msg || (p.pct != null ? `${initialLabel.replace(/…$/, '')} ${p.pct}%` : ''));
+      const msg = raw && labelPrefix ? `${labelPrefix.replace(/…$/, '')} ${raw}` : raw;
       if (msg && msg !== t.label) {
         t.label = msg;
         paintDetailTasks();
@@ -1494,7 +1496,7 @@ async function renderDetail(id, preloaded) {
         .map(
           (a, n) =>
             `<div class="audio-part" data-part="${n}">${audioParts.length > 1 ? `<div class="meta">第 ${n + 1} 支：${esc((a && (a.name || a.file)) || '')}</div>` : ''}` +
-            `<audio controls preload="none" src="${esc(api.audioUrl(id, n))}"></audio><button class="audio-x" type="button" title="收起">✕</button></div>`
+            `<audio controls preload="none" src="${esc(api.audioUrl(id, n))}"></audio></div>`
         )
         .join('')}
       <button type="button" class="act-btn audio-stop" id="audioStopBtn" aria-label="停止播放">⏹ 停止</button>
@@ -1509,6 +1511,18 @@ async function renderDetail(id, preloaded) {
     ? `<div class="kind-row"><span class="kind-l">類型</span>
         <span class="kind-toggle"><button type="button" class="act-btn${lectureNow ? ' on' : ''}" data-kind="lecture" data-task="kind:lecture">🎤 講座</button><button type="button" class="act-btn${lectureNow ? '' : ' on'}" data-kind="meeting" data-task="kind:meeting">👥 會議</button></span></div>`
     : '';
+  // AI 處理第一列：重新整理｜重新轉錄（只有一顆時獨佔一列）
+  const row1Btns = [
+    hasTranscript ? '<button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess" title="重新整理（不重新轉錄）" aria-label="重新整理（不重新轉錄）">🔁 重新整理</button>' : '',
+    audioParts.length ? '<button type="button" class="act-btn" id="retrBtn">🎙 重新轉錄</button>' : '',
+  ].filter(Boolean);
+  const aiRow1 = row1Btns.length ? `<div class="tb-row tb-${row1Btns.length}">${row1Btns.join('')}</div>` : '';
+  // 第二列：加強結論（講座）／加強待辦（會議）｜加強重點｜加強Q&A
+  const enhSecs = [
+    lectureNow ? { k: 'conclusions', label: '加強結論', name: '核心結論', short: '結論' } : { k: 'actionItems', label: '加強待辦', name: '待辦事項', short: '待辦' },
+    { k: 'mainPoints', label: '加強重點', name: lectureNow ? '重點' : '會議重點', short: '重點' },
+    { k: 'qa', label: '加強Q&A', name: lectureNow ? '提問 Q&A' : '會議提問 Q&A', short: 'Q&A' },
+  ];
 
   // 版面：標題 → 工具列（所有按鈕依功能分四組）→ 校對面板（按「校對」才展開）→ 狀態列 → 內容 → 錄音＋逐字稿 → 問答
   view.innerHTML = `
@@ -1548,12 +1562,15 @@ async function renderDetail(id, preloaded) {
       </div>
       <div class="tb-group" data-group="ai">
         <div class="tb-label">🤖 AI 處理</div>
+        ${aiRow1}
+        <div class="tb-row tb-3" id="aiEnhRow">
+          ${enhSecs.map((x) => `<button class="act-btn" type="button" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('')}
+        </div>
         <div class="tb-row tb-2">
-          ${hasTranscript ? '<button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess" title="重新整理（不重新轉錄）" aria-label="重新整理（不重新轉錄）">🔁 重新整理</button>' : ''}
-          <span class="ai-dyn" id="aiDyn"></span>
-          ${audioParts.length ? '<button type="button" class="act-btn" id="retrBtn">🎙 重新轉錄</button>' : ''}
+          <button type="button" class="act-btn" id="enhAllBtn" data-task="enhAll">⚡ 全部加強</button>
           <button type="button" class="tb-btn" id="editModeBtn" aria-pressed="false">✏️ 編輯模式</button>
         </div>
+        <div class="tb-row tb-1" id="aiNotesRow" hidden></div>
       </div>
     </div>
     <div class="card review-panel" id="reviewPanel" data-autoshow hidden>
@@ -1581,81 +1598,77 @@ async function renderDetail(id, preloaded) {
   const trBody = document.getElementById('trBody'); // 逐字稿（隨語言重畫）
 
   // ===== 錄音播放 =====
+  // 只有一個浮動元件：迷你播放器。條件＝有一支在播（或播到一半暫停）且錄音卡不在畫面上（IntersectionObserver）。
+  // 卡片看得到時一律不浮出任何東西，避免蓋住卡片本身。
   releaseDetailWidgets(); // 重畫詳情頁：先卸掉上一次的浮動元件／觀察器
   let audioActive = null; // 目前（最近一次）播放中的 <audio>；停止後為 null
   let audioCardVisible = true;
-  view.insertAdjacentHTML(
-    'beforeend',
-    `<div class="audio-pill" id="audioPill" hidden><button type="button" id="pillToggle">⏸ 暫停</button><button type="button" id="pillStop" aria-label="停止">⏹</button><span class="pill-t" id="pillTime">0:00</span></div>`
-  );
-  const pill = document.getElementById('audioPill');
-  const paintPill = () => {
-    if (!pill) return;
-    const show = !!audioActive && !audioCardVisible;
-    pill.hidden = !show;
+  const audioCardEl = document.getElementById('audioCard');
+  const audioEls = [...view.querySelectorAll('#audioCard audio')];
+  if (audioCardEl) {
+    view.insertAdjacentHTML(
+      'beforeend',
+      `<div class="mini-player" id="miniPlayer" role="region" aria-label="迷你播放器" hidden>` +
+        `<span class="mp-part" id="mpPart"></span>` +
+        `<button type="button" class="mp-btn" id="mpToggle" aria-label="暫停">⏸</button>` +
+        `<span class="mp-time" id="mpTime">0:00</span>` +
+        `<button type="button" class="mp-btn mp-stop" id="mpStop" aria-label="停止">⏹ 停止</button>` +
+        `<button type="button" class="mp-btn mp-x" id="mpClose" aria-label="關閉並停止">✕</button>` +
+        `</div>`
+    );
+  }
+  const mini = document.getElementById('miniPlayer');
+  const paintMini = () => {
+    if (!mini) return;
+    mini.hidden = !(audioActive && !audioCardVisible);
     if (!audioActive) return;
     const playing = audioActive._playing === true;
-    document.getElementById('pillToggle').textContent = playing ? '⏸ 暫停' : '▶ 繼續';
-    document.getElementById('pillTime').textContent = fmtSec(audioActive.currentTime || 0);
+    const tg = document.getElementById('mpToggle');
+    tg.textContent = playing ? '⏸' : '▶';
+    tg.setAttribute('aria-label', playing ? '暫停' : '繼續播放');
+    document.getElementById('mpPart').textContent = `第 ${audioEls.indexOf(audioActive) + 1} 支`;
+    document.getElementById('mpTime').textContent = fmtSec(audioActive.currentTime || 0);
   };
-  view.querySelectorAll('#audioCard audio').forEach((a) => {
+  const markCur = (a) =>
+    view.querySelectorAll('#audioCard .audio-part').forEach((w) => w.classList.toggle('cur', !!a && w.contains(a)));
+  audioEls.forEach((a) => {
     a.addEventListener('play', () => {
-      view.querySelectorAll('#audioCard audio').forEach((o) => o !== a && !o.paused && o.pause());
+      audioEls.forEach((o) => o !== a && !o.paused && o.pause());
       a._playing = true;
       audioActive = a;
-      paintPill();
+      markCur(a);
+      paintMini();
     });
     a.addEventListener('pause', () => {
       a._playing = false;
-      paintPill();
+      paintMini();
     });
     a.addEventListener('ended', () => {
       a._playing = false;
       audioActive = null;
-      paintPill();
+      markCur(null);
+      paintMini();
     });
-    a.addEventListener('timeupdate', paintPill);
+    a.addEventListener('timeupdate', paintMini);
   });
-  if (pill) {
-    document.getElementById('pillToggle').onclick = () => {
-      const a = audioActive;
-      if (!a) return;
-      if (a._playing === true) a.pause();
-      else {
-        const pr = a.play && a.play();
-        if (pr && pr.catch) pr.catch(() => {});
-      }
-    };
-    document.getElementById('pillStop').onclick = () => stopAllAudio();
-  }
-  const audioCardEl = document.getElementById('audioCard');
   if (audioCardEl && typeof IntersectionObserver === 'function') {
-    audioCardVisible = false; // 等觀察器回報；回報前不亂顯示
     const io = new IntersectionObserver((es) => {
       es.forEach((e) => (audioCardVisible = e.isIntersecting));
-      paintPill();
+      paintMini();
     });
     io.observe(audioCardEl);
     detailWidgets.push(() => io.disconnect());
   }
-  detailWidgets.push(() => pill && pill.remove());
+  detailWidgets.push(() => mini && mini.remove());
 
-  // 點時間標記：找出是第幾支、第幾秒，該支浮到畫面下方播放（不用捲回頂端找播放器）
+  // 點時間標記：找出是第幾支、第幾秒，從那裡播放（卡片不在畫面時由迷你播放器控制，不用捲回頂端）
   const seekTo = (seg) => {
     const tgt = seekTarget(seg, audioParts);
     if (!tgt) return;
-    const wraps = view.querySelectorAll('#audioCard .audio-part');
-    wraps.forEach((w, n) => {
-      const a = w.querySelector('audio');
-      if (n !== tgt.part) {
-        w.classList.remove('floating');
-        if (a) a.pause();
-      }
-    });
-    const w = wraps[tgt.part];
-    const a = w && w.querySelector('audio');
+    audioEls.forEach((a, n) => n !== tgt.part && a.pause());
+    const a = audioEls[tgt.part];
     if (!a) return;
-    w.classList.add('floating');
+    markCur(a);
     a._playStart = tgt.time;
     const go = () => {
       try {
@@ -1671,20 +1684,9 @@ async function renderDetail(id, preloaded) {
       if (a.load) a.load();
     }
   };
-  view.querySelectorAll('#audioCard .audio-x').forEach((b) => {
-    b.onclick = () => {
-      const w = b.closest('.audio-part');
-      w.classList.remove('floating');
-      const a = w.querySelector('audio');
-      if (a) a.pause();
-    };
-  });
   // 停止：暫停並回到這次播放的起點（沒有指定起點就回 0）；從時間標記／出處鈕開始的播放也一併停掉
   const stopAllAudio = () => {
-    view.querySelectorAll('#audioCard .audio-part').forEach((w) => {
-      w.classList.remove('floating');
-      const a = w.querySelector('audio');
-      if (!a) return;
+    audioEls.forEach((a) => {
       try {
         a.pause();
       } catch (_) {}
@@ -1694,8 +1696,22 @@ async function renderDetail(id, preloaded) {
       a._playStart = 0;
     });
     audioActive = null;
-    paintPill();
+    markCur(null);
+    paintMini();
   };
+  if (mini) {
+    document.getElementById('mpToggle').onclick = () => {
+      const a = audioActive;
+      if (!a) return;
+      if (a._playing === true) a.pause();
+      else {
+        const pr = a.play && a.play();
+        if (pr && pr.catch) pr.catch(() => {});
+      }
+    };
+    document.getElementById('mpStop').onclick = stopAllAudio;
+    document.getElementById('mpClose').onclick = stopAllAudio;
+  }
   const stopBtn = document.getElementById('audioStopBtn');
   if (stopBtn) stopBtn.onclick = stopAllAudio;
   const retrBtn = document.getElementById('retrBtn');
@@ -1748,22 +1764,19 @@ async function renderDetail(id, preloaded) {
     mm[id] = mode;
     localStorage.setItem(MODE_KEY, JSON.stringify(mm));
     document.querySelectorAll('#modeToggle button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
-    // AI 處理：「加強重點」「加強Q&A」直接放在工具列（講座模式的 mainPoints／qa 也是同一組 key）；學習筆記另有產生／重新產生
-    const eg = document.getElementById('aiDyn');
-    if (eg) {
-      const genNotesBtn = `<button class="act-btn" type="button" data-gen-notes data-task="notes">📚 ${m.notes ? '重新產生學習筆記' : '產生學習筆記'}</button>`;
-      eg.innerHTML =
-        ENH_DIRECT.map((x) => `<button class="act-btn" type="button" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('') +
-        (mode === 'notes' ? genNotesBtn : '');
+    // AI 處理：學習筆記模式多一列「產生／重新產生學習筆記」
+    const nr = document.getElementById('aiNotesRow');
+    if (nr) {
+      nr.hidden = mode !== 'notes';
+      nr.innerHTML =
+        mode === 'notes'
+          ? `<button class="act-btn" type="button" data-gen-notes data-task="notes">📚 ${m.notes ? '重新產生學習筆記' : '產生學習筆記'}</button>`
+          : '';
       wireEnhButtons();
+      paintDetailTasks();
     }
     drawBody(lang);
   };
-
-  const ENH_DIRECT = [
-    { k: 'mainPoints', label: '📌 加強重點' },
-    { k: 'qa', label: '❓ 加強Q&A' },
-  ];
 
   const tableHtml = (t, del) => {
     const head = t.headers.map((h) => `<th>${esc(h)}</th>`).join('');
@@ -2861,23 +2874,52 @@ async function renderDetail(id, preloaded) {
       alert('這場沒有逐字稿，無法加強');
       return;
     }
-    const nameMap = { actionItems: '待辦事項', mainPoints: '會議重點', qa: '會議提問 Q&A' };
+    const name = (enhSecs.find((x) => x.k === section) || {}).name || section;
     if (detailBusy()) {
       toast('已有一項作業進行中，請等它完成');
       return;
     }
-    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變，舊版會留著可以換回來）。`)) return;
+    if (!confirm(`重新從整份逐字稿抓出「完整的${name}」？會取代目前這一區的內容（其他區不變，舊版會留著可以換回來）。`)) return;
     try {
       const before = ((m.summary || {})[section] || []).length;
       // 伺服器會先把目前版備份到 alt，再寫入新版 → 之後可用「換版／合併」
-      const fresh = await runServerAI(id, 'enh:' + section, `加強${nameMap[section]}中…`, 'enhance', { section });
+      const fresh = await runServerAI(id, 'enh:' + section, `加強${name}中…`, 'enhance', { section });
       renderDetail(id, fresh);
       const after = ((fresh.summary || {})[section] || []).length;
-      toast(`已加強${nameMap[section]}：${before} 筆 → ${after} 筆`);
+      toast(`已加強${name}：${before} 筆 → ${after} 筆`);
     } catch (e) {
       alert('加強失敗：' + errText(e));
     }
   };
+  // 全部加強：依序加強 結論（或待辦）→ 重點 → Q&A；每項等工作完成才送下一項，失敗就停
+  const doEnhanceAll = async () => {
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法加強');
+      return;
+    }
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
+    if (!confirm(`會依序加強${enhSecs.map((x) => x.short).join('、')}，約需數分鐘，舊版會保留可換版。確定？`)) return;
+    let fresh = null;
+    let done = 0;
+    try {
+      for (const [i, x] of enhSecs.entries()) {
+        const pre = `全部加強 ${i + 1}/${enhSecs.length}…`;
+        fresh = await runServerAI(id, 'enhAll', pre, 'enhance', { section: x.k }, null, pre);
+        done++;
+      }
+    } catch (e) {
+      if (fresh) renderDetail(id, fresh);
+      alert(`全部加強在第 ${done + 1} 項（${enhSecs[done].name}）失敗，已停止：${errText(e)}${done ? `\n前 ${done} 項已完成。` : ''}`);
+      return;
+    }
+    renderDetail(id, fresh);
+    toast('全部加強完成 ✓');
+  };
+  const enhAllBtn = document.getElementById('enhAllBtn');
+  if (enhAllBtn) enhAllBtn.onclick = () => doEnhanceAll();
   function wireEnhButtons() {
     document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
     document.querySelectorAll('[data-nenh]').forEach((b) => (b.onclick = () => doEnhanceNotes(b.dataset.nenh)));

@@ -372,19 +372,10 @@ ol.list.qa.editing .item-del { margin-top: 6px; }
 /* 連結做成大按鈕（匯出備份） */
 a.big { display: block; width: 100%; padding: 15px; font-size: 16px; font-weight: 600; border-radius: 12px; margin-top: 10px; text-align: center; text-decoration: none; }
 a.big.secondary { background: var(--bg); color: var(--ink); }
-/* 錄音播放器：每支一個；點時間標記時那一支浮到底部播放 */
+/* 錄音播放器：每支一個；點時間標記時那一支從該處播放（.cur 標示正在播的那支） */
 .audio-part { position: relative; margin-top: 8px; }
 .audio-part audio { width: 100%; display: block; }
-.audio-part .audio-x { display: none; }
-.audio-part.floating {
-  position: fixed; left: 12px; right: 12px; bottom: calc(84px + env(safe-area-inset-bottom)); z-index: 55;
-  background: var(--card); border: 1px solid var(--line); border-radius: 14px; padding: 8px 40px 8px 10px;
-  box-shadow: 0 6px 24px rgba(0,0,0,0.18); margin: 0;
-}
-.audio-part.floating .audio-x {
-  display: block; position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
-  border: none; background: transparent; color: var(--muted); font-size: 18px; padding: 6px;
-}
+.audio-part.cur audio { outline: 2px solid var(--brand); outline-offset: 2px; border-radius: 28px; }
 .time-mark.seekable { color: var(--brand); cursor: pointer; }
 
 /* ===== 董事長版：出處時間、講座分組、待確認清單、匯出把關 ===== */
@@ -482,7 +473,11 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
 .tb-label { font-size: 12px; font-weight: 800; color: var(--muted); letter-spacing: .04em; margin-bottom: 6px; }
 .tb-row { display: grid; gap: 6px; }
 .tb-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+.tb-1 { grid-template-columns: minmax(0, 1fr); }
 .tb-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.tb-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.tb-group .tb-row + .tb-row { margin-top: 6px; }
+.tb-row[hidden] { display: none; }
 .toolbar .act-btn, .tb-btn { min-width: 0; min-height: 44px; white-space: normal; line-height: 1.25; padding: 6px 6px; }
 .tb-btn {
   width: 100%; border: 1px solid var(--line); border-radius: 9px; background: var(--btn2); color: var(--ink);
@@ -522,19 +517,23 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
 .terms-list-d > summary { cursor: pointer; min-height: 44px; display: flex; align-items: center; font-size: 14px; font-weight: 700; }
 
 /* ---- v110：錄音停止鈕／浮動膠囊、逐字稿快速捲動軸、AI 處理直接按鈕 ---- */
-.ai-dyn { display: contents; }
 .audio-stop { width: 100%; min-height: 44px; margin-top: 8px; }
-.audio-pill {
-  position: fixed; right: calc(12px + env(safe-area-inset-right)); bottom: calc(150px + env(safe-area-inset-bottom)); z-index: 56;
-  display: flex; align-items: center; gap: 4px; padding: 4px 6px; border-radius: 999px;
+/* v111：唯一的浮動迷你播放器。只在有在播、且錄音卡不在畫面時出現；固定在底部分頁列上方 */
+.mini-player {
+  position: fixed; z-index: 56;
+  left: calc(12px + env(safe-area-inset-left)); right: calc(12px + env(safe-area-inset-right));
+  bottom: calc(80px + env(safe-area-inset-bottom));
+  display: flex; align-items: center; gap: 6px; padding: 4px 6px 4px 12px; border-radius: 14px;
   background: var(--card); border: 1px solid var(--line); box-shadow: 0 6px 24px rgba(0,0,0,0.22);
 }
-.audio-pill[hidden] { display: none; }
-.audio-pill button {
-  min-height: 44px; min-width: 44px; padding: 0 12px; border: none; border-radius: 999px;
-  background: var(--btn2); color: var(--ink); font-size: 14px; font-weight: 700;
+.mini-player[hidden] { display: none; }
+.mini-player .mp-part { flex: 0 0 auto; font-size: 13px; font-weight: 700; white-space: nowrap; }
+.mini-player .mp-time { flex: 1 1 auto; min-width: 0; font-size: 13px; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mini-player .mp-btn {
+  flex: 0 0 auto; min-height: 44px; min-width: 44px; padding: 0 10px; border: none; border-radius: 10px;
+  background: var(--btn2); color: var(--ink); font-size: 15px; font-weight: 700;
 }
-.audio-pill .pill-t { padding: 0 8px 0 4px; font-size: 13px; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; }
+.mini-player .mp-x { background: transparent; color: var(--muted); }
 .tr-rail {
   position: fixed; z-index: 50; pointer-events: none;
   right: calc(2px + env(safe-area-inset-right));

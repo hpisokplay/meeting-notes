@@ -150,6 +150,19 @@ def test_enhance_backs_up_old_section(sj):
     assert m["translations"] == {}
 
 
+def test_enhance_lecture_conclusions_grounded_with_backup(sj):
+    store, jobs = sj
+    mk(store, mode="lecture", summary={"conclusions": ["舊結論"], "advice": [], "risks": [], "cases": [],
+                                        "mainPoints": ["舊重點"], "qa": []})
+    run_job(store, jobs, "enhance", section="conclusions")
+    m = store.get("m1")
+    assert m["alt"]["summary:conclusions"] == ["舊結論"]
+    assert [x["text"] for x in m["summary"]["conclusions"]] == ["潤飾1", "潤飾2"]
+    assert m["summary"]["conclusions"][0]["src"] == [{"t": 3725.0, "quote": "我們談台積店的案子"}]
+    assert m["summary"]["mainPoints"] == ["舊重點"]
+    assert isinstance(m["review"]["items"], list)
+
+
 def test_assemble_polished_keeps_uncovered_and_splits_overmerge():
     all_ = ["a", "b", "c", "d", "e"]
     items = [{"text": "AB", "src": [1, 2]}, {"text": "CDE", "src": [3, 4, 5, 9]}]
