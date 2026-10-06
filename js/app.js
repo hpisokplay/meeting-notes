@@ -6,7 +6,7 @@ import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord, splitQA } from './export.js';
 
-const APP_VERSION = 'v100';
+const APP_VERSION = 'v101';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -1258,12 +1258,12 @@ async function renderDetail(id, preloaded) {
       </div>
       <div class="act-grid" id="enhGrid"></div>
     </div>
-    ${audioCard}
-    <div id="detailBody"></div>
     <div class="card" id="termsCard">
       <div class="section-title sec-head" data-sec="terms" style="margin-top:0"><span class="sec-t">📝 專有名詞訂正</span><span class="sec-right"><span class="chev" id="termsChev">▾</span></span></div>
       <div class="sec-body" id="termsSecBody"><div id="termsBody"></div></div>
     </div>
+    ${audioCard}
+    <div id="detailBody"></div>
     <div class="card" id="chatCard">
       <div class="section-title" style="margin-top:0">💬 問這場會議 <button class="copy" id="chatClear" hidden>清除紀錄</button></div>
       <div id="chatLog"></div>

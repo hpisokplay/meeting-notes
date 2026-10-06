@@ -163,6 +163,31 @@ describe('app（整合，假 NAS）', () => {
     expect(gHtml).toContain('未分類');
   });
 
+  it('專有名詞訂正在加強按鈕下方、錄音上方（兩種模式都一樣；沒錄音時緊接加強按鈕）', async () => {
+    const pos = (h, s) => h.indexOf(s);
+    await go('#/m/test-1');
+    let h = document.getElementById('view').innerHTML;
+    const order = [pos(h, 'id="enhGrid"'), pos(h, 'id="termsCard"'), pos(h, 'id="audioCard"'), pos(h, 'id="detailBody"'), pos(h, 'id="chatCard"')];
+    expect(order.every((n) => n >= 0)).toBe(true);
+    expect([...order].sort((a, b) => a - b)).toEqual(order);
+    expect(h).toContain('問這場會議');
+    // 學習筆記模式位置不變
+    document.querySelector('#modeToggle [data-mode="notes"]').click();
+    await tick();
+    h = document.getElementById('view').innerHTML;
+    expect(pos(h, 'id="enhGrid"')).toBeLessThan(pos(h, 'id="termsCard"'));
+    expect(pos(h, 'id="termsCard"')).toBeLessThan(pos(h, 'id="audioCard"'));
+    document.querySelector('#modeToggle [data-mode="meeting"]').click();
+    await tick();
+    // 沒錄音
+    nas.meetings['test-na'] = Object.assign(JSON.parse(JSON.stringify(MEETING)), { id: 'test-na', audio: [] });
+    await go('#/m/test-na');
+    h = document.getElementById('view').innerHTML;
+    expect(pos(h, 'id="audioCard"')).toBe(-1);
+    expect(pos(h, 'id="enhGrid"')).toBeLessThan(pos(h, 'id="termsCard"'));
+    expect(pos(h, 'id="termsCard"')).toBeLessThan(pos(h, 'id="detailBody"'));
+  });
+
   it('詳情頁有錄音播放器（每支一個、preload=none）與重新轉錄；點時間標記播放對的那一支', async () => {
     await go('#/m/test-1');
     const audios = document.querySelectorAll('#audioCard audio');
