@@ -341,6 +341,14 @@ GROUNDING_RULES = (
     "- 聽錯字：逐字稿明顯是同音錯字的一般名詞（「鼓勵所得」＝股利所得）→ text 寫正確的詞，quote 照逐字稿原樣抄（含錯字）。"
     "人名、公司名不適用這條，照逐字稿寫。\n"
     "- 不確定：不確定就不寫。✗ 加「（推測）」來填補；✗ 用你的專業知識補上講者沒講的理由、法條或背景。\n"
+    "- 張冠李戴：數字、人名、結論只能掛在講者原本講的那個案例或對象上。"
+    "✗ 講者在 A 案例說「匯回 2000 萬以上會被盯上」，卻寫成 B 案例的門檻；"
+    "✗ 講者說「倫敦、紐約不跟台灣交換資訊，新加坡要等它們先交換」，卻寫成「新加坡不與英美交換」（主詞與對象被調換）。"
+    "✓ 寫之前先確認：這個數字是誰的、哪個案例的、在講什麼。\n"
+    "- 遺漏條件：門檻、期間、比例、適用對象一定要跟著結論寫在同一條。"
+    "✓「除戶後 2 年內回國恢復戶籍可立即加保，超過 2 年須滿 6 個月」；✗「除戶後回國可立即加保」（少了「2 年內」）。"
+    "✓「有戶籍者一年在台滿 31 天且生活重心在台即為稅務居民」；✗「有戶籍就是稅務居民」（少了「滿 31 天」）。"
+    "✓「投資公司賣股要課 12% 最低稅負（持股滿 3 年減半）」；✗ 漏掉持有年限條件。\n"
     "\n"
     "【src 的寫法】\n"
     "- quote：從逐字稿「同一行」裡逐字複製連續的 6–40 個字（標點可以省略）。✗ 改寫、✗ 摘要、✗ 把兩處拼在一起、✗ 加字。\n"
@@ -574,8 +582,29 @@ NOTES_SRC_RULES = (
     "- tables：src 引用表格內容出處的原句；每一格都要有逐字稿依據，沒有依據的格子寫「（未提及）」，不可自己填。\n"
     "- concepts：plain／why 只能用講者的解釋改寫，✗ 用你自己的專業知識補充講者沒講的定義或背景。\n"
 )
-NOTES_SRC_PROMPT = (NOTES_PROMPT.replace(LANG_RULE + IN_USER, "") + "\n\n" + NOTES_SRC_RULES + "\n"
-                    + GROUNDING_RULES + LANG_RULE + IN_USER)
+_CONCEPT_OLD = "term＝名詞本身；plain＝用白話說明它是什麼；why＝為什麼重要／用在哪裡。"
+_CONCEPT_NEW = ("只收講者有解釋的名詞。term＝名詞本身；plain＝用白話改寫「講者自己的解釋」；"
+                "why＝講者說它為什麼重要（講者沒說就留空字串）。✗ 用你自己的知識補定義。")
+assert _CONCEPT_OLD in NOTES_PROMPT
+NOTES_SRC_PROMPT = (NOTES_PROMPT.replace(LANG_RULE + IN_USER, "").replace(_CONCEPT_OLD, _CONCEPT_NEW)
+                    + "\n\n" + NOTES_SRC_RULES + "\n" + GROUNDING_RULES + LANG_RULE + IN_USER)
+
+# section instructions for the src-aware notes enhance: no 「全部／不要精簡」 pressure (it pushes the
+# model to pad with unsupported items); only what the speaker actually said.
+NOTES_SRC_SECTIONS = {
+    "outline": {"label": "章節大綱", "instr": (
+        "依講述順序列出這段的章節。title 為 8～20 字主題；points 為該節講者講到的重點；"
+        "anchor 填該節開始處逐字稿中的一句原話（10～20 字，必須真的出現過；只放原句文字，不含時間與說話者）")},
+    "concepts": {"label": "重要概念", "instr": (
+        "列出這段中講者有解釋的名詞或機制。term＝名詞；plain＝用白話改寫「講者自己的解釋」"
+        "（講者沒有解釋的名詞不要列）；why＝講者說它為什麼重要（講者沒說就留空字串）。✗ 用你自己的知識補定義")},
+    "tables": {"label": "對照表", "instr": (
+        "把這段中講者明確比較的「多項目 × 多屬性」內容還原成表格。rows 每列長度必須與 headers 相同；"
+        "沒有這類內容就回空陣列，不要硬湊")},
+    "figures": {"label": "關鍵數據", "instr": "列出這段裡符合下列標準的數據。\n" + FIGURE_RULE},
+    "quiz": {"label": "自我測驗", "instr": (
+        "針對這段講者講清楚的知識點出題；答案必須在這段裡找得到依據，沒有明確答案的不要出")},
+}
 
 
 def notes_src_section_schema(section: str) -> dict:
@@ -584,7 +613,7 @@ def notes_src_section_schema(section: str) -> dict:
 
 
 def notes_src_enhance_prompt(section: str) -> str:
-    meta = NOTES_SECTIONS[section]
+    meta = NOTES_SRC_SECTIONS[section]
     return (f"以下是一場研討會／課程逐字稿的其中一段（每行「[時:分:秒] 說話者: 內容」）。請{meta['instr']}。"
             "使用與逐字稿相同的主要語言，忠於逐字稿、不可自行補充沒講到的內容。"
             f"這段沒有相關內容就回空陣列。\n\n{NOTES_SRC_RULES}\n{GROUNDING_RULES}"
@@ -636,7 +665,7 @@ def enhance_src_prompt(section: str) -> str:
     """Chunk extraction for one summary section (meeting or lecture key); Items with src."""
     meta = SECTION_META_SRC[section]
     return ("以下是一段逐字稿（每行「[時:分:秒] 說話者: 內容」）。"
-            f"請{meta['instr']}。務求完整、不要遺漏；這段沒有相關內容就回空陣列。每一條都是 "
+            f"請{meta['instr']}。這段沒有相關內容就回空陣列。每一條都是"
             '{"text":"…","group":"…","src":[{"t":秒數,"quote":"逐字稿原句"}]}。\n\n'
             + GROUNDING_RULES + '只輸出 JSON {"items":[...]}。' + LANG_RULE + IN_USER)
 
