@@ -166,16 +166,11 @@ def fix_traditional(text):
     return _TW_FIX.sub("只", text)
 
 
-def _join(a, b):
-    if a and b and a[-1].isascii() and a[-1].isalnum() and b[0].isascii() and b[0].isalnum():
-        return a + " " + b
-    return a + b
-
-
 def smooth_speakers(segs, max_sec=3.0, max_chars=8):
     """A run of one other speaker sandwiched between the same speaker A on both sides,
-    shorter than max_sec AND <= max_chars, is reassigned to A; adjacent same-speaker
-    segments are then re-merged. Segments need speaker/text/t (start seconds).
+    shorter than max_sec AND <= max_chars, is reassigned to A. Only the speaker label
+    changes: segments are never merged (build_segments already owns line length/gap
+    splitting; re-merging produced multi-thousand-char lines). Segments need speaker/text/t.
 
     Trade-off: a real interjection of <= max_chars lasting < max_sec between two segments of
     the same speaker is absorbed too. Accepted, because diarization flicker in lectures is
@@ -195,13 +190,7 @@ def smooth_speakers(segs, max_sec=3.0, max_chars=8):
                 for k in range(i, j + 1):
                     segs[k]["speaker"] = segs[i - 1]["speaker"]
         i = j + 1
-    out = []
-    for s in segs:
-        if out and out[-1]["speaker"] == s["speaker"]:
-            out[-1]["text"] = _join(out[-1]["text"], s["text"])
-        else:
-            out.append(s)
-    return out
+    return segs
 
 
 def name_speakers(segs):

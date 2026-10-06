@@ -13,12 +13,32 @@ def S(spk, text, t):
 
 
 # ---- smoothing
-def test_sandwiched_short_run_merged_and_remerged():
+def test_sandwiched_short_run_relabelled_not_merged():
     segs = [S("A", "今天我們來談稅", 0.0), S("B", "嗯", 10.0), S("A", "好的繼續", 11.0)]
     out = smooth_speakers(segs)
-    assert len(out) == 1
-    assert out[0]["speaker"] == "A" and out[0]["t"] == 0.0
-    assert out[0]["text"] == "今天我們來談稅嗯好的繼續"
+    assert [s["speaker"] for s in out] == ["A", "A", "A"]
+    assert [s["text"] for s in out] == ["今天我們來談稅", "嗯", "好的繼續"]
+    assert [s["t"] for s in out] == [0.0, 10.0, 11.0]
+
+
+def test_long_single_speaker_lecture_keeps_segment_count():
+    """Regression: 89-min lecture collapsed to 7 segments because smoothing re-merged
+    every adjacent same-speaker line."""
+    import random
+    rnd = random.Random(7)
+    phrase = "所以股利所得可以選擇合併計稅或者分離課稅，"
+    segs, t = [], 0.0
+    for i in range(300):
+        n = rnd.randint(20, 60)
+        segs.append(S("SPEAKER_00", (phrase * 4)[:n] + "。", t))
+        t += rnd.uniform(3.0, 15.0)
+        if i % 37 == 5:  # diarization flicker: 1-2 char other-speaker line
+            segs.append(S("SPEAKER_01", "嗯" if i % 2 else "對對", t))
+            t += 0.8
+    out = smooth_speakers(segs)
+    assert abs(len(out) - len(segs)) <= 0.05 * len(segs)
+    assert max(len(s["text"]) for s in out) <= 120
+    assert {s["speaker"] for s in out} == {"SPEAKER_00"}
 
 
 def test_long_duration_run_kept():
@@ -46,7 +66,7 @@ def test_different_neighbours_kept_and_input_not_mutated():
 
 def test_multi_segment_short_run():
     segs = [S("A", "甲", 0.0), S("B", "嗯", 1.0), S("B", "對", 1.5), S("A", "乙", 2.0)]
-    assert len(smooth_speakers(segs)) == 1
+    assert [s["speaker"] for s in smooth_speakers(segs)] == ["A"] * 4
 
 
 # ---- opencc fixes
@@ -88,7 +108,7 @@ def test_hotwords_small_glossary_no_warning(caplog):
 def test_flicker_ababa_collapses():
     segs = [S("A", "正文很長", 0.0), S("B", "嗯", 5.0), S("A", "對", 6.0), S("B", "好", 7.0), S("A", "繼續", 8.0)]
     out = smooth_speakers(segs)
-    assert len(out) == 1 and out[0]["speaker"] == "A"
+    assert len(out) == 5 and {s["speaker"] for s in out} == {"A"}
 
 
 class FakePipe:
