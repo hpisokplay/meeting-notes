@@ -3,19 +3,35 @@
 // - Word：產生 Word 可開啟的 .doc（HTML 格式），保留中文與排版、可再編輯。
 import { formatDate } from './format.js';
 import { buildDocxBytes, normalizeSections } from './docx.js';
+import { itemText, meetingMode, LECTURE_SECTIONS, groupItems } from './items.js';
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
 }
 function ol(items) {
   return items && items.length
-    ? '<ol>' + items.map((i) => `<li>${esc(i)}</li>`).join('') + '</ol>'
+    ? '<ol>' + items.map((i) => `<li>${esc(itemText(i))}</li>`).join('') + '</ol>'
     : '<p class="none">（無）</p>';
 }
+// 依主題分組的清單（講座重點）：分組標題＋連續編號
+function groupedOl(items) {
+  if (!items || !items.length) return '<p class="none">（無）</p>';
+  let n = 0;
+  return groupItems(items)
+    .map((g) => {
+      const start = n + 1;
+      n += g.items.length;
+      return (
+        (g.group ? `<p class="nt-h">${esc(g.group)}</p>` : '') +
+        `<ol${start > 1 ? ` start="${start}"` : ''}>${g.items.map(([x]) => `<li>${esc(itemText(x))}</li>`).join('')}</ol>`
+      );
+    })
+    .join('');
+}
 
-// 把「問：… 答：…」拆成問、答兩段
+// 把「問：… 答：…」拆成問、答兩段（條目可能是字串或 {text} 物件）
 export function splitQA(item) {
-  const s = String(item == null ? '' : item);
+  const s = itemText(item);
   const ai = s.search(/答\s*[：:]/);
   if (ai >= 0) {
     return {
@@ -66,9 +82,18 @@ export function meetingToHtmlBody(meeting, opts) {
     .map((seg) => `<p class="seg"><strong style="color:${colors[seg.speaker] || '#111'}">${esc(seg.speaker)}：</strong>${esc(seg.text)}</p>`)
     .join('');
   let html = `<h1>${esc(meeting.title)}</h1><p class="date">${esc(formatDate(meeting.createdAt))}</p>`;
-  if (want.actionItems) html += `<h2>✅ 待辦事項 Action Item</h2>${ol(s.actionItems || [])}`;
-  if (want.mainPoints) html += `<h2>📌 會議重點 Main Point</h2>${ol(s.mainPoints || s.keyPoints || [])}`;
-  if (want.qa) html += `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(s.qa || [])}`;
+  if (meetingMode(meeting) === 'lecture') {
+    for (const sec of LECTURE_SECTIONS) {
+      if (!want[sec.k]) continue;
+      const body =
+        sec.k === 'qa' ? qaOl(s.qa || []) : sec.k === 'mainPoints' ? groupedOl(s.mainPoints || []) : ol(s[sec.k] || []);
+      html += `<h2>${esc(sec.label)}</h2>${body}`;
+    }
+  } else {
+    if (want.actionItems) html += `<h2>✅ 待辦事項 Action Item</h2>${ol(s.actionItems || [])}`;
+    if (want.mainPoints) html += `<h2>📌 會議重點 Main Point</h2>${ol(s.mainPoints || s.keyPoints || [])}`;
+    if (want.qa) html += `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(s.qa || [])}`;
+  }
   if (want.notes) html += notesHtml(meeting.notes);
   if (want.transcript) html += `<h2>🗣️ 逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`;
   return html;
@@ -79,7 +104,7 @@ function notesHtml(n) {
   if (!n) return '';
   const none = '<p class="none">（無）</p>';
   const outline = (n.outline || [])
-    .map((o, i) => `<p class="nt-h">${i + 1}. ${esc(o.title)}</p>${(o.points || []).length ? `<ul>${o.points.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : ''}`)
+    .map((o, i) => `<p class="nt-h">${i + 1}. ${esc(o.title)}</p>${(o.points || []).length ? `<ul>${o.points.map((p) => `<li>${esc(itemText(p))}</li>`).join('')}</ul>` : ''}`)
     .join('');
   const concepts = (n.concepts || [])
     .map((c) => `<p class="nt-h">${esc(c.term)}</p><p>${esc(c.plain)}</p>${c.why ? `<p class="nt-why">→ ${esc(c.why)}</p>` : ''}`)

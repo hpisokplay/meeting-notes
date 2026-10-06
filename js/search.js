@@ -1,16 +1,12 @@
-// 會議搜尋：比對標題、逐字稿、摘要文字（不分大小寫）
+import { itemText, ALL_SUMMARY_KEYS } from './items.js';
+
+// 會議搜尋：比對標題、逐字稿、摘要文字（不分大小寫）。條目可能是字串或 {text} 物件。
 export function meetingSearchText(m) {
   const s = m.summary || {};
   const segs = (m.transcript || []).map((x) => `${x.speaker} ${x.text}`).join(' ');
-  return [
-    m.title || '',
-    segs,
-    ...(s.actionItems || []),
-    ...(s.mainPoints || s.keyPoints || []),
-    ...(s.qa || []),
-  ]
-    .join(' ')
-    .toLowerCase();
+  const items = [];
+  for (const k of ALL_SUMMARY_KEYS) if (Array.isArray(s[k])) items.push(...s[k].map(itemText));
+  return [m.title || '', segs, ...items].join(' ').toLowerCase();
 }
 
 export function matchMeeting(m, query) {

@@ -12,6 +12,7 @@ const ASSETS = [
   './js/search.js',
   './js/export.js',
   './js/docx.js',
+  './js/items.js',
   './js/groups.js',
   './js/wakelock.js',
   './manifest.webmanifest',

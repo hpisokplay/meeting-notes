@@ -1,6 +1,8 @@
 // 產生「真正的」.docx（Office Open XML）：docx 本質是一個 zip，內含幾個 XML。
 // 這裡用純 JS 自建最小可用的 docx（store 無壓縮 zip + 直接格式化的段落），
 // 不需任何外部套件，Word / Pages / iOS / WeChat 都能開啟。
+import { itemText, meetingMode, LECTURE_SECTIONS, groupItems } from './items.js';
+
 const enc = new TextEncoder();
 
 function crc32(bytes) {
@@ -71,7 +73,7 @@ const line = (t, sz) => para(run(t, { sz: sz || 22 }));
 
 const SPK_COLORS = ['0A58CA', '1A7F37', 'B35900', '8250DF', 'CF222E', '0A6D8A', '9A6700'];
 function splitQA(item) {
-  const s = String(item == null ? '' : item);
+  const s = itemText(item);
   const ai = s.search(/答\s*[：:]/);
   if (ai >= 0) {
     return {
@@ -92,6 +94,11 @@ export function normalizeSections(opts) {
     mainPoints: on(o.mainPoints),
     qa: on(o.qa),
     transcript: on(o.transcript),
+    // 講座模式的區塊（舊會議沒有這些欄位，預設帶上也不影響）
+    conclusions: on(o.conclusions),
+    advice: on(o.advice),
+    risks: on(o.risks),
+    cases: on(o.cases),
     // 學習筆記預設「不」輸出：它是選用功能，多數會議沒有，預設帶上會讓舊行為改變
     notes: o.notes === true,
   };
@@ -159,7 +166,7 @@ function notesBody(n) {
   if ((n.outline || []).length) {
     n.outline.forEach((o, i) => {
       body.push(para(run(`${i + 1}. ${o.title}`, { b: true }), '<w:keepNext/>'));
-      (o.points || []).forEach((p) => body.push(line(`　・${p}`)));
+      (o.points || []).forEach((p) => body.push(line(`　・${itemText(p)}`)));
     });
   } else none();
   body.push(heading('💡 重要概念 Concepts'));
@@ -212,27 +219,48 @@ function documentXml(meeting, opts) {
   const body = [];
   body.push(title(meeting.title || '會議記錄'));
   body.push(line(dateStr, 18));
-  if (want.actionItems) {
-    body.push(heading('✅ 待辦事項 Action Item'));
-    if (actionItems.length) actionItems.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
-    else body.push(line('（無）'));
-  }
-  if (want.mainPoints) {
-    body.push(heading('📌 會議重點 Main Point'));
-    if (mainPoints.length) mainPoints.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
-    else body.push(line('（無）'));
-  }
-  if (want.qa) {
-    body.push(heading('❓ 會議提問 Q&A'));
-    if (qa.length) {
-      qa.forEach((x, i) => {
-        const { q, a } = splitQA(x);
-        // 問與答同段、以換行分隔，並設 keepLines 讓整組不被分頁拆開（跟 PDF 一致）
-        let runs = run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
-        if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
-        body.push(para(runs, '<w:keepLines/>'));
-      });
-    } else body.push(line('無'));
+  const numberedList = (arr) => {
+    if (!arr.length) return body.push(line('（無）'));
+    arr.forEach((x, i) => body.push(line(`${i + 1}. ${itemText(x)}`)));
+  };
+  const qaList = () => {
+    if (!qa.length) return body.push(line('無'));
+    qa.forEach((x, i) => {
+      const { q, a } = splitQA(x);
+      // 問與答同段、以換行分隔，並設 keepLines 讓整組不被分頁拆開（跟 PDF 一致）
+      let runs = run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
+      if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
+      body.push(para(runs, '<w:keepLines/>'));
+    });
+  };
+  if (meetingMode(meeting) === 'lecture') {
+    // 講座模式：核心結論／講者建議／風險提醒／案例／重點（依主題分組）／Q&A
+    for (const sec of LECTURE_SECTIONS) {
+      if (!want[sec.k]) continue;
+      body.push(heading(sec.label));
+      if (sec.k === 'qa') qaList();
+      else if (sec.k === 'mainPoints') {
+        if (!mainPoints.length) body.push(line('（無）'));
+        let n = 0;
+        for (const g of groupItems(mainPoints)) {
+          if (g.group) body.push(para(run(g.group, { b: true }), '<w:keepNext/>'));
+          g.items.forEach(([x]) => body.push(line(`${++n}. ${itemText(x)}`)));
+        }
+      } else numberedList(s[sec.k] || []);
+    }
+  } else {
+    if (want.actionItems) {
+      body.push(heading('✅ 待辦事項 Action Item'));
+      numberedList(actionItems);
+    }
+    if (want.mainPoints) {
+      body.push(heading('📌 會議重點 Main Point'));
+      numberedList(mainPoints);
+    }
+    if (want.qa) {
+      body.push(heading('❓ 會議提問 Q&A'));
+      qaList();
+    }
   }
   if (want.notes && meeting.notes) body.push(...notesBody(meeting.notes));
   if (want.transcript) {
