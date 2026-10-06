@@ -370,7 +370,10 @@ def run_whisper(api, asr, runner, gate):
         if free is not None and free < need:
             gate.wait("whisper needs %d MiB, %d free" % (need, free))
             continue
-        kw = {"compute_type": "int8_float16", "batch_size": batch} if low else             {"compute_type": "float16", "batch_size": 8}
+        if low:
+            kw = {"compute_type": "int8_float16", "batch_size": batch}
+        else:
+            kw = {"compute_type": "float16", "batch_size": 8}
         msg = MSG_LOWMEM if low else ""
         api.progress("asr", 0, msg)
         try:
