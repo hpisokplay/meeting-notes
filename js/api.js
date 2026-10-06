@@ -216,6 +216,8 @@ export const jobIdOf = (r) => (r && typeof r === 'object' && (r.jobId || r.aiJob
 // action: 'confirm' | 'edit' | 'delete'；edit 帶 text。回傳更新後的會議。
 export const reviewAction = (id, rid, action, text) =>
   req('POST', `/api/meetings/${enc(id)}/review/${enc(rid)}`, text != null ? { action, text } : { action });
+// 全部照建議（只限高信心、非人名）：回傳更新後的會議＋applied {cards, transcript, items}
+export const acceptHighReview = (id) => req('POST', `/api/meetings/${enc(id)}/review/accept-high`, {});
 // 改模式後伺服器會排入重新整理，回傳 {jobId}（或含 aiJobId 的會議）
 export const setMeetingMode = (id, mode) => req('POST', `/api/meetings/${enc(id)}/mode`, { mode });
 export const restoreRaw = (id) => req('POST', `/api/meetings/${enc(id)}/restore-raw`, {});

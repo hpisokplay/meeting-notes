@@ -467,6 +467,19 @@ def review_action(m: dict, rid: str, action: str, text: str | None = None) -> di
     m["review"] = review
 
 
+def accept_high(m: dict) -> dict:
+    """Apply every eligible pending card (see W.accept_high_eligible) with the single-accept logic, in
+    list order. Returns {cards, transcript, items}."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    out = {"cards": 0, "transcript": 0, "items": 0}
+    for r in [x for x in review.get("items") or [] if W.accept_high_eligible(x)]:
+        a = review_action(m, r["id"], "accept")
+        out["cards"] += 1
+        out["transcript"] += a.get("transcript", 0)
+        out["items"] += a.get("items", 0)
+    return out
+
+
 # ---------------------------------------------------------------- pipeline job start
 def start_reprocess(store: Store, jobs, mid: str, payload: dict | None = None, prepare=None) -> dict:
     """Enqueue an ai "reprocess" job as the meeting's pipeline job (status "summarizing", aiJobId).
@@ -507,6 +520,25 @@ def start_reprocess(store: Store, jobs, mid: str, payload: dict | None = None, p
 # ---------------------------------------------------------------- HTTP
 def build_review_router(store: Store, get_jobs) -> APIRouter:
     r = APIRouter(prefix="/api")
+
+    @r.post("/meetings/{mid}/review/accept-high")
+    def review_accept_high(mid: str):
+        got: dict = {}
+
+        def apply(m):
+            cur = get_jobs().read(m.get("aiJobId")) if m.get("aiJobId") else None
+            if m.get("status") == "summarizing" and cur and cur.get("state") in ACTIVE_JOB_STATES:
+                raise HTTPException(409, "整理中，請稍後再確認")
+            got["applied"] = accept_high(m)
+            if got["applied"]["cards"]:
+                m["review"] = verify_review(m, store.glossary_list())  # one pure re-verify
+        try:
+            saved = store.update(mid, apply)
+            return {**saved, "applied": got["applied"]}
+        except BadId:
+            raise HTTPException(400, "會議 id 不合法")
+        except KeyError:
+            raise HTTPException(404, "找不到這場會議")
 
     @r.post("/meetings/{mid}/review/{rid}")
     def review(mid: str, rid: str, body: dict = Body(...)):

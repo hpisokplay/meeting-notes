@@ -21,6 +21,7 @@ import {
   listItemIds,
   confirmOnly,
   isWordReview,
+  isAcceptHighEligible,
   reviewScope,
   scopeText,
   splitTimes,
@@ -28,7 +29,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v105';
+const APP_VERSION = 'v106';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -2429,8 +2430,13 @@ async function renderDetail(id, preloaded) {
       ? `<div class="hint review-hint">AI 已逐項判斷並給建議；沒問題按「照建議」即可</div>
         <details class="review-why"><summary>為什麼要確認？</summary>錄音轉文字常把人名、專有名詞、數字聽錯，摘要也可能跟著寫錯。AI 已對照逐字稿原話提出建議，請你最後確認一次；全部處理完才能分享／匯出。</details>`
       : `<div class="hint" style="margin:0 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>`;
+    const eligible = pend.filter(isAcceptHighEligible).length;
+    const bulk = eligible
+      ? `<button class="act-btn primary review-bulk" id="acceptHighBtn" type="button" style="width:100%;margin:0 0 8px"${locked() ? ` data-locked disabled title="${LOCK_MSG}"` : ''} data-n="${eligible}" data-rest="${pend.length - eligible}">⚡ 全部照建議（高信心 ${eligible} 張）</button>`
+      : '';
     reviewBox.innerHTML = `<div class="review-head" id="reviewHead">⚠️ 待確認清單（<span id="reviewCount">${pend.length}</span>）<span class="chev">${reviewOpen ? '▾' : '▸'}</span></div>
       <div class="review-list"${reviewOpen ? '' : ' hidden'}>
+        ${bulk}
         ${hint}
         ${rows}
       </div>`;
@@ -2438,6 +2444,15 @@ async function renderDetail(id, preloaded) {
       reviewOpen = !reviewOpen;
       drawReview();
     };
+    const bulkBtn = document.getElementById('acceptHighBtn');
+    if (bulkBtn)
+      bulkBtn.onclick = () => {
+        if (reviewSending) return;
+        const n = Number(bulkBtn.dataset.n);
+        const rest = Number(bulkBtn.dataset.rest);
+        if (!confirm(`將一次套用 ${n} 張高信心建議（不含人名）。其餘 ${rest} 張仍需逐張確認。確定？`)) return;
+        sendAcceptHigh();
+      };
     reviewBox.querySelectorAll('[data-rt]').forEach((b) => {
       b.onclick = () => {
         const t = Number(b.dataset.rt);
@@ -2512,6 +2527,39 @@ async function renderDetail(id, preloaded) {
     };
   };
   let reviewSending = false;
+  const sendAcceptHigh = async () => {
+    if (reviewSending) return;
+    reviewSending = true;
+    reviewBox.querySelectorAll('button').forEach((x) => (x.disabled = true));
+    try {
+      const r2 = await api.acceptHighReview(id);
+      const applied = (r2 && typeof r2 === 'object' && r2.applied) || {};
+      if (r2 && r2.applied) delete r2.applied;
+      const fresh = r2 && typeof r2 === 'object' && r2.id ? r2 : await api.getMeeting(id);
+      await cacheMeeting(fresh);
+      m = fresh;
+      toast(`已套用 ${Number(applied.cards) || 0} 張：逐字稿 ${Number(applied.transcript) || 0} 處、摘要 ${Number(applied.items) || 0} 條`);
+      if (currentDetailId() === id) renderDetail(id, fresh);
+    } catch (e) {
+      noteFetchError(e);
+      if (e && (e.status === 404 || e.status === 409)) {
+        try {
+          const fresh = await api.getMeeting(id);
+          await cacheMeeting(fresh);
+          m = fresh;
+          toast(e.status === 409 ? '整理中，請稍後再確認' : '內容已更新，已重新整理清單');
+          if (currentDetailId() === id) renderDetail(id, fresh);
+          return;
+        } catch (e2) {
+          noteFetchError(e2);
+        }
+      }
+      alert('處理失敗：' + errText(e));
+      drawReview();
+    } finally {
+      reviewSending = false;
+    }
+  };
   const sendReview = async (r, action, text) => {
     if (reviewSending) return;
     reviewSending = true;

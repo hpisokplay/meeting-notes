@@ -419,6 +419,25 @@ def delete_in_entries(m: dict, span: str) -> int:
     return changed
 
 
+# person-name guard for 「全部照建議」: surnames incl. the common-character ones verify drops
+_NAME_SURNAMES = set(
+    "王李張劉陳楊黃趙吳周徐孫朱胡郭何林羅高梁鄭謝宋唐許韓馮鄧曹彭曾蕭蔡潘杜戴夏鍾汪"
+    "田任姜范方石姚譚廖鄒熊陸郝孔崔康毛邱秦史顧侯邵孟龍萬段雷錢湯尹黎易常武喬賀賴龔"
+    "文盧簡游柯魏翁施詹余葉洪呂蘇沈莊江涂連童傅歐卓溫邢藍嚴董薛")
+
+
+def looks_like_name(s: str) -> bool:
+    s = str(s or "").strip()
+    return 2 <= len(s) <= 4 and all("一" <= c <= "鿿" for c in s) and s[0] in _NAME_SURNAMES
+
+
+def accept_high_eligible(r) -> bool:
+    """Pending card, high confidence, no program 'name' flag behind it, span / suggestion not name-like."""
+    return (is_card(r) and r.get("state") == "pending" and r.get("confidence") == "high"
+            and "name" not in (r.get("sources") or [])
+            and not looks_like_name(r.get("span")) and not looks_like_name(r.get("suggestion")))
+
+
 def card_action(m: dict, r: dict, action: str, text: str | None = None) -> dict:
     """accept / keep / edit (legacy confirm = accept, delete = keep) on card r. Mutates m and r;
     returns applied {transcript: n, items: m}."""

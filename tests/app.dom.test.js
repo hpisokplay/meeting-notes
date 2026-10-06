@@ -70,6 +70,7 @@ vi.mock('../js/api.js', () => {
     }),
     jobIdOf: (r) => (r && (r.jobId || r.aiJobId)) || null,
     // 待確認清單：照契約改狀態、edit 改條目文字、delete 移掉條目，回傳更新後的會議
+    acceptHighReview: vi.fn(async () => { throw new Error('unmocked'); }),
     reviewAction: vi.fn(async (id, rid, action, text) => {
       nas.calls.push(['reviewAction', id, rid, action, text]);
       const m = nas.meetings[id];
@@ -981,6 +982,49 @@ describe('app（整合，假 NAS）', () => {
     expect(document.getElementById('reviewCount').textContent).toBe('3');
     expect(document.querySelector('[data-rid="rw000001"]')).toBeNull();
     expect(document.getElementById('view').innerHTML).toContain('（已改）');
+  });
+
+  it('全部照建議：只算高信心非人名，確認後送出、toast 顯示並依回傳重畫；取消不送', async () => {
+    const wm = wordMeeting();
+    wm.review.items.push(
+      { id: 'rw000010', span: '台積店', action: 'replace', suggestion: '台積電', reason: 'r', confidence: 'high', targets: [{ where: 'transcript', count: 1 }], context: '【台積店】', sources: ['term'], state: 'pending' },
+      { id: 'rw000011', span: '股利所得', action: 'keep', suggestion: '', reason: 'r', confidence: 'high', targets: [], context: '【股利所得】', sources: [], state: 'pending' },
+      { id: 'rw000012', span: '黃任宗', action: 'replace', suggestion: '黃任中', reason: 'r', confidence: 'high', targets: [], context: '【黃任宗】', sources: [], state: 'pending' }
+    );
+    nas.meetings['w-1'] = wm;
+    await go('#/m/w-1');
+    const btn = document.getElementById('acceptHighBtn');
+    expect(btn.textContent).toBe('⚡ 全部照建議（高信心 2 張）'); // rw000001 有 name 來源、黃任宗像人名 → 不算
+    const asked = [];
+    window.confirm = (t) => (asked.push(t), false);
+    btn.click();
+    expect(asked[0]).toBe('將一次套用 2 張高信心建議（不含人名）。其餘 5 張仍需逐張確認。確定？');
+    expect(api.acceptHighReview).not.toHaveBeenCalled();
+    window.confirm = () => true;
+    let release;
+    api.acceptHighReview.mockImplementationOnce(async (id) => {
+      nas.calls.push(['acceptHigh', id]);
+      await new Promise((r) => (release = r));
+      const m = nas.meetings[id];
+      ['rw000010', 'rw000011'].forEach((x) => (m.review.items.find((i) => i.id === x).state = 'confirmed'));
+      m.updatedAt += 1;
+      return { ...JSON.parse(JSON.stringify(m)), applied: { cards: 2, transcript: 3, items: 1 } };
+    });
+    btn.click();
+    await tick();
+    expect(document.querySelector('[data-rid="rw000001"] [data-wv="accept"]').disabled).toBe(true); // 送出中停用
+    release();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['acceptHigh', 'w-1']);
+    expect(document.getElementById('toast').textContent).toBe('已套用 2 張：逐字稿 3 處、摘要 1 條');
+    expect(document.querySelector('[data-rid="rw000010"]')).toBeNull();
+    expect(document.getElementById('acceptHighBtn')).toBeNull();
+  });
+
+  it('全部照建議：沒有符合的卡就不顯示按鈕', async () => {
+    nas.meetings['w-1'] = wordMeeting();
+    await go('#/m/w-1');
+    expect(document.getElementById('acceptHighBtn')).toBeNull();
   });
 
   it('單字訂正卡：保留原文送 keep；自己改送 edit＋文字；送出中按鈕停用', async () => {

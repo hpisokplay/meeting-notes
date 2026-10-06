@@ -422,3 +422,63 @@ def test_user_keep_answers_later_keep_card_for_same_span(app_client):
     W.apply_ai_cards(out, [{"span": "黃任宗", "action": "keep", "suggestion": "", "reason": "again",
                             "confidence": "high", "itemIds": [], "fromFlags": []}])
     assert [x["state"] for x in cards(out) if x["span"] == "黃任宗"] == ["confirmed"]
+
+
+# ---------------------------------------------------------------- accept-high
+HIGH_RAW = [
+    {"span": "台積店", "action": "replace", "suggestion": "台積電", "reason": "r", "confidence": "high",
+     "itemIds": [], "fromFlags": []},
+    {"span": "股利所得", "action": "keep", "suggestion": "", "reason": "ok", "confidence": "high",
+     "itemIds": [], "fromFlags": []},
+    {"span": "黃任宗", "action": "replace", "suggestion": "黃任中", "reason": "name", "confidence": "high",
+     "itemIds": ["aaaaaaaa"], "fromFlags": []},
+    {"span": "Jefry", "action": "replace", "suggestion": "Jeffrey", "reason": "r", "confidence": "medium",
+     "itemIds": [], "fromFlags": []},
+    {"span": "，前後數字不一致", "action": "delete", "suggestion": "", "reason": "r", "confidence": "low",
+     "itemIds": ["bbbbbbbb"], "fromFlags": []},
+]
+
+
+def test_accept_high_applies_only_high_non_name(app_client):
+    app, c = app_client
+    m, _ = with_cards(HIGH_RAW)
+    app.state.store.save(m)
+    r = c.post("/api/meetings/m1/review/accept-high")
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["applied"]["cards"] == 2 and out["applied"]["transcript"] == 3  # 台積店 x3 (30s, 100s x2)
+    assert out["transcript"][2]["text"].count("台積電") == 1 and "台積店" not in out["transcript"][3]["text"]
+    assert rv(out, card(m, "台積店")["id"])["state"] == "confirmed"
+    assert rv(out, card(m, "股利所得")["id"])["state"] == "confirmed"
+    for sp in ("黃任宗", "Jefry", "，前後數字不一致"):  # name / medium / low stay pending
+        assert rv(out, card(m, sp)["id"])["state"] == "pending"
+    assert "黃任宗" in out["transcript"][0]["text"]
+    assert "applied" not in app.state.store.get("m1")
+    # nothing eligible left: a second call is a no-op
+    again = c.post("/api/meetings/m1/review/accept-high").json()
+    assert again["applied"] == {"cards": 0, "transcript": 0, "items": 0}
+
+
+def test_accept_high_no_resurrection_and_name_flag_excluded(app_client):
+    app, c = app_client
+    m, _ = with_cards(HIGH_RAW)
+    for x in m["review"]["items"]:
+        if W.is_card(x) and x["span"] == "股利所得":
+            x["sources"] = ["name"]
+    app.state.store.save(m)
+    out = c.post("/api/meetings/m1/review/accept-high").json()
+    assert out["applied"]["cards"] == 1
+    assert rv(out, card(m, "股利所得")["id"])["state"] == "pending"
+    tid = card(m, "台積店")["id"]
+    st = app.state.store.get("m1")
+    got = c.put("/api/meetings/m1", json=st).json()
+    assert rv(got, tid)["state"] == "confirmed"
+
+
+def test_accept_high_409_while_job_active(app_client):
+    app, c = app_client
+    m, _ = with_cards(HIGH_RAW)
+    app.state.store.save(m)
+    assert c.post("/api/meetings/m1/ai", json={"action": "reprocess"}).status_code == 200
+    r = c.post("/api/meetings/m1/review/accept-high")
+    assert r.status_code == 409 and r.json()["detail"] == "整理中，請稍後再確認"

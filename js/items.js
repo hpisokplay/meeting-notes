@@ -237,6 +237,15 @@ export function reviewScope(r) {
   });
   return { transcript, items };
 }
+// 「全部照建議」資格（與伺服器同規則；伺服器為準）：待確認、高信心、不是程式標的人名、span／建議不像人名
+const NAME_SURNAMES = '王李張劉陳楊黃趙吳周徐孫朱胡郭何林羅高梁鄭謝宋唐許韓馮鄧曹彭曾蕭蔡潘杜戴夏鍾汪田任姜范方石姚譚廖鄒熊陸郝孔崔康毛邱秦史顧侯邵孟龍萬段雷錢湯尹黎易常武喬賀賴龔文盧簡游柯魏翁施詹余葉洪呂蘇沈莊江涂連童傅歐卓溫邢藍嚴董薛';
+const looksLikeName = (s) => {
+  s = String(s || '').trim();
+  return s.length >= 2 && s.length <= 4 && /^[一-鿿]+$/.test(s) && NAME_SURNAMES.includes(s[0]);
+};
+export const isAcceptHighEligible = (r) =>
+  isWordReview(r) && r.state === 'pending' && r.confidence === 'high' && !(Array.isArray(r.sources) && r.sources.includes('name')) &&
+  !looksLikeName(r.span) && !looksLikeName(r.suggestion);
 export const scopeText = (s, prefix) => `${prefix}逐字稿 ${Number(s.transcript) || 0} 處、摘要 ${Number(s.items) || 0} 條`;
 // "[01:02:03]" / "[02:03]" → 秒數
 export function hmsToSec(s) {
