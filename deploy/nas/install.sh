@@ -29,7 +29,7 @@ cd "$BASE"
 "$DOCKER" compose up -d --build
 
 if [ -x "$TS" ]; then
-  "$TS" serve --bg --https=8443 http://127.0.0.1:8778 || echo "WARN: tailscale serve failed"
+  "$TS" serve --bg --https=9443 http://127.0.0.1:8779 || echo "WARN: tailscale serve failed"
 else
   echo "WARN: tailscale binary not found at $TS"
 fi
@@ -38,4 +38,4 @@ echo "---- status ----"
 "$DOCKER" ps --filter name=meetings
 [ -x "$TS" ] && "$TS" serve status || true
 echo "worker key file: $BASE/worker.key"
-echo "URL: https://ddys.tail95e8ec.ts.net:8443/"
+echo "URL: https://ddys.tail95e8ec.ts.net:9443/"

@@ -80,7 +80,7 @@ def test_summary_failed_message():
     s.save({"id": "m1", "title": "週會", "createdAt": 1, "status": "done", "aiJobId": "a1", "error": "額度用完"})
     sent = []
     assert N.on_job_done(s, {"id": "a1", "kind": "ai", "meeting": "m1"}, lambda t, st=None: sent.append(t))
-    assert sent[0] == "⚠️《週會》逐字稿已完成，但摘要失敗：額度用完\nhttps://ddys.tail95e8ec.ts.net:8443/#/m/m1"
+    assert sent[0] == "⚠️《週會》逐字稿已完成，但摘要失敗：額度用完\nhttps://ddys.tail95e8ec.ts.net:9443/#/m/m1"
 
 
 def test_on_job_done_polls_until_done(tmp_path):

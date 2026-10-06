@@ -1,5 +1,5 @@
 # Installs MeetingWorker for the current user.
-#   .\install.ps1 -Server https://nas.example:8443 -Key <worker key> -PyannoteDir C:\path\to\pyannote-c1
+#   .\install.ps1 -Server https://nas.example:9443 -Key <worker key> -PyannoteDir C:\path\to\pyannote-c1
 param(
     [Parameter(Mandatory = $true)][string]$Server,
     [Parameter(Mandatory = $true)][string]$Key,

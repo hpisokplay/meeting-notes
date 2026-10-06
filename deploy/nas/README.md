@@ -5,7 +5,7 @@
 - 資料主本：`/volume1/projects/meetings`（容器內 `/data`，Telegram 機器人看到 `/projects/meetings`）
 - 備份：`/volume1/docker/backups/meetings`
 - 轉錄器金鑰：`/volume1/docker/meetings/worker.key`（填到電腦轉錄器設定）
-- 網址：https://ddys.tail95e8ec.ts.net:8443/
+- 網址：https://ddys.tail95e8ec.ts.net:9443/
 
 ## 第一次安裝（只做一次）
 前置（由 Claude 用 ssh 完成）：把 `deploy/nas/` 內的檔案放到 NAS `/volume1/docker/meetings/`，並先跑一次 `update_app.sh` 讓 `app/` 有程式。
@@ -16,7 +16,7 @@
 sudo sh /volume1/docker/meetings/install.sh
 ```
 
-它會建資料夾、產生 `worker.key`、建置並啟動容器、設定 `tailscale serve`（8443），最後印出狀態。
+它會建資料夾、產生 `worker.key`、建置並啟動容器、設定 `tailscale serve`（9443；8443 已給 XS 系統），最後印出狀態。
 
 ## 更新程式
 在專案根目錄（Git Bash）執行：

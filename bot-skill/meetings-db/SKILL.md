@@ -17,7 +17,7 @@ groups.json           分類 [{id,name,color}]
 inbox/                丟錄音進來會自動建立會議並轉錄
 ```
 
-網頁連結：`https://ddys.tail95e8ec.ts.net:8443/#/m/<id>`
+網頁連結：`https://ddys.tail95e8ec.ts.net:9443/#/m/<id>`
 
 ## 查詢
 1. 讀 `index.json` 依標題／日期（createdAt 是毫秒，換算台北時間）／分類找會議。`status` 不是 `done` 代表還在轉錄或處理中，要告訴使用者。
@@ -36,7 +36,7 @@ inbox/                丟錄音進來會自動建立會議並轉錄
 1. 把收到的檔案先複製成暫存名：`cp <收到的檔> /projects/meetings/inbox/<檔名>.tmp`
 2. 再改成正式名：`mv /projects/meetings/inbox/<檔名>.tmp /projects/meetings/inbox/<檔名>`（避免伺服器讀到寫一半的檔）
 3. 回覆「已丟進去，轉好會通知你」。伺服器會自動建立會議並轉錄，完成後自己傳通知。
-- 超過 20 MB 的檔案請使用者改從網頁上傳：`https://ddys.tail95e8ec.ts.net:8443/#/new`
+- 超過 20 MB 的檔案請使用者改從網頁上傳：`https://ddys.tail95e8ec.ts.net:9443/#/new`
 - 檔名含空白或中文沒問題，但不要覆蓋 inbox 內已有的同名檔。
 
 ## 回答規則

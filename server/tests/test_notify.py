@@ -51,7 +51,7 @@ def test_hooks_texts(tmp_path):
     sent = []
     send = lambda t, st=None: sent.append(t)
     assert N.on_job_done(s, {"id": "a1", "kind": "ai", "meeting": "m1"}, send)
-    assert sent[-1] == "✅《週會》轉好了\nhttps://ddys.tail95e8ec.ts.net:8443/#/m/m1"
+    assert sent[-1] == "✅《週會》轉好了\nhttps://ddys.tail95e8ec.ts.net:9443/#/m/m1"
     assert not N.on_job_done(s, {"id": "other", "kind": "ai", "meeting": "m1"}, send)
     assert N.on_job_terminal(s, {"id": "t1", "kind": "transcribe", "meeting": "m1", "error": "壞了"}, "failed", send)
     assert sent[-1] == "❌《週會》轉錄失敗：壞了"

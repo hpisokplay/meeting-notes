@@ -9,7 +9,7 @@
 
 1. **不用 Gemini／Groq 金鑰。** 語音轉文字用使用者電腦的顯示卡（faster-whisper large-v3 ＋ pyannote 分說話者）；所有文字處理（摘要、加強、學習筆記、問答、掃詞、翻譯）用 Claude Max（NAS 上的 `claude -p`）。
 2. **資料存 NAS**，不再寫 GitHub。舊資料（`hpisokplay/meeting-notes-data` 的 `meetings.json`：26 場、10 個分類）全部匯入，一筆不刪。GitHub 上的舊 repo 與舊網頁原封不動保留。
-3. **網頁與手機都能開**：`https://ddys.tail95e8ec.ts.net:8443/`（Tailscale 內網，443 已被定錨使用）。PWA 可加到主畫面。
+3. **網頁與手機都能開**：`https://ddys.tail95e8ec.ts.net:9443/`（Tailscale 內網；443 給定錨、8443 給 XS 系統）。PWA 可加到主畫面。
 4. **大檔案**：單檔 ≥ 1000 MB、長度 ≥ 8 小時。上傳分塊、可續傳；轉錄在電腦顯示卡上跑。
 5. **現有功能全部保留**（清單見 §7）。
 6. **Telegram**：沿用現有 @ysdd_claude_bot（tgbridge），加一個 `meetings-db` 技能：問會議內容、要檔案（Word／Markdown／逐字稿／錄音）、傳錄音進來轉。轉好時主動通知。
@@ -29,7 +29,7 @@
 ## 3. 架構
 
 ```
-手機／電腦瀏覽器 ──HTTPS(Tailscale serve :8443)──► NAS 容器 meetings（FastAPI :8778）
+手機／電腦瀏覽器 ──HTTPS(Tailscale serve :9443 → NAS 8779)──► NAS 容器 meetings（FastAPI :8778）
                                                    ├─ 靜態前端（PWA）
                                                    ├─ REST API、分塊上傳
                                                    ├─ 工作佇列（jobs/）
@@ -186,7 +186,7 @@ AI 工作在伺服器單一執行緒排隊執行（Claude 一次一件）。提�
 
 ## 11. 部署
 
-- `deploy/nas/`：`Dockerfile`（node:22-bookworm-slim ＋ python3 ＋ ffmpeg ＋ claude-code@2.1.280 釘版本）、`compose.yaml`、`claude-wrapper.sh`（同定錨）、`requirements.txt`、`install.sh`（一次性，需 sudo：建資料夾、`docker compose up -d --build`、`tailscale serve --bg --https=8443 http://127.0.0.1:8778`）、`update_app.sh`（tar over ssh ＋ `.restart`）。
+- `deploy/nas/`：`Dockerfile`（node:22-bookworm-slim ＋ python3 ＋ ffmpeg ＋ claude-code@2.1.280 釘版本）、`compose.yaml`、`claude-wrapper.sh`（同定錨）、`requirements.txt`、`install.sh`（一次性，需 sudo：建資料夾、`docker compose up -d --build`、`tailscale serve --bg --https=9443 http://127.0.0.1:8779`）、`update_app.sh`（tar over ssh ＋ `.restart`）。
 - ssh 使用者不能跑 docker → **安裝那一步要使用者本人輸入 sudo 密碼**（一行指令）。其餘（傳檔、匯入資料、裝技能）我用 ssh 做。
 
 ## 12. 測試

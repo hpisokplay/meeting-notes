@@ -2,7 +2,7 @@
 
 放在家裡 Synology NAS 上的會議紀錄 App（PWA）。上傳會議錄音，**電腦顯示卡**轉成分說話者的逐字稿，**Claude（Max 訂閱）**整理摘要、學習筆記、問答、專有名詞訂正與翻譯。資料存在 NAS，手機與電腦開同一個網址看到同一份。
 
-網址（Tailscale 內網）：`https://ddys.tail95e8ec.ts.net:8443/`
+網址（Tailscale 內網）：`https://ddys.tail95e8ec.ts.net:9443/`
 
 ## 使用方式
 
