@@ -30,7 +30,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v112';
+const APP_VERSION = 'v113';
 export const DEEP_CORRECT_CONFIRM = '會逐段重新掃描整份逐字稿的錯字（約 3–5 分鐘），只新增待確認項目，不會改動已確認的內容。確定？';
 
 const view = document.getElementById('view');
@@ -138,6 +138,7 @@ export function progressLabel(m, seenReprocess) {
   const base = STAGE_TEXT[m && m.status] || (m && m.status) || '';
   const p = (m && m.progress) || {};
   if ((p.action || (m && m.aiAction)) === 'deep_correct') return `${base}・${p.msg || '加強校對中'}`;
+  if ((p.action || (m && m.aiAction)) === 'filter_pending') return `${base}・${p.msg || 'AI 複核可能錯字中'}`;
   if (isReprocessJob(m, seenReprocess)) {
     const rs = reprocessStage(m);
     if (rs) {

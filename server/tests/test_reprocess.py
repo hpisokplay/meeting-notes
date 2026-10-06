@@ -93,9 +93,12 @@ def test_pipeline_after_transcription_lecture(sj, fake_env, monkeypatch, tmp_pat
     monkeypatch.undo()
 
     stages = [s[0] for s in seen if s[0] != "claude"]
+    stages = [x for i, x in enumerate(stages) if not i or stages[i - 1] != x]  # the AI filter is a correction sub-step
     assert stages == ["correction", "mode", "summary", "slips", "verify", "adjudicate"]  # no notes yet
+    corr_msgs = [s[1] for s in seen if s[0] == "correction"]
+    assert corr_msgs[0] == "名詞校正中（第 1/1 段）" and "AI 複核可能錯字中（1/1 批）" in corr_msgs
     msgs = {s[0]: s[1] for s in seen}
-    assert msgs["correction"] == "名詞校正中（第 1/1 段）" and msgs["mode"] == "判斷講座／會議"
+    assert msgs["mode"] == "判斷講座／會議"
     assert msgs["summary"] == "整理摘要中" and msgs["slips"] == "檢查口誤中" and msgs["verify"] == "驗證中"
     assert msgs["adjudicate"] == "AI 審稿中"
     # the meeting carried the stage + action while summarizing (checked at the next report)

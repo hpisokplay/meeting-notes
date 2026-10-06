@@ -14,7 +14,7 @@ transcript translation calls.
 Grounded prompts (2026-10-06): MODE_DETECT answers env FAKE_CLAUDE_KIND (default "meeting");
 SUMMARY_MEETING / SUMMARY_LECTURE / enhance-with-src / NOTES-with-src return Items whose src quotes
 the first "[HH:MM:SS] 說話者: 內容" line of stdin; CORRECTION returns env FAKE_CLAUDE_CORRECTIONS
-(JSON list, default []); SLIPS returns env FAKE_CLAUDE_SLIPS (JSON list, default []); ADJUDICATE returns
+(JSON list, default []); VERIFY_CANDIDATES answers env FAKE_CLAUDE_VERIFY (see verify_items); SLIPS returns env FAKE_CLAUDE_SLIPS (JSON list, default []); ADJUDICATE returns
 env FAKE_CLAUDE_ADJUDICATE (see adjudicate_items); FAKE_CLAUDE_ADJUDICATE_FAIL=1 fails that call only.
 FAKE_CLAUDE_LOG=<path> appends {"argv": [...], "stdin": "..."} as one JSON line per call.
 """
@@ -76,6 +76,18 @@ def adjudicate_items(stdin):
     return items
 
 
+def verify_items(stdin):
+    """VERIFY_CANDIDATES: every 「[C:id] 「wrong」→「right」」 candidate in stdin gets the decision
+    FAKE_CLAUDE_VERIFY[wrong] (JSON object, default "confirm"); "skip" leaves it unanswered."""
+    want = json.loads(os.environ.get("FAKE_CLAUDE_VERIFY", "{}"))
+    out = []
+    for cid, wrong, right in re.findall(r"^\[C:([^\]]+)\] 「(.+?)」→「(.+?)」", stdin, re.M):
+        d = want.get(wrong, "confirm")
+        if d != "skip":
+            out.append({"id": cid, "decision": d, "reason": f"測試：{wrong}→{right} {d}"})
+    return out
+
+
 def is_obj_list(schema, key):
     p = (schema.get("properties") or {}).get(key) or {}
     return (p.get("items") or {}).get("type") == "object"
@@ -118,6 +130,8 @@ def auto(schema, system, stdin):
         ip = set(it.get("properties", {}))
         if "wrong" in ip:
             return {"items": json.loads(os.environ.get("FAKE_CLAUDE_CORRECTIONS", "[]"))}
+        if "decision" in ip:
+            return {"items": verify_items(stdin)}
         if "issue" in ip:
             return {"items": json.loads(os.environ.get("FAKE_CLAUDE_SLIPS", "[]"))}
         if "span" in ip:

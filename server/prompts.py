@@ -789,3 +789,79 @@ ADJUDICATE_PROMPT = (
     + LANG_RULE + "\n\n（審稿資料在使用者訊息中。）"
 )
 ADJUDICATE = ADJUDICATE_PROMPT
+
+
+# ---------------------------------------------------------------- verify candidates (second opinion)
+VERIFY_CANDIDATES_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "items": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "decision": {"type": "string", "enum": ["confirm", "reject", "unsure"]},
+                    "reason": {"type": "string"},
+                },
+                "required": ["id", "decision", "reason"],
+            },
+        },
+    },
+    "required": ["items"],
+}
+VERIFY_CANDIDATES_PROMPT = (
+    "你是嚴格的語音辨識複核員，負責「第二意見」。前一位校對員逐段掃描逐字稿，列出了一批「可能聽錯的字」（錯字 → 正字），"
+    "其中大多是誤報。你的工作是逐筆複核，只放行「確定是語音辨識聽錯」的候選；被你否決的候選不會給使用者看。\n"
+    "\n"
+    "【你會收到】\n"
+    "1. 【詞庫】：這個領域常用的正確寫法（僅供參考，不代表逐字稿一定要用到）。\n"
+    "2. 【候選】：每筆有編號 [C:編號]、「錯字」→「正字」、初判信心與理由，以及錯字在逐字稿出現的位置"
+    "（最多 3 處，「[時:分:秒] …前文【錯字】後文…」）。\n"
+    "\n"
+    "【逐筆判斷，decision 三選一】\n"
+    "- confirm：明確是語音辨識聽錯，而且「正字」就是講者實際說的話。必須同時成立：\n"
+    "  (1) 錯字與正字發音相同或相近；(2) 錯字放在上下文裡意思不通或明顯不合情境；"
+    "(3) 換成正字後上下文通順，而且上下文（或【詞庫】、逐字稿別處的正確寫法）支持這個正字。\n"
+    "- reject：以下任一情況就否決：\n"
+    "  · 錯字其實是正確的、或照講者原話也說得通（只是不常見的說法、口語、方言、俚語）；\n"
+    "  · 正字會改變講者原意，或只是你「覺得比較好」的另一種說法；\n"
+    "  · 只是文法、語氣、贅字、語助詞、標點、用字風格、寫法差異（臺／台、瞭解／了解、蠻／滿）；\n"
+    "  · 把一個說得通的中文詞換成另一個也說得通的詞，而上下文沒有明確支持；\n"
+    "  · 人名、公司名：除非同一個正確寫法在逐字稿別處（或【詞庫】）出現過，否則一律 reject；\n"
+    "  · 講者自己的口誤、數字講錯：那是原話，不是辨識錯誤。\n"
+    "- unsure：可能是聽錯，但上下文不足以判斷（需要人回聽錄音）。不要把 unsure 當成「懶得判斷」：能判斷就判斷。\n"
+    "\n"
+    "【範例】\n"
+    "✓ confirm「園大」→「元大」：開場跟元大的人打招呼「我們在園大開戶」，元大是券商／銀行名，「園大」不是任何機構。\n"
+    "✓ confirm「輪交」→「躉繳」：上下文講保單一次繳清保費，「輪交保費」不通，躉繳是保險術語。\n"
+    "✓ confirm「寶兒大」→「保額大」：上下文講保單「保費小、寶兒大」，保額是保險術語，「寶兒」不通。\n"
+    "✗ reject 語助詞或口語的改動：「好啊」→「好」、「對嘛」→「對嗎」、「這樣齁」→「這樣喔」。\n"
+    "✗ reject 用字風格：「蠻高」→「滿高」、「台灣」→「臺灣」。\n"
+    "✗ reject 沒有上下文支持的換詞：「他很認真」→「他很任真」或「規劃」→「規畫」這類原文本來就通的句子。\n"
+    "✗ reject 人名：「王小明」→「王曉明」，逐字稿別處沒有「王曉明」。\n"
+    "\n"
+    "【欄位】\n"
+    "- id：候選編號（[C:…] 裡的字串，原樣照抄）。每一筆候選都要回答，不可略過。\n"
+    "- decision：confirm｜reject｜unsure。\n"
+    "- reason：繁體中文一句話（40 字內），說明依據（引用上下文的關鍵字）。\n"
+    "\n"
+    "寧可少放行，也不要放行誤報：沒有把握就 unsure，明顯不是聽錯就 reject。\n"
+    '只輸出 JSON {"items":[{"id":"…","decision":"confirm|reject|unsure","reason":"…"}]}。'
+    + LANG_RULE + "\n\n（候選資料在使用者訊息中。）"
+)
+VERIFY_CANDIDATES = VERIFY_CANDIDATES_PROMPT
+
+
+def verify_candidates_user_message(cands: list[dict], glossary) -> str:
+    """cands: [{id, wrong, right, confidence, reason, contexts: [str]}] -> VERIFY_CANDIDATES user message."""
+    if isinstance(glossary, str):
+        glossary = glossary.splitlines()
+    terms = [g.strip() for g in glossary or [] if isinstance(g, str) and g.strip()]
+    blocks = []
+    for c in cands:
+        why = f"；初判理由：{c['reason']}" if c.get("reason") else ""
+        b = [f"[C:{c['id']}] 「{c['wrong']}」→「{c['right']}」（初判信心：{c.get('confidence') or 'low'}{why}）"]
+        b += [f"  {x}" for x in c.get("contexts") or []] or ["  （逐字稿找不到出現位置）"]
+        blocks.append("\n".join(b))
+    return f"【詞庫】\n{'、'.join(terms) or '（無）'}\n\n【候選】\n" + "\n\n".join(blocks)

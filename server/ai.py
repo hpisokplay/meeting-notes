@@ -57,11 +57,18 @@ CORRECTION_WINDOW_CHARS = 3_500  # correction scans small windows: one call over
 CORRECTION_OVERLAP_CHARS = 300   # each window repeats the tail of the previous one (words at the seam)
 CORRECTION_CONCURRENCY = 2       # windows run 2 at a time (Claude Max)
 CORRECTION_MAX_TS = 20           # occurrence times kept per merged proposal
+VERIFY_BATCH = 30                # VERIFY_CANDIDATES: candidates per call
+VERIFY_CONCURRENCY = 2           # batches run 2 at a time
+VERIFY_CTX_CHARS = 40            # context chars on each side of a candidate occurrence
+VERIFY_MAX_CTX = 3               # occurrences shown per candidate
+VERIFY_MSG = "AI 複核可能錯字中"
 ABORT_CHECK_S = 1.0              # poll interval while claude runs
 HEARTBEAT_S = 30.0               # job heartbeat while claude runs (requeue_stale is 10 min)
 
-ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess", "deep_correct"}
-PIPELINE_ACTIONS = ("reprocess", "deep_correct")  # status "summarizing" + aiJobId; report their own steps
+ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess", "deep_correct",
+           "filter_pending"}
+# status "summarizing" + aiJobId (409 while one runs); they report their own steps
+PIPELINE_ACTIONS = ("reprocess", "deep_correct", "filter_pending")
 LABELS = {"summary": "摘要", "notes": "學習筆記", "ask": "回答問題", "terms": "挑專有名詞",
           "translate": "翻譯"}
 DEFAULT_MODEL = "opus"
@@ -716,6 +723,164 @@ def scan_corrections(ctx: Ctx, transcript, label: str, pct=(3, 14), stage: str =
     return merge_window_proposals(per_window, wins, segs, ctx.glossary)
 
 
+# ---------------------------------------------------------------- AI second opinion (VERIFY_CANDIDATES)
+def candidate_contexts(transcript, wrong: str, right: str = "", limit: int = VERIFY_MAX_CTX,
+                       side: int = VERIFY_CTX_CHARS) -> list[str]:
+    """Up to `limit` occurrences of `wrong` as 「[HH:MM:SS] …前文【wrong】後文…」 (±side chars)."""
+    out = []
+    for s in transcript or []:
+        if not isinstance(s, dict):
+            continue
+        text = str(s.get("text") or "")
+        for a, b in R._matches(text, wrong, right):
+            ts = _hms(s.get("t"))
+            pre = ("…" if a > side else "") + text[max(0, a - side):a]
+            post = text[b:b + side] + ("…" if len(text) - b > side else "")
+            out.append((f"[{ts}] " if ts else "") + f"{pre}【{text[a:b]}】{post}".replace("\n", " "))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def verify_candidates(ctx: Ctx, cands: list[dict], transcript, pct=(14, 15), stage: str = "correction") -> dict:
+    """VERIFY_CANDIDATES (strict second opinion) over cands [{wrong, right, confidence, reason, contexts?}]:
+    VERIFY_BATCH per call, VERIFY_CONCURRENCY calls at a time, progress 「AI 複核可能錯字中（i/N 批）」.
+    Returns {(wrong, right): (decision, reason)}; a candidate the AI did not answer is "unsure".
+    Claude errors propagate (the caller decides: optional step or job failure)."""
+    uniq: dict[tuple, dict] = {}
+    for c in cands:
+        uniq.setdefault((c["wrong"], c["right"]), c)
+    keys = list(uniq)
+    if not keys:
+        return {}
+    batches = [keys[i:i + VERIFY_BATCH] for i in range(0, len(keys), VERIFY_BATCH)]
+    n = len(batches)
+    lock = threading.Lock()
+    started = [0]
+
+    def one(batch: list[tuple]) -> dict:
+        with lock:
+            started[0] += 1
+            k = started[0]
+            ctx.report(pct[0] + (pct[1] - pct[0]) * (k - 1) // n, f"{VERIFY_MSG}（{k}/{n} 批）", stage)
+        rows, ids = [], {}
+        for i, key in enumerate(batch, 1):
+            c = uniq[key]
+            cid = f"c{i}"
+            ids[cid] = key
+            cx = c.get("contexts")
+            if cx is None:
+                cx = candidate_contexts(transcript, key[0], key[1])
+            rows.append({"id": cid, "wrong": key[0], "right": key[1], "confidence": c.get("confidence"),
+                         "reason": str(c.get("reason") or "").strip(), "contexts": cx})
+        r = ctx.call(P.VERIFY_CANDIDATES, P.verify_candidates_user_message(rows, ctx.glossary),
+                     P.VERIFY_CANDIDATES_SCHEMA)
+        got = {}
+        for x in _a(r.get("items")):
+            if not isinstance(x, dict):
+                continue
+            key = ids.get(str(x.get("id") or "").strip().removeprefix("C:"))
+            if key is None or key in got:
+                continue
+            d = x.get("decision") if x.get("decision") in ("confirm", "reject", "unsure") else "unsure"
+            got[key] = (d, re.sub(r"\s+", " ", str(x.get("reason") or "")).strip()[:200])
+        return {key: got.get(key, ("unsure", "")) for key in batch}
+    out: dict = {}
+    futs: list = []
+    ex = ThreadPoolExecutor(max_workers=VERIFY_CONCURRENCY, thread_name_prefix="verify")
+    try:
+        futs = [ex.submit(one, b) for b in batches]
+        for f in futs:
+            out.update(f.result())
+    except BaseException:
+        for f in futs:
+            f.cancel()
+        raise
+    finally:
+        ex.shutdown(wait=True)
+    return out
+
+
+def _filtered(proposals: list[dict], verdicts: dict) -> tuple[list[dict], list[dict], set]:
+    """Split proposals by the AI filter's verdicts -> (kept, rejected, unsure keys). confirm: unchanged;
+    unsure: kept with confidence low; reject: out (with filterReason). Unjudged proposals: unchanged."""
+    kept, rejected, unsure = [], [], set()
+    for p in proposals:
+        key = (p.get("wrong"), p.get("right"))
+        d, why = verdicts.get(key, ("confirm", ""))
+        if d == "reject":
+            rejected.append({**p, "filterReason": why})
+        elif d == "unsure":
+            unsure.add(key)
+            kept.append({**p, "confidence": "low"})
+        else:
+            kept.append(p)
+    return kept, rejected, unsure
+
+
+def filter_proposals(ctx: Ctx, proposals: list[dict], transcript, old_corrections, pct=(14, 15),
+                     stage: str = "correction") -> tuple[list[dict], list[dict], set]:
+    """Second opinion on the medium / low proposals of a correction scan (high ones skip it, as do pairs
+    already settled in meeting.corrections: applied / rejected). -> (kept, rejected, unsure keys)."""
+    old = old_corrections.get("items") if isinstance(old_corrections, dict) else None
+    settled = {(c.get("wrong"), c.get("right")) for c in old or [] if isinstance(c, dict)
+               and c.get("state") != "pending"}
+    todo = [p for p in proposals if p.get("confidence") != "high" and (p["wrong"], p["right"]) not in settled]
+    if not todo:
+        return list(proposals), [], set()
+    return _filtered(proposals, verify_candidates(ctx, todo, transcript, pct, stage))
+
+
+def _cap_unsure(cards: list, pm: dict, unsure: set) -> list:
+    """Adjudicate cards answering a term flag the AI filter was unsure about stay at confidence low."""
+    if not unsure:
+        return cards
+    review = pm.get("review") if isinstance(pm.get("review"), dict) else {}
+    ids = {r["id"] for r in review.get("items") or [] if isinstance(r, dict) and r.get("kind") == "term"
+           and (r.get("text"), r.get("suggestion")) in unsure}
+    out = []
+    for x in cards or []:
+        if isinstance(x, dict) and (set(x.get("fromFlags") or []) & ids
+                                    or (x.get("span"), x.get("suggestion")) in unsure):
+            x = {**x, "confidence": "low"}
+        out.append(x)
+    return out
+
+
+def pending_filter_candidates(m: dict) -> dict:
+    """「AI 再篩一次」 targets: pending medium / low rows about the transcript.
+    -> {(wrong, right): {"wrong", "right", "confidence", "cards": [card ids], "flags": [term flag ids]}}.
+    Cards: pending replace cards (not leftovers) with a transcript target; term flags: pending (not merged)
+    term rows whose correction is pending medium / low. High rows and handled items are never included."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
+    pend = {(c.get("wrong"), c.get("right")): c for c in corr.get("items") or []
+            if isinstance(c, dict) and c.get("state") == "pending"}
+    out: dict[tuple, dict] = {}
+
+    def add(key, conf, card=None, flag=None):
+        e = out.setdefault(key, {"wrong": key[0], "right": key[1], "confidence": conf, "cards": [], "flags": []})
+        if _CONF_RANK.get(conf, 1) < _CONF_RANK.get(e["confidence"], 1):
+            e["confidence"] = conf
+        if card:
+            e["cards"].append(card)
+        if flag:
+            e["flags"].append(flag)
+    for r in review.get("items") or []:
+        if not isinstance(r, dict) or r.get("state") != "pending":
+            continue
+        if W.is_card(r):
+            if (r.get("action") == "replace" and r.get("origin") != "leftover" and r.get("suggestion")
+                    and r.get("confidence") in ("medium", "low")
+                    and any(isinstance(t, dict) and t.get("where") == "transcript" for t in r.get("targets") or [])):
+                add((r["span"], r["suggestion"]), r["confidence"], card=r["id"])
+        elif r.get("kind") == "term" and r.get("text") and r.get("suggestion"):
+            c = pend.get((r["text"], r["suggestion"]))
+            if c is not None and c.get("confidence") in ("medium", "low"):
+                add((r["text"], r["suggestion"]), c["confidence"], flag=r["id"])
+    return out
+
+
 def adjudicate_cards(ctx: Ctx, pm: dict, budget: int, flag_ids=None, entries: bool = True) -> list:
     """ADJUDICATE over the preview meeting `pm` (flag_ids: only these pending flags; entries: also the
     summary / notes entry blocks). Flags the AI left unanswered (no card names them in fromFlags) are
@@ -747,16 +912,20 @@ def _settled_wrongs(m: dict) -> set[str]:
     return out
 
 
-def _fold_deep(m: dict, proposals: list[dict]) -> set[tuple]:
-    """deep_correct on meeting m (in place): proposals the user already settled are dropped, the rest
-    go through merge_corrections (safe high ones auto-applied: transcript + the entries quoting it).
-    Returns the (wrong, right) pairs that are new in meeting.corrections."""
+def _fold_deep(m: dict, proposals: list[dict], rejected=(), unsure=()) -> set[tuple]:
+    """deep_correct on meeting m (in place): proposals the user already settled are dropped, the AI
+    filter's rejections are recorded (state "rejected", resolvedBy "ai-filter"), the rest go through
+    merge_corrections (safe high ones auto-applied: transcript + the entries quoting it).
+    Returns the (wrong, right) pairs that are new (and not rejected) in meeting.corrections."""
     settled = _settled_wrongs(m)
     props = [p for p in proposals if p.get("wrong") not in settled]
+    rej = [p for p in rejected or () if p.get("wrong") not in settled]
     old = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
     known = {(c.get("wrong"), c.get("right")) for c in old.get("items") or [] if isinstance(c, dict)}
+    known |= {(p.get("wrong"), p.get("right")) for p in rej}
     before = m.get("transcript") or []
-    transcript, corrections = R.merge_corrections(old, props, before)
+    base = R.apply_filter_verdicts(old, rej, unsure) if (rej or unsure) else old
+    transcript, corrections = R.merge_corrections(base, props, before)
     new = {(c["wrong"], c["right"]) for c in corrections["items"] if (c.get("wrong"), c.get("right")) not in known}
     if new or corrections.get("items") != old.get("items"):
         m["corrections"] = corrections
@@ -827,10 +996,17 @@ def _deep_correct(ctx: Ctx, payload):
     m0 = ctx.m
     fp = _fingerprint(m0.get("transcript"))
     warnings: list[str] = []
-    proposals = scan_corrections(ctx, copy.deepcopy(m0.get("transcript") or []), STEP_DEEP[2], (3, 88))
+    proposals = scan_corrections(ctx, copy.deepcopy(m0.get("transcript") or []), STEP_DEEP[2], (3, 82))
+    settled = _settled_wrongs(m0)
+    proposals = [p for p in proposals if p.get("wrong") not in settled]  # never re-asked, never re-judged
+    rejected, unsure = [], set()
+    got = _optional(lambda: filter_proposals(ctx, proposals, m0.get("transcript"), m0.get("corrections"),
+                                             (82, 88)), "AI 複核", warnings)
+    if got is not None:
+        proposals, rejected, unsure = got
     proposed = {(p["wrong"], p["right"]) for p in proposals}
     pm = copy.deepcopy(m0)
-    new = _fold_deep(pm, proposals)
+    new = _fold_deep(pm, proposals, rejected, unsure)
     _reverify(pm, ctx)
     again = _ai_kept_term_flags(pm, proposed)
     _reopen(pm, again)
@@ -841,19 +1017,97 @@ def _deep_correct(ctx: Ctx, payload):
         budget = min(ctx.budget, ADJUDICATE_BUDGET)
         cards = _optional(lambda: adjudicate_cards(ctx, pm, budget, flag_ids, entries=False),
                           "AI 審稿", warnings) or []
-        cards = uncertain_keeps_to_rows(cards, pm, flag_ids)
+        cards = _cap_unsure(uncertain_keeps_to_rows(cards, pm, flag_ids), pm, unsure)
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
             raise ClaudeError("逐字稿在加強校對期間被修改，請再按一次「加強校對」")
-        got = _fold_deep(m, proposals)
+        got = _fold_deep(m, proposals, rejected, unsure)
         _reverify(m, ctx)
         _reopen(m, again & _ai_kept_term_flags(m, proposed))
         W.add_ai_cards(m, cards)
         if warnings:
             m["warnings"] = [w for w in m.get("warnings") or [] if isinstance(w, str)] + warnings
-        log.info("deep_correct %s: %d new corrections, %d re-asked, %d cards", m.get("id"), len(got),
-                 len(again), len(cards))
+        log.info("deep_correct %s: %d new corrections, %d filtered out, %d re-asked, %d cards", m.get("id"),
+                 len(got), len(rejected), len(again), len(cards))
+    return apply
+
+
+def _reject_row(m: dict, e: dict, why: str) -> int:
+    """The AI filter rejected candidate e (pending_filter_candidates entry): its pending cards and the
+    pending corrections behind it (the pair itself + term flags merged into the cards) become rejected,
+    resolvedBy "ai-filter" (never shown, never counted; the scans treat them as settled). -> cards hit."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    items = [r for r in review.get("items") or [] if isinstance(r, dict)]
+    by_id = {r.get("id"): r for r in items}
+    now = int(time.time() * 1000)
+    keys = {(e["wrong"], e["right"])}
+    n = 0
+    for cid in e["cards"]:
+        r = by_id.get(cid)
+        if not (W.is_card(r) and r.get("state") == "pending"):
+            continue
+        r.update(state="rejected", resolvedBy=R.FILTER_BY, resolution="keep", filterReason=why, decidedAt=now)
+        n += 1
+        for f in r.get("fromFlags") or []:
+            fl = by_id.get(f)
+            if isinstance(fl, dict) and fl.get("kind") == "term" and fl.get("text") and fl.get("suggestion"):
+                keys.add((fl["text"], fl["suggestion"]))
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else None
+    if corr:
+        for c in corr.get("items") or []:
+            if (isinstance(c, dict) and c.get("state") == "pending" and (c.get("wrong"), c.get("right")) in keys
+                    and c.get("confidence") != "high"):
+                c.update(state="rejected", resolvedBy=R.FILTER_BY, filterReason=why, decidedAt=now)
+        corr["at"] = now
+    if items:
+        m["review"] = {**review, "items": items, "at": now}
+    return n
+
+
+def _unsure_row(m: dict, e: dict) -> None:
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    for r in review.get("items") or []:
+        if W.is_card(r) and r.get("id") in e["cards"] and r.get("state") == "pending":
+            r["confidence"] = "low"
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
+    for c in corr.get("items") or []:
+        if (isinstance(c, dict) and c.get("state") == "pending" and (c.get("wrong"), c.get("right")) == (e["wrong"], e["right"])
+                and c.get("confidence") != "high"):
+            c["confidence"] = "low"
+
+
+def _filter_pending(ctx: Ctx, payload):
+    """「AI 再篩一次」 on a meeting's current checklist: VERIFY_CANDIDATES over the pending medium / low rows
+    about the transcript (pending_filter_candidates). reject -> rejected (resolvedBy "ai-filter", reason
+    kept, never shown / counted / resurrected); unsure -> stays, confidence low; confirm -> unchanged.
+    High rows and handled items are never touched."""
+    m0 = ctx.m
+    fp = _fingerprint(m0.get("transcript"))
+    cands = list(pending_filter_candidates(m0).values())
+    ctx.report(2, f"{VERIFY_MSG}（共 {len(cands)} 項）", "correction")
+    verdicts = verify_candidates(ctx, cands, m0.get("transcript"), (5, 95)) if cands else {}
+
+    def apply(m):
+        if _fingerprint(m.get("transcript")) != fp:
+            raise ClaudeError("逐字稿在 AI 複核期間被修改，請再試一次")
+        now = pending_filter_candidates(m)  # only rows still pending now
+        stats = {"candidates": len(cands), "confirmed": 0, "rejected": 0, "unsure": 0}
+        for key, (d, why) in verdicts.items():
+            e = now.get(key)
+            if e is None:
+                continue
+            if d == "reject":
+                _reject_row(m, e, why)
+                stats["rejected"] += 1
+            elif d == "unsure":
+                _unsure_row(m, e)
+                stats["unsure"] += 1
+            else:
+                stats["confirmed"] += 1
+        _reverify(m, ctx)
+        m["aiFilter"] = {**stats, "at": int(time.time() * 1000)}
+        log.info("filter_pending %s: %s", m.get("id"), stats)
     return apply
 
 
@@ -887,10 +1141,18 @@ def _reprocess(ctx: Ctx, payload):
     warnings: list[str] = []
     ran_correction = bool(payload.get("correction", True))
     ran_slips = bool(payload.get("slips", True))
+    unsure: set = set()
     if ran_correction:
-        proposals = _optional(lambda: scan_corrections(ctx, transcript, STEP_CORRECTION[2]), "名詞校正", warnings)
+        proposals = _optional(lambda: scan_corrections(ctx, transcript, STEP_CORRECTION[2], (3, 12)),
+                              "名詞校正", warnings)
         if proposals is not None:
-            transcript, corrections = R.merge_corrections(m0.get("corrections"), proposals, transcript)
+            old = m0.get("corrections")
+            got = _optional(lambda: filter_proposals(ctx, proposals, transcript, old, (12, 14)), "AI 複核", warnings)
+            if got is not None:
+                proposals, rejected, unsure = got
+                if rejected or unsure:
+                    old = R.apply_filter_verdicts(old, rejected, unsure)
+            transcript, corrections = R.merge_corrections(old, proposals, transcript)
     lines = transcript_lines(transcript)
     mode = payload.get("mode") if payload.get("mode") in R.MODES else None  # /mode: set at the final write
     mode = mode or (m0.get("mode") if m0.get("mode") in R.MODES else None)
@@ -922,6 +1184,8 @@ def _reprocess(ctx: Ctx, payload):
         ctx.step(STEP_ADJUDICATE)
         budget = min(ctx.budget, ADJUDICATE_BUDGET)
         cards = _optional(lambda: adjudicate_cards(ctx, pm, budget), "AI 審稿", warnings)
+        if cards is not None:
+            cards = _cap_unsure(cards, pm, unsure)
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
@@ -1207,7 +1471,7 @@ def _translate(ctx: Ctx, payload):
 
 HANDLERS = {"summary": _summary, "enhance": _enhance, "notes": _notes, "notes_enhance": _notes_enhance,
             "ask": _ask, "terms": _terms, "translate": _translate, "reprocess": _reprocess,
-            "deep_correct": _deep_correct}
+            "deep_correct": _deep_correct, "filter_pending": _filter_pending}
 
 
 # ---------------------------------------------------------------- job handling

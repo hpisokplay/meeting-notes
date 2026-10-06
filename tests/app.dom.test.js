@@ -420,6 +420,8 @@ describe('app（整合，假 NAS）', () => {
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction', action: 'deep_correct', msg: '加強校對中（第 3/12 段）' } }))
       .toBe('摘要中・加強校對中（第 3/12 段）');
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'queued', action: 'deep_correct', msg: '' } })).toBe('摘要中・加強校對中');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction', action: 'filter_pending', msg: 'AI 複核可能錯字中（2/4 批）' } }))
+      .toBe('摘要中・AI 複核可能錯字中（2/4 批）');
   });
 
   describe('錄音停止／浮動膠囊／逐字稿快速捲動軸', () => {

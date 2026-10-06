@@ -177,6 +177,41 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
     return transcript, {"items": items, "at": now_ms()}
 
 
+FILTER_BY = "ai-filter"  # resolvedBy of a candidate the AI second opinion (VERIFY_CANDIDATES) rejected
+
+
+def apply_filter_verdicts(old, rejected: list, unsure=()) -> dict:
+    """Record the AI filter's verdicts in meeting.corrections (before merge_corrections).
+
+    rejected: proposals {wrong, right, confidence, reason, ts, filterReason} -> state "rejected",
+    resolvedBy "ai-filter" (a known pending pair is flipped; a new one is added with count 0). Known
+    applied / rejected pairs are left alone. unsure: (wrong, right) keys whose known pending pair drops
+    to confidence low. merge_corrections then never resurrects a rejected pair (known keys keep state)."""
+    items = [dict(c) for c in (old.get("items") if isinstance(old, dict) else None) or [] if isinstance(c, dict)]
+    by_key = {(c.get("wrong"), c.get("right")): c for c in items}
+    for p in rejected or []:
+        wrong, right = str(p.get("wrong") or "").strip(), str(p.get("right") or "").strip()
+        if not wrong or not right:
+            continue
+        reason = str(p.get("filterReason") or "").strip()
+        o = by_key.get((wrong, right))
+        if o is None:
+            conf = p.get("confidence") if p.get("confidence") in ("high", "medium", "low") else "low"
+            o = {"wrong": wrong, "right": right, "confidence": conf, "count": 0, "ts": clean_ts(p.get("ts"))}
+            if str(p.get("reason") or "").strip():
+                o["reason"] = str(p["reason"]).strip()
+            items.append(o)
+            by_key[(wrong, right)] = o
+        elif o.get("state") != "pending":
+            continue
+        o.update(state="rejected", resolvedBy=FILTER_BY, filterReason=reason, decidedAt=now_ms())
+    for k in unsure or ():
+        o = by_key.get(tuple(k))
+        if o is not None and o.get("state") == "pending":
+            o["confidence"] = "low"
+    return {"items": items, "at": now_ms()}
+
+
 # ---------------------------------------------------------------- src / verify
 def relocate_meeting_src(m: dict) -> None:
     """Re-anchor every summary / notes src.t (verify.relocate_src when Task B provides it)."""

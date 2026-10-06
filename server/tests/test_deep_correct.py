@@ -201,8 +201,9 @@ def test_deep_correct_adds_rows_keeps_summary_and_handled_states(app_client, mon
     # no summary / notes / mode calls
     schemas = [json.loads(line)["argv"] for line in log.read_text(encoding="utf-8").splitlines()]
     kinds = {("wrong" if '"wrong"' in a[a.index("--json-schema") + 1] else
-              "span" if '"span"' in a[a.index("--json-schema") + 1] else "other") for a in schemas}
-    assert kinds == {"wrong", "span"}
+              "span" if '"span"' in a[a.index("--json-schema") + 1] else
+              "decision" if '"decision"' in a[a.index("--json-schema") + 1] else "other") for a in schemas}
+    assert kinds == {"wrong", "span", "decision"}  # correction windows, AI filter, adjudicate
     # safe high one auto-applied to the transcript AND the entry quoting it (no new quote flag)
     assert not any("寶兒大" in s["text"] for s in m["transcript"])
     assert m["summary"]["mainPoints"][0]["text"] == "保單保額大"
