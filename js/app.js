@@ -22,7 +22,7 @@ import {
   confirmOnly,
 } from './items.js';
 
-const APP_VERSION = 'v103';
+const APP_VERSION = 'v104';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -455,7 +455,7 @@ function paintDetailTasks() {
     }
   });
   // 有工作在跑就停用其他動作鈕，避免同時開第二個；執行中的那顆保持可按（用來取消）
-  document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = busy && x !== runningBtn));
+  document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = (busy && x !== runningBtn) || x.hasAttribute('data-locked')));
 }
 function detailBusy() {
   const id = currentDetailId();
@@ -1242,7 +1242,15 @@ async function renderDetail(id, preloaded) {
   // → 避免用「舊的 m」整份覆寫掉伺服器剛寫進來的 AI 結果（stale closure 競態）。
   // opts.edit=true 代表真實內容編輯（逐字稿/摘要/標題/分類），會 bump editedAt。
   // 失敗（連不上 NAS 等）時跳提示並回傳 null，畫面維持原狀。
+  const LOCK_MSG = '整理中，完成後再修改';
+  const locked = () => isProcessing(m);
+  const lockNote = () => (locked() ? `<div class="hint lock-note" style="margin:0 0 8px">🔒 ${LOCK_MSG}</div>` : '');
+  // opts.content=true：會改到逐字稿／摘要／筆記的存檔；整理期間一律擋下（伺服器也會 409）
   const persist = async (mutate, opts = {}) => {
+    if (opts.content && locked()) {
+      toast(LOCK_MSG);
+      return null;
+    }
     try {
       const fresh = await api.getMeeting(id);
       if (mutate(fresh) === STALE) {
@@ -1259,6 +1267,18 @@ async function renderDetail(id, preloaded) {
       return saved;
     } catch (e) {
       noteFetchError(e);
+      if (e && e.status === 409) {
+        try {
+          const fresh = await api.getMeeting(id);
+          await cacheMeeting(fresh);
+          m = fresh;
+          toast(LOCK_MSG);
+          if (currentDetailId() === id) renderDetail(id, fresh);
+          return null;
+        } catch (e2) {
+          noteFetchError(e2);
+        }
+      }
       alert('存檔失敗：' + errText(e));
       return null;
     }
@@ -1847,7 +1867,7 @@ async function renderDetail(id, preloaded) {
           const shown = (sectionOf(m, src) || [])[+iStr];
           await persist(
             (fresh) => (removeSectionItemMatching(fresh, src[0], src[1], +iStr, shown) ? undefined : STALE),
-            { edit: true }
+            { edit: true, content: true }
           );
           drawBody(lang);
           drawReview(); // 存檔時伺服器重新驗證：刪掉的條目，它的待確認項目跟著消失
@@ -1862,7 +1882,7 @@ async function renderDetail(id, preloaded) {
           if (JSON.stringify(sectionOf(fresh, src) || []) !== seen) return STALE;
           const done = merge ? mergeSectionVersions(fresh, src[0], src[1]) : swapSectionVersion(fresh, src[0], src[1]);
           return done ? undefined : STALE;
-        }, { edit: true });
+        }, { edit: true, content: true });
         drawBody(lang);
         drawReview(); // 換版／合併後伺服器重新驗證，回傳的會議帶著新的待確認清單
         if (ok) toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
@@ -1892,11 +1912,22 @@ async function renderDetail(id, preloaded) {
     const rp = document.getElementById('reprocessBtn');
     if (rp) rp.onclick = () => doReprocess();
     paintDetailTasks(); // 重繪後把仍在跑的作業畫回按鈕
+    if (locked()) {
+      // 整理期間：換版／合併／編輯／刪除／講者改名全部停用，並在上方提示
+      bodyEl.querySelectorAll('[data-swap],[data-mergev],[data-edit],[data-del],.spk-chip').forEach((b) => {
+        b.disabled = true;
+        b.setAttribute('data-locked', '');
+        b.title = LOCK_MSG;
+      });
+      bodyEl.querySelectorAll('.seg[data-i]').forEach((el) => el.classList.add('locked'));
+      if (!bodyEl.querySelector('.lock-note')) bodyEl.insertAdjacentHTML('afterbegin', lockNote());
+    }
 
     if (isOrig) {
       // 點段落 → 直接編輯逐字稿文字
       bodyEl.querySelectorAll('.seg[data-i]').forEach((el) => {
         el.onclick = () => {
+          if (locked()) { toast(LOCK_MSG); return; }
           if (el.querySelector('textarea')) return; // 已在編輯中
           const i = +el.dataset.i;
           const seg = m.transcript[i];
@@ -1916,11 +1947,11 @@ async function renderDetail(id, preloaded) {
             const nt = ta.value.trim();
             if (nt && nt !== seg.text) {
               const segIdx = i;
-              await persist((fresh) => {
+              const saved = await persist((fresh) => {
                 if (fresh.transcript && fresh.transcript[segIdx]) fresh.transcript[segIdx].text = nt;
                 fresh.translations = {}; // 原文改了，清掉舊翻譯
-              }, { edit: true });
-              toast('已修改 ✓');
+              }, { edit: true, content: true });
+              if (saved) toast('已修改 ✓');
             }
             drawBody('orig');
           };
@@ -1928,6 +1959,7 @@ async function renderDetail(id, preloaded) {
       });
       bodyEl.querySelectorAll('.spk-chip').forEach((chip) => {
         chip.onclick = async () => {
+          if (locked()) { toast(LOCK_MSG); return; }
           const cur = chip.dataset.spk;
           const nn = prompt(`把「${cur}」改成：`, cur);
           if (nn && nn.trim() && nn.trim() !== cur) {
@@ -1937,7 +1969,7 @@ async function renderDetail(id, preloaded) {
                 if (seg.speaker === cur) seg.speaker = name;
               });
               fresh.translations = {}; // 原文改了，清掉舊翻譯
-            }, { edit: true });
+            }, { edit: true, content: true });
             renderDetail(id);
           }
         };
@@ -2090,6 +2122,19 @@ async function renderDetail(id, preloaded) {
     });
     const ap = document.getElementById('applyTerms');
     if (ap) ap.onclick = () => applyAllTerms();
+    if (locked()) {
+      // 整理期間：套用／手動新增／逐筆訂正都停用
+      termsBody.querySelectorAll('#applyTerms,#addTerm,#rescanTerms').forEach((b) => {
+        b.disabled = true;
+        b.setAttribute('data-locked', '');
+        b.title = LOCK_MSG;
+      });
+      termsBody.querySelectorAll('.term-row').forEach((r) => {
+        r.onclick = () => toast(LOCK_MSG);
+        r.classList.add('locked');
+      });
+      termsBody.insertAdjacentHTML('afterbegin', lockNote());
+    }
   };
 
   // 開啟訂正輸入（idx=-1 表示手動新增）；只「暫存草稿」，不立即改動全文
@@ -2160,6 +2205,7 @@ async function renderDetail(id, preloaded) {
 
   // 一次套用所有「待套用」的草稿：單次全文替換 + 單次存檔 + 單次重繪
   const applyAllTerms = async () => {
+    if (locked()) { toast(LOCK_MSG); return; }
     const pend = ((m.terms && m.terms.items) || []).filter(termPending);
     if (!pend.length) return;
     await persist((fresh) => {
@@ -2170,7 +2216,7 @@ async function renderDetail(id, preloaded) {
           delete it.draft;
         }
       }
-    }, { edit: true });
+    }, { edit: true, content: true });
     lang = 'orig';
     document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === 'orig'));
     drawBody('orig');

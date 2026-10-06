@@ -286,3 +286,28 @@ def test_no_chaining_in_one_batch():
                                          prop("維京群島", "英屬維京群島", [10])], tx)
     assert new[0]["text"] == "放在維京群島的公司"
     assert [c["wrong"] for c in corr["items"]] == ["維新群島"]
+
+
+# ---------------------------------------------------------------- 8. PUT blocked while a job is active
+def test_put_content_409_while_job_active_metadata_ok(app_client):
+    app, c = app_client
+    store = app.state.store
+    store.save(base())
+    jid = c.post("/api/meetings/m1/ai", json={"action": "reprocess"}).json()["jobId"]
+    m = c.get("/api/meetings/m1").json()
+    assert m["status"] == "summarizing"
+    edited = dict(m, transcript=[seg(10, "改過")])
+    r = c.put("/api/meetings/m1", json=edited)
+    assert r.status_code == 409 and r.json()["detail"] == "整理中，完成後再修改"
+    assert c.put("/api/meetings/m1", json=dict(m, title="新標題")).status_code == 200
+    assert c.post(f"/api/jobs/{jid}/cancel").status_code == 200
+    m2 = c.get("/api/meetings/m1").json()
+    assert c.put("/api/meetings/m1", json=dict(m2, transcript=[seg(10, "改過")])).status_code == 200
+
+
+def test_put_content_409_while_transcribing(app_client):
+    app, c = app_client
+    app.state.store.save(base(status="transcribing"))
+    m = c.get("/api/meetings/m1").json()
+    r = c.put("/api/meetings/m1", json=dict(m, summary={"actionItems": ["x"], "mainPoints": [], "qa": []}))
+    assert r.status_code == 409

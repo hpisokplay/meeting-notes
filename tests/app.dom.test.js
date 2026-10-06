@@ -869,6 +869,42 @@ describe('app（整合，假 NAS）', () => {
     const mp = nas.meetings['test-1'].summary.mainPoints[0];
     expect(mp).toEqual({ id: 'bbbbbbbb', text: '台積電的重點', src: [{ t: 300, quote: '原句片段' }] });
   });
+
+  it('整理中：逐字稿編輯、講者改名、專有名詞套用全部停用並提示', async () => {
+    nas.meetings['test-1'].terms = { items: [{ t: '台積', cat: 'org', fix: '', draft: '台積電' }] };
+    nas.meetings['test-1'].status = 'summarizing';
+    nas.meetings['test-1'].aiJobId = 'ja-1';
+    await go('#/m/test-1');
+    const view = document.getElementById('view');
+    expect(view.textContent).toContain('整理中，完成後再修改');
+    expect(view.querySelector('.spk-chip').disabled).toBe(true);
+    expect(view.querySelector('#applyTerms').disabled).toBe(true);
+    expect(view.querySelector('#addTerm').disabled).toBe(true);
+    api.saveMeeting.mockClear();
+    view.querySelector('.seg[data-i]').click();
+    expect(view.querySelector('.seg-edit')).toBeNull();
+    view.querySelector('#applyTerms').click();
+    await tick(80);
+    expect(api.saveMeeting).not.toHaveBeenCalled();
+  });
+
+  it('存檔回 409（整理中）→ 提示「整理中，完成後再修改」並重抓', async () => {
+    await go('#/m/test-1');
+    const alerts = [];
+    window.alert = (msg) => alerts.push(msg);
+    api.saveMeeting.mockImplementationOnce(async () => {
+      throw Object.assign(new Error('整理中，完成後再修改'), { status: 409 });
+    });
+    api.getMeeting.mockClear();
+    document.querySelector('.seg[data-i]').click();
+    const ta = document.querySelector('.seg-edit');
+    ta.value = '被改過的句子';
+    document.querySelector('.seg-save').click();
+    await tick(120);
+    expect(alerts).toEqual([]);
+    expect(document.getElementById('toast').textContent).toContain('整理中，完成後再修改');
+    expect(api.getMeeting.mock.calls.length).toBeGreaterThanOrEqual(2);
+  });
 });
 
 describe('播放與狀態的純函式', () => {

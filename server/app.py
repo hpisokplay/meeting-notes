@@ -12,7 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .ai import AIThread, build_ai_router, on_ai_job_terminal
 from .importer import build_router as build_import_router
-from .review import build_review_router, verify_review
+from .review import ACTIVE_JOB_STATES, build_review_router, verify_review
 from .jobs import JobQueue, build_jobs_router, load_worker_key
 from . import notify as tg_notify
 from .storage import BadId, Store, read_json
@@ -59,6 +59,16 @@ def mount_static(app: FastAPI) -> None:
         return FileResponse(p)
 
 
+def _is_processing(m: dict, get_jobs) -> bool:
+    """An AI/transcribe job is active on this meeting (same test review.py uses for its 409)."""
+    if m.get("status") in ("queued", "transcribing"):
+        return True
+    if m.get("status") == "summarizing" and m.get("aiJobId") and get_jobs is not None:
+        cur = get_jobs().read(m["aiJobId"])
+        return bool(cur and cur.get("state") in ACTIVE_JOB_STATES)
+    return False
+
+
 def _worker_status(store: Store) -> dict:
     w = read_json(store.path("jobs", "worker.json"), {})
     last = w.get("lastSeen") if isinstance(w, dict) else None
@@ -66,7 +76,7 @@ def _worker_status(store: Store) -> dict:
     return {"online": bool(online), "lastSeen": last}
 
 
-def build_router(store: Store) -> APIRouter:
+def build_router(store: Store, get_jobs=None) -> APIRouter:
     r = APIRouter(prefix="/api")
 
     @r.get("/status")
@@ -97,6 +107,9 @@ def build_router(store: Store) -> APIRouter:
             with store._lock(mid):  # same lock as store.update: no lost job-state write
                 stored = store.get(mid)
                 if stored is not None:
+                    if _is_processing(stored, get_jobs) and any(
+                            body.get(k) != stored.get(k) for k in VERIFIED_CONTENT):
+                        raise HTTPException(409, "整理中，完成後再修改")
                     for k in SERVER_OWNED:
                         if k in stored:
                             body[k] = stored[k]
@@ -150,7 +163,7 @@ def create_app(data_dir: Path, *, claude_cmd: list[str] | None = None,
     def _bad_id(request, exc):
         return JSONResponse({"detail": "會議 id 不合法"}, status_code=400)
 
-    app.include_router(build_router(store))
+    app.include_router(build_router(store, lambda: app.state.jobs))
     app.include_router(build_uploads_router(store, lambda: app.state.jobs))
     app.include_router(build_jobs_router(store, lambda: app.state.jobs,
                                          worker_key if worker_key is not None else load_worker_key()))
