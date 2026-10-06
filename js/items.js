@@ -233,7 +233,7 @@ export function reviewScope(r) {
     if (!x) return;
     const n = Math.max(0, Number(x.count) || 0);
     if (x.where === 'transcript') transcript += n;
-    else if (/^(summary|notes)\./.test(String(x.where || ''))) items += n || 1;
+    else if (/^(summary|notes)\./.test(String(x.where || ''))) items += 1; // 條數 = 條目數（count 是條目內出現次數），與伺服器 applied.items 一致
   });
   return { transcript, items };
 }

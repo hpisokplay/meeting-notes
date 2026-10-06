@@ -1010,6 +1010,37 @@ describe('app（整合，假 NAS）', () => {
     expect(document.getElementById('toast').textContent).toBe('已改：逐字稿 2 處、摘要 2 條');
   });
 
+  it('單字訂正卡：stale 不顯示不計數；摘要條數＝條目數（不是出現次數）；照建議按在 keep 卡上顯示已確認', async () => {
+    const m = wordMeeting();
+    m.review.items = [
+      { id: 'rw000010', kind: 'word', span: '黃任宗', action: 'replace', suggestion: '黃任中', reason: '', confidence: 'high',
+        targets: [{ where: 'transcript', count: 4 }, { where: 'notes.concepts', itemId: 'dddddddd', count: 2 }], context: '【黃任宗】', state: 'pending' },
+      { id: 'rw000011', kind: 'word', span: '舊制', action: 'keep', suggestion: '', reason: '', confidence: 'high',
+        targets: [{ where: 'summary.cases', itemId: 'e1', count: 1 }], context: '【舊制】', state: 'pending' },
+      { id: 'rw000012', kind: 'word', span: '不見了', action: 'replace', suggestion: 'x', reason: '', confidence: 'high', targets: [], context: '【不見了】', state: 'stale' },
+    ];
+    nas.meetings['w-1'] = m;
+    await go('#/m/w-1');
+    expect(document.getElementById('reviewCount').textContent).toBe('2');
+    expect(document.querySelector('[data-rid="rw000012"]')).toBeNull();
+    expect(document.querySelector('[data-rid="rw000010"] .word-scope').textContent).toBe('會改到：逐字稿 4 處、摘要 1 條');
+    api.reviewAction.mockImplementationOnce(wordReply({ transcript: 0, items: 0 }));
+    document.querySelector('[data-rid="rw000011"] [data-wv="accept"]').click();
+    await tick(120);
+    expect(document.getElementById('toast').textContent).toBe('已確認 ✓');
+  });
+
+  it('單字訂正卡：只剩 stale／merged 時整個清單隱藏', async () => {
+    const m = wordMeeting();
+    m.review.items = [
+      { id: 'rw000012', kind: 'word', span: '不見了', action: 'replace', suggestion: 'x', targets: [], context: '【不見了】', state: 'stale' },
+      { id: 'rv000013', kind: 'name', section: 'summary.mainPoints', itemId: 'mp000001', text: 't', state: 'merged', mergedInto: 'rw000012' },
+    ];
+    nas.meetings['w-1'] = m;
+    await go('#/m/w-1');
+    expect(document.getElementById('reviewCard').hidden).toBe(true);
+  });
+
   it('未辨識段落：匯出列下方顯示約 X 分鐘，展開列出時間鈕；沒有 gaps 不顯示', async () => {
     nas.meetings['w-1'] = wordMeeting();
     await go('#/m/w-1');

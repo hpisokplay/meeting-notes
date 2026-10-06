@@ -42,6 +42,17 @@ def _hms(t) -> str:
     return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
 
 
+def _kept_span(r: dict) -> bool:
+    """A handled card by which the user said "the original text is right" (keep / accepted keep)."""
+    return r.get("resolution") == "keep" or (r.get("action") == "keep" and r.get("resolution") == "accept")
+
+
+def _too_short(span: str) -> bool:
+    """One CJK character (or one non-word char): replacing it everywhere would hit unrelated words."""
+    from .review import _LATIN_TOKEN
+    return len(span) < 2 and not _LATIN_TOKEN.match(span)
+
+
 def is_card(r) -> bool:
     return isinstance(r, dict) and r.get("kind") == WORD_KIND and isinstance(r.get("span"), str)
 
@@ -231,7 +242,7 @@ def normalize_cards(raw, m: dict, flags: dict) -> list[dict]:
         for f in x.get("fromFlags") or []:
             if isinstance(f, str) and f in flags and f not in ff:
                 ff.append(f)
-        if action == "replace" and (not sug or sug == span):
+        if action == "replace" and (not sug or sug == span or _too_short(span)):
             action, conf = "keep", "low"
         if action != "replace":
             sug = ""
@@ -304,7 +315,9 @@ def finalize_review(m: dict, items: list[dict], prev: list[dict] | None = None) 
             if k:
                 merged_key[k] = r["mergedInto"]
     cards = {r["id"]: r for r in items if is_card(r)}
-    handled_sa = {(r["span"], r["action"]) for r in cards.values() if r.get("state") not in OPEN_STATES}
+    handled = [r for r in cards.values() if r.get("state") not in OPEN_STATES]
+    handled_sa = {(r["span"], r["action"]) for r in handled}
+    kept = {r["span"] for r in handled if _kept_span(r)}  # the user said the original is right
     # leftovers (recomputed from the corrections every time)
     fresh = {c["id"]: c for c in leftover_cards(m)}
     out = []
@@ -315,7 +328,7 @@ def finalize_review(m: dict, items: list[dict], prev: list[dict] | None = None) 
             continue  # the leftover is gone (fixed elsewhere)
         out.append(r)
     for c in fresh.values():
-        if c["id"] not in cards and (c["span"], c["action"]) not in handled_sa:
+        if c["id"] not in cards and (c["span"], c["action"]) not in handled_sa and c["span"] not in kept:
             out.append(c)
     cards = {r["id"]: r for r in out if is_card(r)}
     for r in out:
@@ -359,6 +372,9 @@ def apply_ai_cards(m: dict, raw) -> list[dict]:
     handled = [r for r in items if is_card(r) and r.get("state") not in OPEN_STATES]
     by_id = {r["id"]: r for r in items if is_card(r)}
     by_sa = {(r["span"], r["action"]): r for r in handled}
+    for r in handled:  # "keep the original" also answers a later keep card for the same span
+        if _kept_span(r):
+            by_sa.setdefault((r["span"], "keep"), r)
     new = []
     for c in normalize_cards(raw, m, flags):
         target = by_id.get(c["id"]) or by_sa.get((c["span"], c["action"]))

@@ -402,3 +402,23 @@ def test_gaps_on_save_and_in_exports(tmp_path):
 def test_name_list_shows_transcript_variants():
     lines = W.name_list(grounded_meeting())
     assert any(x.startswith("- 黃任宗：逐字稿 2 次") and "黃任中 1 次" in x for x in lines)
+
+
+def test_single_char_replace_becomes_keep():
+    m = grounded_meeting()
+    W.apply_ai_cards(m, [{"span": "宗", "action": "replace", "suggestion": "中", "reason": "x", "confidence": "high",
+                          "itemIds": [], "fromFlags": []}])
+    (c,) = cards(m)
+    assert c["action"] == "keep" and c["confidence"] == "low" and c["suggestion"] == ""
+
+
+def test_user_keep_answers_later_keep_card_for_same_span(app_client):
+    app, c = app_client
+    m, _ = with_cards()
+    app.state.store.save(m)
+    hid = card(m, "黃任宗")["id"]
+    out = post(c, hid, action="keep")  # the user keeps the original on a replace card
+    assert rv(out, hid)["state"] == "confirmed"
+    W.apply_ai_cards(out, [{"span": "黃任宗", "action": "keep", "suggestion": "", "reason": "again",
+                            "confidence": "high", "itemIds": [], "fromFlags": []}])
+    assert [x["state"] for x in cards(out) if x["span"] == "黃任宗"] == ["confirmed"]

@@ -2390,7 +2390,7 @@ async function renderDetail(id, preloaded) {
   };
   let reviewOpen = true;
   const drawReviewInner = () => {
-    const all = reviewItems(m).filter((r) => r && r.state !== 'merged'); // 已併進別張卡的不顯示、不計數
+    const all = reviewItems(m).filter((r) => r && r.state !== 'merged' && r.state !== 'stale'); // 已併進別張卡／原文已不存在的不顯示、不計數
     paintExportLock();
     if (!all.length) {
       reviewBox.hidden = true;
@@ -2524,7 +2524,8 @@ async function renderDetail(id, preloaded) {
       const fresh = r2 && typeof r2 === 'object' && r2.id ? r2 : await api.getMeeting(id);
       await cacheMeeting(fresh);
       m = fresh;
-      if (isWordReview(r)) toast(action === 'keep' ? '已保留原文 ✓' : scopeText(applied || {}, '已改：'));
+      if (isWordReview(r))
+        toast(action === 'keep' ? '已保留原文 ✓' : action === 'accept' && r.action === 'keep' ? '已確認 ✓' : scopeText(applied || {}, '已改：'));
       else toast(action === 'confirm' ? '已確認 ✓' : action === 'edit' ? '已改正 ✓' : '已刪除 ✓');
       // 條目內容可能變了（改正／刪除）→ 整頁重繪
       if (currentDetailId() === id) renderDetail(id, fresh);
