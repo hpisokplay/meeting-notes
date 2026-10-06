@@ -117,3 +117,20 @@ All 8 items are fixed. The server suite now has **218 tests passing**: the 206 f
 8. **`verify_review`** now calls `verify_meeting` only. The second merge and my own carry-over of edited items are gone, because Task B's `merge_review` now carries state by kind+section+itemId.
 
 Note: the smoke numbers above were measured before this round. With these rules, many of the 70 auto-applied pairs will become pending, for example the 2-character 證與→贈與 and 結會→結匯. That shrinks silent edits but lengthens the 待確認清單. A rerun in Task E will show the new balance.
+
+## Fix round 2
+
+The server suite has **224 tests passing**: 6 new tests in `test_reprocess_fix1.py`, and 2 tests from round 1 updated to the new rulings. Only `review.py`, `ai.py` and tests were edited.
+
+- **A. A user's confirm or edit of a term now replaces every occurrence in the transcript.** The one exception is a match that sits inside an existing occurrence of `right`. Automatic application keeps the strict ±15 s window rules.
+  - The term review item's `detail` is rewritten after verify by `review.term_detail`. Task B's `verify.term_items` stays untouched; its 「出現 N 次」 count is dropped.
+  - The detail always gives the exact total: 「確認後全文 N 處都會改成「right」」.
+  - When the wrong word is short (fewer than 3 CJK characters and not a Latin token) or has more than 5 occurrences, the detail also lists up to 5 contexts, formatted `[HH:MM:SS] …8 chars【wrong】8 chars…`. Look-alikes such as 保【證與】否 show up there, followed by 「若其中有不該改的，請用「改正」或「刪除」」.
+  - Tests:
+    - 7 occurrences → confirm leaves 0, and count=7.
+    - A 2-character wrong word gets the context list, including 保證與否.
+    - A long word with a single occurrence gets no list.
+  - The round-1 test that expected 保證與否 to stay untouched now expects it to change, per the ruling.
+- **C. Settling a term no longer creates duplicate entries.** All pending pairs with the same wrong word merge into the existing (wrong, right) entry, even one that was rejected, or into a single entry if none exists. The other pending pairs are removed.
+- **D. Reruns keep an earlier failure note.** On `/mode` and `/restore-raw`, the correction step does not run, so an earlier 「名詞校正失敗…」 warning is kept. On `/mode`, the slip check does not run either, so an earlier 「檢查口誤失敗…」 warning is kept too. Tested for both routes.
+- **E. No chaining within one correction batch.** A pair whose wrong word equals the right word of a pair already applied in the same batch is skipped. Tested: 維新群島→維京群島 followed by 維京群島→英屬維京群島.

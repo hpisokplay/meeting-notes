@@ -602,7 +602,9 @@ def _reprocess(ctx: Ctx, payload):
     transcript = copy.deepcopy(m0.get("transcript") or [])
     corrections = None
     warnings: list[str] = []
-    if payload.get("correction", True):
+    ran_correction = bool(payload.get("correction", True))
+    ran_slips = bool(payload.get("slips", True))
+    if ran_correction:
         ctx.step(STEP_CORRECTION)
 
         def correct():
@@ -649,8 +651,11 @@ def _reprocess(ctx: Ctx, payload):
             m["notes"] = {**notes, "generatedAt": int(time.time() * 1000)}
         m["translations"] = {}
         m["error"] = None
-        if warnings:
-            m["warnings"] = warnings
+        # a step that did not run this time (/mode, restore-raw) keeps its earlier failure note
+        kept = [w for w in m.get("warnings") or [] if isinstance(w, str) and (
+            (not ran_correction and w.startswith("名詞校正")) or (not ran_slips and w.startswith("檢查口誤")))]
+        if kept + warnings:
+            m["warnings"] = kept + warnings
         else:
             m.pop("warnings", None)
         _reverify(m, ctx, slips)

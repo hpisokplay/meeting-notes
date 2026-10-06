@@ -135,6 +135,7 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
     """
     items = [dict(c) for c in (old.get("items") if isinstance(old, dict) else None) or [] if isinstance(c, dict)]
     by_key = {(c.get("wrong"), c.get("right")): c for c in items}
+    applied_rights: set[str] = set()  # no chaining: a pair may not rewrite what another just wrote
     for p in proposals or []:
         if not isinstance(p, dict):
             continue
@@ -143,6 +144,8 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
             continue
         conf = p.get("confidence") if p.get("confidence") in ("high", "medium", "low") else "low"
         ts = clean_ts(p.get("ts"))
+        if wrong in applied_rights:
+            continue
         o = by_key.get((wrong, right))
         if o is not None:
             if o.get("state") == "pending":
@@ -152,6 +155,7 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
             continue
         if conf == "high" and auto_apply_ok(wrong, right, ts, transcript):
             transcript, n, hit = replace_term(transcript, wrong, right, ts)
+            applied_rights.add(right)
             c = {"wrong": wrong, "right": right, "confidence": conf, "count": n, "ts": hit, "state": "applied"}
         else:
             n, hit = count_term(transcript, wrong, right)
@@ -212,7 +216,55 @@ def verify_review(m: dict, glossary, extra: list | None = None, *, replace_slips
     prev_items = [r for r in prev.get("items") or [] if isinstance(r, dict)]
     if not replace_slips:  # keep the current slip list: hand it back as `extra`
         extra = [r for r in prev_items if r.get("kind") == "slip"] + list(extra or [])
-    return {"items": verify_meeting(m, glossary, extra=list(extra or [])), "at": now_ms()}
+    items = verify_meeting(m, glossary, extra=list(extra or []))
+    for r in items:
+        if r.get("kind") == "term" and r.get("state") == "pending":
+            r["detail"] = term_detail(m, r)
+    return {"items": items, "at": now_ms()}
+
+
+CTX_CHARS = 8
+MAX_CTX = 5
+
+
+def _hms(t: float) -> str:
+    s = int(t)
+    return f"{s // 3600:02d}:{s % 3600 // 60:02d}:{s % 60:02d}"
+
+
+def term_contexts(transcript, wrong: str, right: str = "", limit: int = MAX_CTX) -> list[str]:
+    """Up to `limit` occurrences of `wrong` as 「[時間] …前文【wrong】後文…」 (the text a user
+    confirm would change, e.g. a look-alike 「保證與否」 for 證與)."""
+    out = []
+    for s in transcript or []:
+        if not isinstance(s, dict):
+            continue
+        text = str(s.get("text") or "")
+        for a, b in _matches(text, wrong, right):
+            t = _num(s.get("t"))
+            pre = ("…" if a > CTX_CHARS else "") + text[max(0, a - CTX_CHARS):a]
+            post = text[b:b + CTX_CHARS] + ("…" if len(text) - b > CTX_CHARS else "")
+            out.append((f"[{_hms(t)}] " if t is not None else "") + f"{pre}【{text[a:b]}】{post}")
+            if len(out) >= limit:
+                return out
+    return out
+
+
+def term_detail(m: dict, r: dict) -> str:
+    """Term review detail with the exact total a confirm would change, plus occurrence contexts
+    when the term is short (< MIN_CJK CJK chars and not a Latin token) or frequent (> MAX_CTX)."""
+    wrong, right = str(r.get("text") or ""), str(r.get("suggestion") or "")
+    n, _ = count_term(m.get("transcript"), wrong, right)
+    detail = str(r.get("detail") or "")
+    detail = re.sub(r"，出現 \d+ 次", "", detail)
+    detail += f"確認後全文 {n} 處都會改成「{right}」。"
+    short = len(_CJK.findall(wrong)) < MIN_CJK and not _LATIN_TOKEN.match(wrong)
+    if short or n > MAX_CTX:
+        ctx = term_contexts(m.get("transcript"), wrong, right)
+        if ctx:
+            more = f"（只列前 {len(ctx)} 處）" if n > len(ctx) else ""
+            detail += f"出現位置{more}：" + "；".join(ctx) + "。若其中有不該改的，請用「改正」或「刪除」。"
+    return detail
 
 
 def slip_items(raw: list, tx: TranscriptIndex) -> list[dict]:
@@ -307,14 +359,17 @@ def _apply_term(m: dict, wrong: str, right: str) -> None:
     corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {"items": []}
     items = [c for c in corr.get("items") or [] if isinstance(c, dict)]
     pend = [c for c in items if c.get("wrong") == wrong and c.get("state") == "pending"]
-    # same ±WINDOW_S windows as the automatic path when the pairs carry times; else everywhere
-    ts = sorted({t for c in pend for t in clean_ts(c.get("ts"))}) or None
-    m["transcript"], n, hit_ts = replace_term(m.get("transcript") or [], wrong, right, ts)
-    if not pend:
-        pend = [{"wrong": wrong, "confidence": "medium"}]
-        items.append(pend[0])
-    for c in pend:  # every pending pair with this wrong is settled by the user's choice
-        c.update(right=right, state="applied", count=n, ts=hit_ts or c.get("ts") or [])
+    # a USER decision changes every occurrence (the review detail listed the total and contexts);
+    # only matches inside an existing `right` are left alone
+    m["transcript"], n, hit_ts = replace_term(m.get("transcript") or [], wrong, right)
+    target = next((c for c in items if c.get("wrong") == wrong and c.get("right") == right), None)
+    if target is None:
+        target = pend[0] if pend else {"wrong": wrong, "confidence": "medium"}
+        if not pend:
+            items.append(target)
+    # every pending pair with this wrong is settled by the user's choice: merged into one entry
+    items = [c for c in items if c is target or not (c.get("wrong") == wrong and c.get("state") == "pending")]
+    target.update(right=right, state="applied", count=n, ts=hit_ts or target.get("ts") or [])
     m["corrections"] = {"items": items, "at": now_ms()}
     m["translations"] = {}
 

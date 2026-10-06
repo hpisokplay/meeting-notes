@@ -11,7 +11,7 @@ from server import ai
 from server.ai import ClaudeError, handle_ai_job
 from server.app import create_app
 from server.render import meeting_to_markdown
-from server.review import merge_corrections, replace_term
+from server.review import merge_corrections, replace_term, verify_review
 from server.storage import Store
 from server.verify import review_item
 
@@ -46,7 +46,12 @@ def test_short_cjk_pair_demoted_and_windowed_apply_spares_other_text(tmp_path, m
     new, corr = merge_corrections(None, [prop("證與", "贈與", [10])], tx)
     assert new == tx and state_of(corr, "證與")["state"] == "pending"
     assert state_of(corr, "證與")["ts"] == [10.0]
-    # the user confirms the term review item: only the ±15 s window around 10 s changes
+    # the review detail shows the exact total and every look-alike before the user decides
+    det = next(r for r in verify_review({"transcript": tx, "corrections": corr}, [])["items"]
+               if r["kind"] == "term")["detail"]
+    assert "確認後全文 2 處都會改成「贈與」" in det
+    assert "[00:00:10] 【證與】稅要注意" in det and "[00:01:40] 保【證與】否還不確定" in det
+    # a USER confirm changes every occurrence (round-2 ruling); the automatic path did not
     store = Store(tmp_path / "d")
     store.save({"id": "m1", "title": "t", "createdAt": 1, "status": "done", "transcript": tx,
                 "corrections": corr, "review": {"items": [
@@ -54,7 +59,7 @@ def test_short_cjk_pair_demoted_and_windowed_apply_spares_other_text(tmp_path, m
     c = TestClient(create_app(tmp_path / "d", start_threads=False, claude_cmd=FAKE))
     rid = store.get("m1")["review"]["items"][0]["id"]
     out = c.post(f"/api/meetings/m1/review/{rid}", json={"action": "confirm"}).json()
-    assert [s["text"] for s in out["transcript"]] == ["贈與稅要注意", "保證與否還不確定"]
+    assert [s["text"] for s in out["transcript"]] == ["贈與稅要注意", "保贈與否還不確定"]
 
 
 def test_number_changing_pair_demoted():
@@ -212,4 +217,67 @@ def test_term_apply_settles_every_pending_pair(app_client):
     store.save(base(corrections=corr, review={"items": [term], "at": 1}))
     out = c.post(f"/api/meetings/m1/review/{term['id']}", json={"action": "confirm"}).json()
     assert out["transcript"][1]["text"] == "台積電很大"
-    assert [(x["right"], x["state"]) for x in out["corrections"]["items"]] == [("台積電", "applied")] * 2
+    assert [(x["right"], x["state"]) for x in out["corrections"]["items"]] == [("台積電", "applied")]
+
+
+# ---------------------------------------------------------------- fix round 2
+def test_user_confirm_replaces_all_occurrences(app_client):
+    app, c = app_client
+    store = app.state.store
+    tx = [seg(10 + 100 * i, f"第{i}段提到維新群島") for i in range(7)]
+    corr = {"items": [{"wrong": "維新群島", "right": "維京群島", "confidence": "medium", "count": 7,
+                       "ts": [10.0], "state": "pending"}], "at": 1}
+    m = base(transcript=tx, corrections=corr)
+    m["review"] = verify_review(m, [])
+    term = next(r for r in m["review"]["items"] if r["kind"] == "term")
+    assert "確認後全文 7 處" in term["detail"] and "只列前 5 處" in term["detail"]  # > 5: contexts listed
+    store.save(m)
+    out = c.post(f"/api/meetings/m1/review/{term['id']}", json={"action": "confirm"}).json()
+    assert not any("維新群島" in s["text"] for s in out["transcript"])
+    assert out["corrections"]["items"][0]["count"] == 7
+
+
+def test_long_rare_term_has_no_context_list():
+    tx = [seg(10, "放在維新群島")]
+    corr = {"items": [{"wrong": "維新群島", "right": "維京群島", "confidence": "medium", "count": 1,
+                       "ts": [10.0], "state": "pending"}]}
+    det = next(r for r in verify_review({"transcript": tx, "corrections": corr}, [])["items"]
+               if r["kind"] == "term")["detail"]
+    assert "確認後全文 1 處" in det and "出現位置" not in det
+
+
+def test_settle_merges_into_existing_pair(app_client):
+    app, c = app_client
+    store = app.state.store
+    corr = {"items": [
+        {"wrong": "台積店", "right": "台積殿", "confidence": "low", "count": 1, "ts": [20.0], "state": "pending"},
+        {"wrong": "台積店", "right": "台積電", "confidence": "medium", "count": 1, "ts": [20.0], "state": "rejected"}],
+        "at": 1}
+    term = review_item("term", "transcript", None, "台積店", "x", suggestion="台積殿", t=20.0)
+    store.save(base(corrections=corr, review={"items": [term], "at": 1}))
+    out = c.post(f"/api/meetings/m1/review/{term['id']}", json={"action": "edit", "text": "台積電"}).json()
+    assert out["transcript"][1]["text"] == "台積電很大"
+    assert [(x["wrong"], x["right"], x["state"]) for x in out["corrections"]["items"]] == [
+        ("台積店", "台積電", "applied")]
+
+
+@pytest.mark.parametrize("route", ["mode", "restore-raw"])
+def test_rerun_without_correction_keeps_correction_warning(app_client, route):
+    app, c = app_client
+    store = app.state.store
+    store.save(base(mode="meeting", transcriptRaw=[seg(10, "Jefry 會負責"), seg(20, "台積店很大")],
+                    warnings=["名詞校正失敗，已略過：boom"]))
+    if route == "mode":
+        assert c.post("/api/meetings/m1/mode", json={"mode": "lecture"}).status_code == 200
+    else:
+        assert c.post("/api/meetings/m1/restore-raw").status_code == 200
+    run(app)
+    assert store.get("m1")["warnings"] == ["名詞校正失敗，已略過：boom"]
+
+
+def test_no_chaining_in_one_batch():
+    tx = [seg(10, "放在維新群島的公司")]
+    new, corr = merge_corrections(None, [prop("維新群島", "維京群島", [10]),
+                                         prop("維京群島", "英屬維京群島", [10])], tx)
+    assert new[0]["text"] == "放在維京群島的公司"
+    assert [c["wrong"] for c in corr["items"]] == ["維新群島"]
