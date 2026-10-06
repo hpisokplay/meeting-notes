@@ -209,6 +209,17 @@ export async function runAI(id, action, params = {}) {
   const r = await req('POST', `/api/meetings/${enc(id)}/ai`, { action, ...params });
   return r && r.jobId;
 }
+// 回應裡的工作編號（{jobId} 或含 aiJobId 的會議）；沒有就回 null
+export const jobIdOf = (r) => (r && typeof r === 'object' && (r.jobId || r.aiJobId)) || null;
+
+// ---- 待確認清單／講座會議模式／還原原始逐字稿 ----
+// action: 'confirm' | 'edit' | 'delete'；edit 帶 text。回傳更新後的會議。
+export const reviewAction = (id, rid, action, text) =>
+  req('POST', `/api/meetings/${enc(id)}/review/${enc(rid)}`, text != null ? { action, text } : { action });
+// 改模式後伺服器會排入重新整理，回傳 {jobId}（或含 aiJobId 的會議）
+export const setMeetingMode = (id, mode) => req('POST', `/api/meetings/${enc(id)}/mode`, { mode });
+export const restoreRaw = (id) => req('POST', `/api/meetings/${enc(id)}/restore-raw`, {});
+
 export const getJob = (jobId) => req('GET', `/api/jobs/${enc(jobId)}`);
 export const cancelJob = (jobId) => req('POST', `/api/jobs/${enc(jobId)}/cancel`, {});
 

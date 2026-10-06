@@ -213,3 +213,24 @@ describe('errors and urls', () => {
     expect(api.docxUrl('a')).toBe('/api/meetings/a/export.docx');
   });
 });
+
+describe('待確認清單／模式／還原（董事長版）', () => {
+  it('review action、mode、restore-raw 打對的路徑與內容', async () => {
+    const f = fakeFetch((method, path) => {
+      if (path === '/api/meetings/m%201/review/r1') return json(200, { id: 'm 1', review: { items: [] } });
+      if (path === '/api/meetings/m%201/mode') return json(200, { jobId: 'j9' });
+      if (path === '/api/meetings/m%201/restore-raw') return json(200, { id: 'm 1', aiJobId: 'j7' });
+      return json(404, { detail: 'no' });
+    });
+    vi.stubGlobal('fetch', f);
+    expect((await api.reviewAction('m 1', 'r1', 'edit', '新文字')).id).toBe('m 1');
+    expect(f.calls[0].method).toBe('POST');
+    expect(JSON.parse(f.calls[0].body)).toEqual({ action: 'edit', text: '新文字' });
+    await api.reviewAction('m 1', 'r1', 'confirm');
+    expect(JSON.parse(f.calls[1].body)).toEqual({ action: 'confirm' });
+    expect(api.jobIdOf(await api.setMeetingMode('m 1', 'lecture'))).toBe('j9');
+    expect(JSON.parse(f.calls[2].body)).toEqual({ mode: 'lecture' });
+    expect(api.jobIdOf(await api.restoreRaw('m 1'))).toBe('j7');
+    expect(api.jobIdOf(null)).toBeNull();
+  });
+});
