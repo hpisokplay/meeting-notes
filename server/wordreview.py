@@ -459,9 +459,20 @@ def apply_ai_cards(m: dict, raw) -> list[dict]:
     Program flags named in fromFlags become "merged" into their card. A card equal (id, or same
     span + action) to one the user already handled is not added again: its flags merge into the
     handled card. Returns the new cards."""
+    return _fold_cards(m, raw, replace_open=True)
+
+
+def add_ai_cards(m: dict, raw) -> list[dict]:
+    """Add adjudicate output to meeting.review WITHOUT dropping the open cards (加強校對). Same rules as
+    apply_ai_cards; in addition a card about a span the user kept (「原文正確」) is never added."""
+    return _fold_cards(m, raw, replace_open=False)
+
+
+def _fold_cards(m: dict, raw, replace_open: bool) -> list[dict]:
     review = m.get("review") if isinstance(m.get("review"), dict) else {"items": []}
     items = [r for r in review.get("items") or [] if isinstance(r, dict)]
-    items = [r for r in items if not (is_card(r) and r.get("origin") != "leftover" and r.get("state") in OPEN_STATES)]
+    if replace_open:
+        items = [r for r in items if not (is_card(r) and r.get("origin") != "leftover" and r.get("state") in OPEN_STATES)]
     keep_ids = {r["id"] for r in items if is_card(r)}
     for r in items:  # flags merged into a dropped card are open again
         if not is_card(r) and r.get("state") == MERGED and r.get("mergedInto") not in keep_ids:
@@ -475,8 +486,11 @@ def apply_ai_cards(m: dict, raw) -> list[dict]:
         if _kept_span(r):
             by_sa.setdefault((r["span"], "keep"), r)
     new = []
+    kept = {r["span"]: r for r in handled if _kept_span(r) and r.get("resolvedBy") != "ai"}
     for c in normalize_cards(raw, m, flags):
         target = by_id.get(c["id"]) or by_sa.get((c["span"], c["action"]))
+        if target is None and not replace_open and c["span"] in kept:
+            target = kept[c["span"]]  # the user said the original is right: answer the flags with it
         if target is None:
             new.append(c)
             by_id[c["id"]] = target = c
@@ -673,15 +687,27 @@ def _flag_line(r: dict) -> str:
     return f"[F:{r['id']}] {r.get('kind')}：{r.get('detail') or ''}{sug}"
 
 
-def adjudicate_blocks(m: dict) -> tuple[str, list[str]]:
-    """(header, blocks) of the ADJUDICATE user message; blocks are chunked by the caller."""
+def _pending_flags(m: dict, flag_ids=None) -> list[dict]:
     review = m.get("review") if isinstance(m.get("review"), dict) else {}
-    flags = [r for r in review.get("items") or [] if isinstance(r, dict) and not is_card(r)
-             and r.get("kind") in FLAG_KINDS and r.get("state") == "pending" and r.get("id")]
+    return [r for r in review.get("items") or [] if isinstance(r, dict) and not is_card(r)
+            and r.get("kind") in FLAG_KINDS and r.get("state") == "pending" and r.get("id")
+            and (flag_ids is None or r["id"] in flag_ids)]
+
+
+def pending_flag_ids(m: dict, flag_ids=None) -> set[str]:
+    """Ids of the pending program flags an adjudicate run is asked about."""
+    return {r["id"] for r in _pending_flags(m, flag_ids)}
+
+
+def adjudicate_blocks(m: dict, flag_ids=None, entries: bool = True) -> tuple[str, list[str]]:
+    """(header, blocks) of the ADJUDICATE user message; blocks are chunked by the caller.
+    flag_ids: only these pending flags (None = all); entries=False: no summary / notes entry blocks
+    (flags attached to an entry are then sent on their own)."""
+    flags = _pending_flags(m, flag_ids)
     by_item: dict[tuple, list] = {}
     loose = []
     for r in flags:
-        if r.get("itemId") and str(r.get("section") or "").startswith(("summary.", "notes.")):
+        if entries and r.get("itemId") and str(r.get("section") or "").startswith(("summary.", "notes.")):
             by_item.setdefault((r["section"], r["itemId"]), []).append(r)
         else:
             loose.append(r)
@@ -710,7 +736,7 @@ def adjudicate_blocks(m: dict) -> tuple[str, list[str]]:
             if isinstance(r.get("t"), (int, float)):
                 b += ["  前後逐字稿："] + ["  " + x for x in _lines_near(tr, [r["t"]])]
         blocks.append("\n".join(b))
-    for section, _raw, iid, text, src in iter_items(m):
+    for section, _raw, iid, text, src in iter_items(m) if entries else ():
         if not str(text).strip():
             continue
         b = [f"### [I:{iid}] {section}", f"條目：{text}"]
@@ -730,8 +756,10 @@ def adjudicate_blocks(m: dict) -> tuple[str, list[str]]:
     return "\n".join(head), blocks
 
 
-def adjudicate_messages(m: dict, budget: int) -> list[str]:
-    head, blocks = adjudicate_blocks(m)
+def adjudicate_messages(m: dict, budget: int, flag_ids=None, entries: bool = True) -> list[str]:
+    head, blocks = adjudicate_blocks(m, flag_ids, entries)
+    if not blocks:
+        return []
     out, cur, size = [], [], len(head)
     for b in blocks:
         if cur and size + len(b) + 2 > budget:

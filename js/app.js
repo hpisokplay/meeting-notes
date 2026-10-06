@@ -30,7 +30,8 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v111';
+const APP_VERSION = 'v112';
+export const DEEP_CORRECT_CONFIRM = '會逐段重新掃描整份逐字稿的錯字（約 3–5 分鐘），只新增待確認項目，不會改動已確認的內容。確定？';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -136,6 +137,7 @@ export function isReprocessJob(m, seen) {
 export function progressLabel(m, seenReprocess) {
   const base = STAGE_TEXT[m && m.status] || (m && m.status) || '';
   const p = (m && m.progress) || {};
+  if ((p.action || (m && m.aiAction)) === 'deep_correct') return `${base}・${p.msg || '加強校對中'}`;
   if (isReprocessJob(m, seenReprocess)) {
     const rs = reprocessStage(m);
     if (rs) {
@@ -1557,7 +1559,10 @@ async function renderDetail(id, preloaded) {
       </div>
       <div class="tb-group" data-group="review">
         <div class="tb-label">✅ 校對</div>
-        <button class="tb-btn" id="reviewBtn" type="button" aria-controls="reviewPanel" aria-expanded="false"></button>
+        <div class="tb-row${hasTranscript ? ' tb-review' : ' tb-1'}">
+          <button class="tb-btn" id="reviewBtn" type="button" aria-controls="reviewPanel" aria-expanded="false"></button>
+          ${hasTranscript ? '<button type="button" class="act-btn" id="deepCorrectBtn" data-task="deepCorrect" title="逐段重新掃描整份逐字稿的錯字">🔍 加強校對</button>' : ''}
+        </div>
         ${gapsLineHtml(m)}
       </div>
       <div class="tb-group" data-group="ai">
@@ -2549,6 +2554,27 @@ async function renderDetail(id, preloaded) {
     if (!confirm('用目前的逐字稿重新整理？會依序做：名詞校正 → 判斷講座／會議 → 整理摘要（有筆記也會重做）→ 驗證，舊版會留著可以換回來。不會重新轉錄。')) return;
     runAndReload('reprocess', '重新整理中…', 'reprocess', {}, '重新整理完成 ✓');
   };
+  // 加強校對：逐段重新掃描整份逐字稿的聽錯字，只新增待確認項目（摘要／筆記不重做、已確認的不動）
+  const doDeepCorrect = async () => {
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法加強校對');
+      return;
+    }
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
+    if (!confirm(DEEP_CORRECT_CONFIRM)) return;
+    const before = reviewRows(m).length + legacyPending(m).length;
+    try {
+      const fresh = await runServerAI(id, 'deepCorrect', '加強校對中…', 'deep_correct', {});
+      if (currentDetailId() === id) renderDetail(id, fresh);
+      const added = reviewRows(fresh).length + legacyPending(fresh).length - before;
+      toast(added > 0 ? `加強校對完成：新增 ${added} 項待確認 ✓` : '加強校對完成：沒有找到新的錯字 ✓');
+    } catch (e) {
+      alert('加強校對失敗：' + errText(e));
+    }
+  };
   const doSetKind = (kind) => {
     if (kind === meetingMode(m)) return;
     const name = kind === 'lecture' ? '講座' : '會議';
@@ -2944,6 +2970,8 @@ async function renderDetail(id, preloaded) {
   document.querySelectorAll('#toolbar [data-kind]').forEach((b) => (b.onclick = () => doSetKind(b.dataset.kind)));
   const rp = document.getElementById('reprocessBtn');
   if (rp) rp.onclick = () => doReprocess();
+  const dc = document.getElementById('deepCorrectBtn');
+  if (dc) dc.onclick = () => doDeepCorrect();
   document.getElementById('copyAllBtn').onclick = async () => {
     if (exportBlocked()) return; // 跟分享／匯出一樣：待確認沒清空前不能複製
     try {

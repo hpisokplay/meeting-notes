@@ -338,7 +338,8 @@ def test_pipeline_adjudicate_cards(sj, monkeypatch, tmp_path):
     # the adjudicate call got flags, entries with their context and the name list
     calls = [json.loads(line) for line in log.read_text(encoding="utf-8").splitlines()]
     adj_calls = [c for c in calls if '"span"' in c["argv"][c["argv"].index("--json-schema") + 1]]
-    assert len(adj_calls) == 1
+    assert len(adj_calls) == 2  # + one re-ask of the flags no card answered (entries not resent)
+    assert "[I:" not in adj_calls[1]["stdin"] and "] term：" not in adj_calls[1]["stdin"]
     stdin = adj_calls[0]["stdin"]
     assert "人名與異寫清單" in stdin and "[I:" in stdin and "] term：" in stdin and "] slip：" in stdin
     assert "前後逐字稿" in stdin and "--model" in adj_calls[0]["argv"]
@@ -349,9 +350,10 @@ def test_pipeline_adjudicate_cards(sj, monkeypatch, tmp_path):
     assert slip["state"] == "merged" and slip["mergedInto"] == card(m, "股利所得48他要繳24億")["id"]
     k = card(m, "講座")
     assert k["targets"][0]["where"].startswith("summary.") and sum(t["count"] for t in k["targets"]) == 6
-    # 台積店 was auto-applied at ±15 s of 30 s only: the occurrences at 100 s become a leftover card
-    lo = [x for x in cards(m) if x["origin"] == "leftover"]
-    assert [x["span"] for x in lo] == ["台積店"] and lo[0]["targets"] == [{"where": "transcript", "count": 2}]
+    # 台積店: ts recomputed from every occurrence in the window that proposed it (the model said 30 s;
+    # the transcript also has it at 100 s) -> all applied, no leftover card
+    assert not any("台積店" in s["text"] for s in m["transcript"])
+    assert not [x for x in cards(m) if x["origin"] == "leftover"]
     # gaps saved with the transcript, shown in the md header
     assert m["gaps"] and m["gaps"][-1]["end"] == 200.0
     assert "未辨識" in meeting_to_markdown(m)

@@ -485,6 +485,8 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
 }
 .tb-btn.on { background: var(--brand); color: #fff; border-color: var(--brand); }
 #reviewBtn { font-size: 15px; }
+.tb-review { grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); } /* 校對（主）｜加強校對（次） */
+#deepCorrectBtn { font-weight: 600; color: var(--muted); }
 #reviewBtn.attn { background: color-mix(in srgb, #ff9500 16%, var(--card)); border-color: #ff9500; color: var(--ink); }
 #reviewBtn.done { background: var(--card); color: var(--muted); font-weight: 600; } /* 已校對：淡色，但仍可點開 */
 #reviewBtn.on { box-shadow: inset 0 0 0 2px var(--brand); }

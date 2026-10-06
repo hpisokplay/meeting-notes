@@ -15,6 +15,8 @@ import signal
 import subprocess
 import threading
 import time
+from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from typing import Callable
 
 from fastapi import APIRouter, Body, HTTPException
@@ -51,10 +53,15 @@ ENHANCE_BATCH_CHARS = 60_000     # enhance: batched scan for completeness (legac
 NOTES_ENHANCE_BATCH_CHARS = 20_000  # notes_enhance (legacy: 80 lines)
 TRANSLATE_BATCH_CHARS = 12_000   # translated output must fit the output-token limit
 ASK_CHUNK_CHARS = 50_000
+CORRECTION_WINDOW_CHARS = 3_500  # correction scans small windows: one call over 40k chars summarises
+CORRECTION_OVERLAP_CHARS = 300   # each window repeats the tail of the previous one (words at the seam)
+CORRECTION_CONCURRENCY = 2       # windows run 2 at a time (Claude Max)
+CORRECTION_MAX_TS = 20           # occurrence times kept per merged proposal
 ABORT_CHECK_S = 1.0              # poll interval while claude runs
 HEARTBEAT_S = 30.0               # job heartbeat while claude runs (requeue_stale is 10 min)
 
-ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess"}
+ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess", "deep_correct"}
+PIPELINE_ACTIONS = ("reprocess", "deep_correct")  # status "summarizing" + aiJobId; report their own steps
 LABELS = {"summary": "摘要", "notes": "學習筆記", "ask": "回答問題", "terms": "挑專有名詞",
           "translate": "翻譯"}
 DEFAULT_MODEL = "opus"
@@ -67,6 +74,8 @@ STEP_NOTES = ("notes", 50, "整理筆記中")
 STEP_SLIPS = ("slips", 75, "檢查口誤中")
 STEP_VERIFY = ("verify", 90, "驗證中")
 STEP_ADJUDICATE = ("adjudicate", 93, "AI 審稿中")
+STEP_DEEP = ("correction", 3, "加強校對中")
+STEP_DEEP_ADJUDICATE = ("adjudicate", 90, "AI 審稿中")
 ADJUDICATE_BUDGET = 150_000  # chars per adjudicate call (items + context); more -> several calls
 
 
@@ -226,6 +235,99 @@ def chunk_lines(lines: list[str], budget: int) -> list[str]:
     if cur:
         chunks.append("\n".join(cur))
     return chunks
+
+
+def correction_windows(lines: list[str], size: int = CORRECTION_WINDOW_CHARS,
+                       overlap: int = CORRECTION_OVERLAP_CHARS) -> list[tuple[int, int]]:
+    """[a, b) line ranges of about `size` chars (a longer single line is its own window). Every
+    window after the first starts with the last lines of the previous one (>= `overlap` chars when
+    possible, never the whole previous window), so a word cut at the seam is seen whole once."""
+    out: list[tuple[int, int]] = []
+    n, a = len(lines), 0
+    while a < n:
+        b, used = a, 0
+        while b < n and (b == a or used + len(lines[b]) + 1 <= size):
+            used += len(lines[b]) + 1
+            b += 1
+        out.append((a, b))
+        if b >= n:
+            break
+        c, tail = b, 0
+        while c - 1 > a and tail < overlap:
+            c -= 1
+            tail += len(lines[c]) + 1
+        a = c
+    return out
+
+
+_CONF_RANK = {"high": 3, "medium": 2, "low": 1}
+# characters that are spelling variants of each other (same word, different written form)
+_VARIANT_CHARS = [set(x) for x in ("與予", "台臺", "佈布", "週周", "劃畫", "汙污", "裡裏", "姐姊", "菸煙", "群羣")]
+
+
+def _variant_of(a: str, b: str) -> bool:
+    """Same length, every differing character pair is a known spelling variant (贈予稅 / 贈與稅)."""
+    if a == b or len(a) != len(b):
+        return False
+    return all(x == y or any({x, y} <= v for v in _VARIANT_CHARS) for x, y in zip(a, b))
+
+
+def merge_window_proposals(per_window: list, wins: list[tuple[int, int]], segs: list[dict],
+                           glossary=None) -> list[dict]:
+    """Global merge of the per-window CORRECTION outputs (one proposal list per window).
+
+    - A proposal counts only where its `wrong` really occurs in its own window; its ts are recomputed
+      from those occurrences (segment times across the full transcript, not the model's guesses).
+    - Variants of one intended word: rights that are spelling variants of each other (贈予稅／贈與稅)
+      become one form (the 【詞庫】 one, else the most proposed), so 證明稅／證據稅／證理稅 all point at
+      the same right.
+    - Union by (wrong, right): windows (votes), best confidence (+ its reason), all times.
+    - Conflicts (same wrong -> different rights): the right with most windows wins, then the higher
+      confidence, then the first seen; the others are dropped.
+    Returns CORRECTION-shaped proposals ordered by first occurrence."""
+    gl = [g.strip() for g in (glossary.splitlines() if isinstance(glossary, str) else glossary or [])
+          if isinstance(g, str) and g.strip()]
+    raw = []
+    for (a, b), props in zip(wins, per_window):
+        for p in props or []:
+            if not isinstance(p, dict):
+                continue
+            wrong, right = str(p.get("wrong") or "").strip(), str(p.get("right") or "").strip()
+            if wrong and right and wrong != right:
+                conf = p.get("confidence") if p.get("confidence") in _CONF_RANK else "low"
+                raw.append((a, b, wrong, right, conf, str(p.get("reason") or "").strip()))
+    rights = Counter(x[3] for x in raw)
+
+    def canon(r: str) -> str:
+        g = next((g for g in gl if _variant_of(r, g)), None)
+        if g:
+            return g
+        return max([r] + [r2 for r2 in rights if _variant_of(r, r2)], key=lambda x: (rights[x], x == r))
+    acc: dict[tuple, dict] = {}
+    for a, b, wrong, right, conf, reason in raw:
+        right = canon(right)
+        if right == wrong:
+            continue
+        hits = [s for s in segs[a:b] if R._matches(str(s.get("text") or ""), wrong, right)]
+        if not hits:
+            continue  # not in this window (made up, or copied from elsewhere): ignore
+        e = acc.get((wrong, right))
+        if e is None:
+            e = acc[(wrong, right)] = {"wrong": wrong, "right": right, "confidence": conf, "reason": reason,
+                                       "ts": set(), "votes": set(), "order": len(acc)}
+        elif _CONF_RANK[conf] > _CONF_RANK[e["confidence"]]:
+            e["confidence"], e["reason"] = conf, reason or e["reason"]
+        e["votes"].add(a)
+        e["ts"].update(float(s["t"]) for s in hits if isinstance(s.get("t"), (int, float))
+                       and not isinstance(s.get("t"), bool))
+    best: dict[str, dict] = {}
+    rank = lambda e: (len(e["votes"]), _CONF_RANK[e["confidence"]], -e["order"])  # noqa: E731
+    for e in acc.values():
+        if e["wrong"] not in best or rank(e) > rank(best[e["wrong"]]):
+            best[e["wrong"]] = e
+    return [{"wrong": e["wrong"], "right": e["right"], "confidence": e["confidence"], "reason": e["reason"],
+             "ts": sorted(e["ts"])[:CORRECTION_MAX_TS]}
+            for e in sorted(best.values(), key=lambda e: (min(e["ts"], default=float("inf")), e["order"]))]
 
 
 def _keywords(q: str) -> set[str]:
@@ -578,6 +680,134 @@ def _reverify(m: dict, ctx: Ctx, slips=None) -> None:
     m["review"] = R.verify_review(m, ctx.glossary, extra, replace_slips=slips is not None)
 
 
+def scan_corrections(ctx: Ctx, transcript, label: str, pct=(3, 14), stage: str = "correction") -> list[dict]:
+    """CORRECTION over ~3,500-char overlapping windows (exhaustive per window), CORRECTION_CONCURRENCY
+    calls at a time, then the global merge. Progress 「<label>（第 i/N 段）」. Any Claude error stops
+    the remaining windows and propagates (the caller decides: optional step or job failure)."""
+    segs = [s for s in transcript or [] if isinstance(s, dict)]
+    lines = transcript_lines(segs)
+    wins = correction_windows(lines)
+    n = len(wins)
+    if not n:
+        return []
+    lock = threading.Lock()
+    started = [0]
+    futs: list = []
+
+    def one(i: int) -> list:
+        with lock:
+            started[0] += 1
+            k = started[0]
+            ctx.report(pct[0] + (pct[1] - pct[0]) * (k - 1) // n, f"{label}（第 {k}/{n} 段）", stage)
+        a, b = wins[i]
+        r = ctx.call(P.CORRECTION, P.correction_user_message("\n".join(lines[a:b]), ctx.glossary),
+                     P.CORRECTION_SCHEMA)
+        return _a(r.get("items"))
+    ex = ThreadPoolExecutor(max_workers=CORRECTION_CONCURRENCY, thread_name_prefix="correction")
+    try:
+        futs = [ex.submit(one, i) for i in range(n)]
+        per_window = [f.result() for f in futs]
+    except BaseException:
+        for f in futs:
+            f.cancel()
+        raise
+    finally:
+        ex.shutdown(wait=True)
+    return merge_window_proposals(per_window, wins, segs, ctx.glossary)
+
+
+def adjudicate_cards(ctx: Ctx, pm: dict, budget: int, flag_ids=None, entries: bool = True) -> list:
+    """ADJUDICATE over the preview meeting `pm` (flag_ids: only these pending flags; entries: also the
+    summary / notes entry blocks). Flags the AI left unanswered (no card names them in fromFlags) are
+    asked once more, on their own: otherwise they stay as raw flags in the checklist."""
+    out = []
+    for text in W.adjudicate_messages(pm, budget, flag_ids, entries):
+        out += _a(ctx.call(P.ADJUDICATE, text, P.ADJUDICATE_SCHEMA).get("items"))
+    answered = {f for x in out if isinstance(x, dict) for f in x.get("fromFlags") or [] if isinstance(f, str)}
+    missing = W.pending_flag_ids(pm, flag_ids) - answered
+    if missing:
+        for text in W.adjudicate_messages(pm, budget, missing, entries=False):
+            out += _a(ctx.call(P.ADJUDICATE, text, P.ADJUDICATE_SCHEMA).get("items"))
+    return out
+
+
+def _settled_wrongs(m: dict) -> set[str]:
+    """Strings the user already said are right: rejected corrections, kept cards, deleted term rows."""
+    out = set()
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
+    for c in corr.get("items") or []:
+        if isinstance(c, dict) and c.get("state") == "rejected" and c.get("wrong"):
+            out.add(str(c["wrong"]))
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    for r in review.get("items") or []:
+        if W.is_card(r) and r.get("state") not in W.OPEN_STATES and W._kept_span(r) and r.get("resolvedBy") != "ai":
+            out.add(r["span"])
+        elif isinstance(r, dict) and r.get("kind") == "term" and r.get("state") == "deleted" and r.get("text"):
+            out.add(str(r["text"]))
+    return out
+
+
+def _fold_deep(m: dict, proposals: list[dict]) -> set[tuple]:
+    """deep_correct on meeting m (in place): proposals the user already settled are dropped, the rest
+    go through merge_corrections (safe high ones auto-applied: transcript + the entries quoting it).
+    Returns the (wrong, right) pairs that are new in meeting.corrections."""
+    settled = _settled_wrongs(m)
+    props = [p for p in proposals if p.get("wrong") not in settled]
+    old = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
+    known = {(c.get("wrong"), c.get("right")) for c in old.get("items") or [] if isinstance(c, dict)}
+    before = m.get("transcript") or []
+    transcript, corrections = R.merge_corrections(old, props, before)
+    new = {(c["wrong"], c["right"]) for c in corrections["items"] if (c.get("wrong"), c.get("right")) not in known}
+    if new or corrections.get("items") != old.get("items"):
+        m["corrections"] = corrections
+    applied = [c for c in corrections["items"] if (c["wrong"], c["right"]) in new and c.get("state") == "applied"]
+    if applied:
+        if not (isinstance(m.get("transcriptRaw"), list) and m["transcriptRaw"]):
+            m["transcriptRaw"] = copy.deepcopy(before)
+        m["transcript"] = transcript
+        for c in applied:  # the entries say what the transcript said: keep their quotes findable
+            W.replace_in_entries(m, c["wrong"], c["right"], quotes=True)
+        m["translations"] = {}
+    return new
+
+
+def _new_term_flags(m: dict, new: set[tuple]) -> set[str]:
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    return {r["id"] for r in review.get("items") or [] if isinstance(r, dict) and r.get("kind") == "term"
+            and r.get("state") == "pending" and (r.get("text"), r.get("suggestion")) in new}
+
+
+def _deep_correct(ctx: Ctx, payload):
+    """加強校對: windowed exhaustive correction -> merge_corrections (safe ones auto-applied) -> adjudicate
+    only the new term flags -> new checklist rows. Summary / notes are not regenerated; handled rows
+    and corrections keep their state; the open rows stay (new cards are added, not swapped in)."""
+    m0 = ctx.m
+    fp = _fingerprint(m0.get("transcript"))
+    warnings: list[str] = []
+    proposals = scan_corrections(ctx, copy.deepcopy(m0.get("transcript") or []), STEP_DEEP[2], (3, 88))
+    pm = copy.deepcopy(m0)
+    new = _fold_deep(pm, proposals)
+    _reverify(pm, ctx)
+    flag_ids = _new_term_flags(pm, new)
+    cards = []
+    if flag_ids:
+        ctx.step(STEP_DEEP_ADJUDICATE)
+        budget = min(ctx.budget, ADJUDICATE_BUDGET)
+        cards = _optional(lambda: adjudicate_cards(ctx, pm, budget, flag_ids, entries=False),
+                          "AI 審稿", warnings) or []
+
+    def apply(m):
+        if _fingerprint(m.get("transcript")) != fp:
+            raise ClaudeError("逐字稿在加強校對期間被修改，請再按一次「加強校對」")
+        got = _fold_deep(m, proposals)
+        _reverify(m, ctx)
+        W.add_ai_cards(m, cards)
+        if warnings:
+            m["warnings"] = [w for w in m.get("warnings") or [] if isinstance(w, str)] + warnings
+        log.info("deep_correct %s: %d new corrections, %d cards", m.get("id"), len(got), len(cards))
+    return apply
+
+
 def _summary(ctx: Ctx, payload):
     """Grounded, mode-aware summary (manual 「摘要」 button) + verification. No term correction."""
     mode = ctx.m.get("mode") if ctx.m.get("mode") in R.MODES else None
@@ -609,15 +839,7 @@ def _reprocess(ctx: Ctx, payload):
     ran_correction = bool(payload.get("correction", True))
     ran_slips = bool(payload.get("slips", True))
     if ran_correction:
-        ctx.step(STEP_CORRECTION)
-
-        def correct():
-            got = []
-            for text in chunk_lines(transcript_lines(transcript), ctx.budget):
-                r = ctx.call(P.CORRECTION, P.correction_user_message(text, ctx.glossary), P.CORRECTION_SCHEMA)
-                got += _a(r.get("items"))
-            return got
-        proposals = _optional(correct, "名詞校正", warnings)
+        proposals = _optional(lambda: scan_corrections(ctx, transcript, STEP_CORRECTION[2]), "名詞校正", warnings)
         if proposals is not None:
             transcript, corrections = R.merge_corrections(m0.get("corrections"), proposals, transcript)
     lines = transcript_lines(transcript)
@@ -650,9 +872,7 @@ def _reprocess(ctx: Ctx, payload):
         _reverify(pm, ctx, slips)
         ctx.step(STEP_ADJUDICATE)
         budget = min(ctx.budget, ADJUDICATE_BUDGET)
-        cards = _optional(lambda: [x for text in W.adjudicate_messages(pm, budget)
-                                   for x in _a(ctx.call(P.ADJUDICATE, text, P.ADJUDICATE_SCHEMA).get("items"))],
-                          "AI 審稿", warnings)
+        cards = _optional(lambda: adjudicate_cards(ctx, pm, budget), "AI 審稿", warnings)
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
@@ -937,7 +1157,8 @@ def _translate(ctx: Ctx, payload):
 
 
 HANDLERS = {"summary": _summary, "enhance": _enhance, "notes": _notes, "notes_enhance": _notes_enhance,
-            "ask": _ask, "terms": _terms, "translate": _translate, "reprocess": _reprocess}
+            "ask": _ask, "terms": _terms, "translate": _translate, "reprocess": _reprocess,
+            "deep_correct": _deep_correct}
 
 
 # ---------------------------------------------------------------- job handling
@@ -1035,7 +1256,7 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
         handler = HANDLERS.get(action)
         if handler is None:
             raise ClaudeError(f"未知的 AI 動作：{action}")
-        if action != "reprocess":  # reprocess reports its own sub-steps right away
+        if action not in PIPELINE_ACTIONS:  # reprocess / deep_correct report their own sub-steps
             report(0, f"Claude {LABELS.get(action, '處理')}中…" if action in LABELS else "Claude 處理中…")
         apply = handler(Ctx(m, call, report, model, glossary), payload)
         if abort():
@@ -1156,8 +1377,8 @@ def build_ai_router(store: Store, get_jobs) -> APIRouter:
             raise HTTPException(404, "找不到這場會議")
         if not (isinstance(m.get("transcript"), list) and m["transcript"]):
             raise HTTPException(400, "這場沒有逐字稿，無法使用 AI 功能")
-        if action == "reprocess":  # pipeline job: status "summarizing" + aiJobId, like after transcription
-            return R.start_reprocess(store, get_jobs(), mid)
+        if action in PIPELINE_ACTIONS:  # pipeline job: status "summarizing" + aiJobId, 409 while one runs
+            return R.start_reprocess(store, get_jobs(), mid, action=action)
         return {"jobId": get_jobs().enqueue("ai", mid, payload)}
 
     return r

@@ -383,6 +383,45 @@ describe('app（整合，假 NAS）', () => {
     expect(rp.title).toBe('重新整理（不重新轉錄）');
   });
 
+  it('加強校對：校對組裡「校對」旁的次要鈕；先確認，取消不跑；確定 → runAI deep_correct → 顯示進度 → 重抓會議', async () => {
+    await go('#/m/test-1');
+    const btn = document.getElementById('deepCorrectBtn');
+    expect(btn.textContent.trim()).toBe('🔍 加強校對');
+    expect(btn.closest('[data-group="review"]')).toBeTruthy();
+    expect(btn.classList.contains('primary')).toBe(false);
+    expect(btn.parentElement).toBe(document.getElementById('reviewBtn').parentElement); // 同一列、在「校對」旁
+    const asked = [];
+    window.confirm = (msg) => (asked.push(msg), false);
+    btn.click();
+    await tick(60);
+    expect(asked).toEqual(['會逐段重新掃描整份逐字稿的錯字（約 3–5 分鐘），只新增待確認項目，不會改動已確認的內容。確定？']);
+    expect(nas.calls.filter((c) => c[0] === 'runAI')).toEqual([]);
+    window.confirm = () => true;
+    const labels = [];
+    api.waitJob.mockImplementation(async (jid, onProgress) => {
+      onProgress({ msg: '加強校對中（第 2/5 段）', pct: 30 });
+      labels.push(document.getElementById('deepCorrectBtn').textContent);
+      nas.meetings['test-1'].title = '加強校對後';
+      return { state: 'done' };
+    });
+    const gets = api.getMeeting.mock.calls.length;
+    document.getElementById('deepCorrectBtn').click();
+    await tick(200);
+    api.waitJob.mockImplementation(async () => ({ state: 'done' }));
+    expect(nas.calls).toContainEqual(['runAI', 'test-1', 'deep_correct', {}]);
+    expect(labels[0]).toContain('加強校對中（第 2/5 段）');
+    expect(api.getMeeting.mock.calls.length).toBeGreaterThan(gets);
+    expect(document.getElementById('titleInput').value).toBe('加強校對後');
+    expect(document.getElementById('deepCorrectBtn').textContent.trim()).toBe('🔍 加強校對');
+  });
+
+  it('加強校對進度頁：顯示伺服器訊息（第 i/N 段）', async () => {
+    const { progressLabel } = await import('../js/app.js');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction', action: 'deep_correct', msg: '加強校對中（第 3/12 段）' } }))
+      .toBe('摘要中・加強校對中（第 3/12 段）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'queued', action: 'deep_correct', msg: '' } })).toBe('摘要中・加強校對中');
+  });
+
   describe('錄音停止／浮動膠囊／逐字稿快速捲動軸', () => {
     let ios;
     beforeEach(() => {

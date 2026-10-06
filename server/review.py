@@ -518,8 +518,9 @@ def apply_batch(m: dict, accept, keep) -> dict:
 
 
 # ---------------------------------------------------------------- pipeline job start
-def start_reprocess(store: Store, jobs, mid: str, payload: dict | None = None, prepare=None) -> dict:
-    """Enqueue an ai "reprocess" job as the meeting's pipeline job (status "summarizing", aiJobId).
+def start_reprocess(store: Store, jobs, mid: str, payload: dict | None = None, prepare=None,
+                    action: str = "reprocess") -> dict:
+    """Enqueue an ai "reprocess" (or "deep_correct") job as the meeting's pipeline job (status "summarizing", aiJobId).
 
     prepare(m) runs first under the meeting lock (may raise HTTPException). 409 while a transcription
     or another pipeline job is active. Returns {"jobId"}.
@@ -536,10 +537,10 @@ def start_reprocess(store: Store, jobs, mid: str, payload: dict | None = None, p
             raise HTTPException(400, "這場沒有逐字稿，無法使用 AI 功能")
         if prepare:
             prepare(m)
-        jid = jobs.enqueue("ai", mid, {"action": "reprocess", **(payload or {})})
+        jid = jobs.enqueue("ai", mid, {"action": action, **(payload or {})})
         made.append(jid)
         m.update(status="summarizing", aiJobId=jid, error=None,
-                 progress={"stage": "queued", "pct": 0, "msg": "", "action": "reprocess",
+                 progress={"stage": "queued", "pct": 0, "msg": "", "action": action,
                            "engine": (m.get("progress") or {}).get("engine", "")})
     try:
         store.update(mid, apply)
