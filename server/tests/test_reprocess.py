@@ -331,11 +331,14 @@ def test_mode_endpoint(app_client, tmp_path, monkeypatch):
     r = c.post("/api/meetings/m1/mode", json={"mode": "lecture"})
     jid = r.json()["jobId"]
     m = app.state.store.get("m1")
-    assert m["mode"] == "lecture" and m["aiJobId"] == jid and m["status"] == "summarizing"
+    assert m["mode"] == "meeting" and m["aiJobId"] == jid and m["status"] == "summarizing"
+    assert app.state.jobs.get(jid)["payload"] == {"action": "reprocess", "mode": "lecture",
+                                                  "correction": False, "slips": False}
     log = tmp_path / "log.jsonl"
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
     handle_ai_job(app.state.store, app.state.jobs.claim(["ai"], "nas-ai"), FAKE, app.state.jobs)
     m = app.state.store.get("m1")
+    assert m["mode"] == "lecture"
     assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa"}
     schemas = [c_[0] for c_ in log_calls(log)]
     assert len(schemas) == 1 and "conclusions" in schemas[0]["properties"]  # no correction / slips / mode

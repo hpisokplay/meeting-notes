@@ -437,14 +437,17 @@ class Ctx:
         self.report(pct, msg + suffix, stage)
 
 
-def _optional(fn, what: str):
-    """Run an optional Claude step: retryable errors propagate, a permanent failure is skipped."""
+def _optional(fn, what: str, warnings: list | None = None):
+    """Run an optional Claude step: retryable errors propagate, a permanent failure is skipped
+    (and noted in `warnings` as 「<what>失敗，已略過：<msg>」)."""
     try:
         return fn()
     except (ClaudeLimitError, ClaudeTransientError, ClaudeAborted):
         raise
     except ClaudeError as e:
         log.warning("optional step %s skipped: %s", what, e)
+        if warnings is not None:
+            warnings.append(f"{what}失敗，已略過：{e}")
         return None
 
 
@@ -536,15 +539,31 @@ def _grounded_notes(ctx: Ctx, lines: list[str], pct=(50, 75)) -> dict:
             for k in P.NOTES_KEYS}
 
 
+def _is_ungrounded(x) -> bool:
+    """Legacy entry (plain string) or an object without sources."""
+    return isinstance(x, str) or (isinstance(x, dict) and not x.get("src"))
+
+
+def _backup_one(m: dict, area: str, k: str, old_list) -> None:
+    """alt["<area>:<k>"] = the list being replaced (the frontend's swap / merge slot). The first time
+    a list holding legacy / source-less entries is replaced, it is also kept once, never overwritten,
+    in alt["<area>:<k>:legacy"] (a second rerun must not lose the pre-grounding version)."""
+    old_list = list(_a(old_list))
+    alt = m.setdefault("alt", {})
+    alt[f"{area}:{k}"] = old_list
+    lk = f"{area}:{k}:legacy"
+    if lk not in alt and any(_is_ungrounded(x) for x in old_list):
+        alt[lk] = list(old_list)
+
+
 def _backup(m: dict, area: str, keys) -> None:
     """Old summary / notes lists -> alt["<area>:<key>"] (flat keys) before an overwrite."""
     old = m.get(area) if isinstance(m.get(area), dict) else {}
     keys = [k for k in old if isinstance(old.get(k), list)] if keys is None else keys
     if any(_a(old.get(k)) for k in keys):
-        alt = m.setdefault("alt", {})
         for k in keys:
             if isinstance(old.get(k), list):
-                alt[f"{area}:{k}"] = list(old[k])
+                _backup_one(m, area, k, old[k])
 
 
 def _reverify(m: dict, ctx: Ctx, slips=None) -> None:
@@ -582,6 +601,7 @@ def _reprocess(ctx: Ctx, payload):
     fp = _fingerprint(m0.get("transcript"))
     transcript = copy.deepcopy(m0.get("transcript") or [])
     corrections = None
+    warnings: list[str] = []
     if payload.get("correction", True):
         ctx.step(STEP_CORRECTION)
 
@@ -591,11 +611,12 @@ def _reprocess(ctx: Ctx, payload):
                 r = ctx.call(P.CORRECTION, P.correction_user_message(text, ctx.glossary), P.CORRECTION_SCHEMA)
                 got += _a(r.get("items"))
             return got
-        proposals = _optional(correct, "correction")
+        proposals = _optional(correct, "名詞校正", warnings)
         if proposals is not None:
             transcript, corrections = R.merge_corrections(m0.get("corrections"), proposals, transcript)
     lines = transcript_lines(transcript)
-    mode = m0.get("mode") if m0.get("mode") in R.MODES else None
+    mode = payload.get("mode") if payload.get("mode") in R.MODES else None  # /mode: set at the final write
+    mode = mode or (m0.get("mode") if m0.get("mode") in R.MODES else None)
     if mode is None:
         ctx.step(STEP_MODE)
         mode = _detect_mode(ctx, lines)
@@ -609,7 +630,7 @@ def _reprocess(ctx: Ctx, payload):
     if payload.get("slips", True):
         ctx.step(STEP_SLIPS)
         slips = _optional(lambda: [x for text in chunk_lines(lines, ctx.budget)
-                                   for x in _a(ctx.call(P.SLIPS, text, P.SLIPS_SCHEMA).get("items"))], "slips")
+                                   for x in _a(ctx.call(P.SLIPS, text, P.SLIPS_SCHEMA).get("items"))], "檢查口誤", warnings)
     ctx.step(STEP_VERIFY)
 
     def apply(m):
@@ -628,6 +649,10 @@ def _reprocess(ctx: Ctx, payload):
             m["notes"] = {**notes, "generatedAt": int(time.time() * 1000)}
         m["translations"] = {}
         m["error"] = None
+        if warnings:
+            m["warnings"] = warnings
+        else:
+            m.pop("warnings", None)
         _reverify(m, ctx, slips)
     return apply
 
@@ -713,7 +738,7 @@ def _enhance(ctx: Ctx, payload):
 
     def apply(m):
         box = m["summary"] if isinstance(m.get("summary"), dict) else {}
-        m.setdefault("alt", {})[f"summary:{section}"] = list(_a(box.get(section)))
+        _backup_one(m, "summary", section, box.get(section))
         box[section] = items
         m["summary"] = box
         m["translations"] = {}
@@ -746,7 +771,7 @@ def _notes_enhance(ctx: Ctx, payload):
 
     def apply(m):
         box = m["notes"] if isinstance(m.get("notes"), dict) else {k: [] for k in P.NOTES_KEYS}
-        m.setdefault("alt", {})[f"notes:{section}"] = list(_a(box.get(section)))
+        _backup_one(m, "notes", section, box.get(section))
         box[section] = items
         m["notes"] = box
         m["translations"] = {}

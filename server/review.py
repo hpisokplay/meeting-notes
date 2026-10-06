@@ -13,9 +13,9 @@ import time
 
 from fastapi import APIRouter, Body, HTTPException
 
-from .items import NOTES_LIST_KEYS, ensure_ids, item_text, normalize_src
+from .items import NOTES_LIST_KEYS, ensure_ids, item_text, normalize_src, parse_time
 from .storage import BadId, Store
-from .verify import TranscriptIndex, merge_review, review_item, verify_meeting
+from .verify import TranscriptIndex, extract_numbers, review_item, verify_meeting
 
 MODES = ("lecture", "meeting")
 MAX_TS = 5
@@ -27,6 +27,12 @@ def now_ms() -> int:
 
 
 # ---------------------------------------------------------------- corrections
+WINDOW_S = 15.0        # a correction only touches segments within ±15 s of a reported time
+MIN_CJK = 3            # shorter CJK strings are too ambiguous to replace automatically
+_CJK = re.compile(r"[㐀-鿿豈-﫿]")
+_LATIN_TOKEN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.\-]*$")
+
+
 def _term_re(wrong: str) -> re.Pattern:
     """Latin / digit edges get word boundaries (CIS must not hit CISCO); CJK is plain substring."""
     pre = r"(?<![A-Za-z0-9])" if re.match(r"[A-Za-z0-9]", wrong) else ""
@@ -34,53 +40,97 @@ def _term_re(wrong: str) -> re.Pattern:
     return re.compile(pre + re.escape(wrong) + post)
 
 
-def count_term(transcript, wrong: str) -> tuple[int, list[float]]:
-    """Occurrences of `wrong` in the transcript text and the segment times (first MAX_TS)."""
+def _num(t) -> float | None:
+    return float(t) if isinstance(t, (int, float)) and not isinstance(t, bool) else None
+
+
+def clean_ts(ts) -> list[float]:
+    out = []
+    for t in ts if isinstance(ts, list) else []:
+        t = _num(t) if not isinstance(t, str) else parse_time(t)
+        if t is not None and t not in out:
+            out.append(t)
+    return out
+
+
+def _in_window(seg, ts: list[float] | None) -> bool:
+    if not ts:
+        return True
+    t = _num(seg.get("t"))
+    return t is not None and any(abs(t - x) <= WINDOW_S for x in ts)
+
+
+def _matches(text: str, wrong: str, right: str) -> list[tuple[int, int]]:
+    """Spans of `wrong` in text, except those lying inside an existing occurrence of `right`."""
+    rx = _term_re(wrong)
+    guard = [(m.start(), m.start() + len(right)) for m in re.finditer(re.escape(right), text)] if right else []
+    return [(m.start(), m.end()) for m in rx.finditer(text)
+            if not any(a <= m.start() and m.end() <= b for a, b in guard)]
+
+
+def count_term(transcript, wrong: str, right: str = "", ts: list[float] | None = None) -> tuple[int, list[float]]:
+    """Replaceable occurrences of `wrong` (within the ts windows if given) and segment times."""
     if not wrong:
         return 0, []
-    rx = _term_re(wrong)
-    n, ts = 0, []
+    n, hit = 0, []
     for s in transcript or []:
-        if not isinstance(s, dict):
+        if not isinstance(s, dict) or not _in_window(s, ts):
             continue
-        k = len(rx.findall(str(s.get("text") or "")))
+        k = len(_matches(str(s.get("text") or ""), wrong, right))
         if k:
             n += k
-            t = s.get("t")
-            if isinstance(t, (int, float)) and not isinstance(t, bool) and len(ts) < MAX_TS:
-                ts.append(float(t))
-    return n, ts
+            t = _num(s.get("t"))
+            if t is not None and len(hit) < MAX_TS:
+                hit.append(t)
+    return n, hit
 
 
-def replace_term(transcript, wrong: str, right: str) -> tuple[list, int, list[float]]:
-    """New transcript with every `wrong` -> `right` (segment texts only), count, segment times."""
+def replace_term(transcript, wrong: str, right: str, ts: list[float] | None = None) -> tuple[list, int, list[float]]:
+    """New transcript with `wrong` -> `right` in segment texts (only within ±WINDOW_S of ts when
+    given; never inside an existing `right`), count, segment times."""
     if not wrong or wrong == right:
         return transcript, 0, []
-    rx = _term_re(wrong)
-    out, n, ts = [], 0, []
+    out, n, hit = [], 0, []
     for s in transcript or []:
-        if isinstance(s, dict) and isinstance(s.get("text"), str):
-            new, k = rx.subn(lambda _m: right, s["text"])
-            if k:
-                s = {**s, "text": new}
-                n += k
-                t = s.get("t")
-                if isinstance(t, (int, float)) and not isinstance(t, bool) and len(ts) < MAX_TS:
-                    ts.append(float(t))
+        if isinstance(s, dict) and isinstance(s.get("text"), str) and _in_window(s, ts):
+            spans = _matches(s["text"], wrong, right)
+            if spans:
+                text = s["text"]
+                for a, b in reversed(spans):
+                    text = text[:a] + right + text[b:]
+                s = {**s, "text": text}
+                n += len(spans)
+                t = _num(s.get("t"))
+                if t is not None and len(hit) < MAX_TS:
+                    hit.append(t)
         out.append(s)
-    return out, n, ts
+    return out, n, hit
 
 
-_DIGITS = re.compile(r"\d")
+def _numbers(s: str) -> list:
+    return [sorted(n["values"]) for n in extract_numbers(s)]
+
+
+def auto_apply_ok(wrong: str, right: str, ts: list[float], transcript) -> bool:
+    """Controller ruling: a high-confidence pair is applied automatically only when ALL hold."""
+    if wrong in right or right in wrong:                      # (a) no 股利 -> 股利所得 doubling
+        return False
+    if not (len(_CJK.findall(wrong)) >= MIN_CJK or _LATIN_TOKEN.match(wrong)):  # (b)
+        return False
+    if _numbers(wrong) != _numbers(right):                    # (c) never change a number
+        return False
+    if not ts:                                                # (d) needs windows
+        return False
+    n, _ = count_term(transcript, wrong, right, ts)
+    return 0 < n <= max(3, 2 * len(ts))                       # (e) bounded number of hits
 
 
 def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
-    """Fold CORRECTION output into meeting.corrections and apply the new high-confidence ones.
+    """Fold CORRECTION output into meeting.corrections and apply the safe high-confidence ones.
 
     - A (wrong, right) pair already known keeps its state (rejected stays rejected, a pending one is
       never auto-applied: a restore-raw or a user decision must not be undone by a re-run).
-    - New high -> applied to the transcript (if it occurs); new medium / low -> pending.
-    - A pair whose digits differ is never auto-applied (numbers need a human).
+    - New high passing auto_apply_ok -> applied within ±WINDOW_S of its ts; everything else pending.
     Returns (new transcript, corrections dict).
     """
     items = [dict(c) for c in (old.get("items") if isinstance(old, dict) else None) or [] if isinstance(c, dict)]
@@ -92,33 +142,33 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
         if not wrong or not right or wrong == right:
             continue
         conf = p.get("confidence") if p.get("confidence") in ("high", "medium", "low") else "low"
-        if conf == "high" and sorted(_DIGITS.findall(wrong)) != sorted(_DIGITS.findall(right)):
-            conf = "medium"
+        ts = clean_ts(p.get("ts"))
         o = by_key.get((wrong, right))
         if o is not None:
             if o.get("state") == "pending":
-                n, ts = count_term(transcript, wrong)
+                n, _ = count_term(transcript, wrong, right)
                 if n:
-                    o.update(count=n, ts=ts)
+                    o["count"] = n
             continue
-        if conf == "high":
-            new, n, ts = replace_term(transcript, wrong, right)
-            if not n:
-                continue
-            transcript = new
-            c = {"wrong": wrong, "right": right, "confidence": conf, "count": n, "ts": ts, "state": "applied"}
+        if conf == "high" and auto_apply_ok(wrong, right, ts, transcript):
+            transcript, n, hit = replace_term(transcript, wrong, right, ts)
+            c = {"wrong": wrong, "right": right, "confidence": conf, "count": n, "ts": hit, "state": "applied"}
         else:
-            n, ts = count_term(transcript, wrong)
+            n, hit = count_term(transcript, wrong, right)
             if not n:
                 continue
-            c = {"wrong": wrong, "right": right, "confidence": conf, "count": n, "ts": ts, "state": "pending"}
+            c = {"wrong": wrong, "right": right, "confidence": conf, "count": n, "ts": ts or hit,
+                 "state": "pending"}
+            if conf == "high":
+                c["demoted"] = True  # model said high, the safety rules said "ask a human"
         reason = str(p.get("reason") or "").strip()
         if reason:
             c["reason"] = reason
         items.append(c)
         by_key[(wrong, right)] = c
     # pending pairs that no longer occur (e.g. fixed by hand) are dropped; history of the rest kept
-    items = [c for c in items if c.get("state") != "pending" or count_term(transcript, c.get("wrong") or "")[0]]
+    items = [c for c in items if c.get("state") != "pending"
+             or count_term(transcript, c.get("wrong") or "", c.get("right") or "")[0]]
     return transcript, {"items": items, "at": now_ms()}
 
 
@@ -156,23 +206,13 @@ def verify_review(m: dict, glossary, extra: list | None = None, *, replace_slips
     """meeting.review after program verification (states of handled items carried over).
 
     replace_slips: the slip list is being regenerated (`extra`), so old slip items are not carried.
-    A regenerated item for an entry the user already edited (same kind/section/itemId and the item
-    text equals what the user wrote) stays "edited" instead of coming back as pending.
+    verify_meeting does the state merge (by id, and by kind/section/itemId for confirmed/edited).
     """
     prev = m.get("review") if isinstance(m.get("review"), dict) else {}
     prev_items = [r for r in prev.get("items") or [] if isinstance(r, dict)]
     if not replace_slips:  # keep the current slip list: hand it back as `extra`
         extra = [r for r in prev_items if r.get("kind") == "slip"] + list(extra or [])
-    items = verify_meeting(m, glossary, extra=list(extra or []))
-    items = merge_review(prev_items, items)
-    edited = {(r.get("kind"), r.get("section"), r.get("itemId")): r.get("editedText")
-              for r in prev_items if r.get("state") == "edited" and r.get("itemId")}
-    for r in items:
-        if r.get("state") == "pending" and r.get("itemId"):
-            et = edited.get((r.get("kind"), r.get("section"), r.get("itemId")))
-            if et is not None and et == r.get("text"):
-                r["state"] = "edited"
-    return {"items": items, "at": now_ms()}
+    return {"items": verify_meeting(m, glossary, extra=list(extra or [])), "at": now_ms()}
 
 
 def slip_items(raw: list, tx: TranscriptIndex) -> list[dict]:
@@ -264,14 +304,17 @@ def _apply_term(m: dict, wrong: str, right: str) -> None:
     """Apply wrong -> right to the transcript (raw saved first) and record it as applied."""
     if not (isinstance(m.get("transcriptRaw"), list) and m["transcriptRaw"]):
         m["transcriptRaw"] = copy.deepcopy(m.get("transcript") or [])
-    m["transcript"], n, ts = replace_term(m.get("transcript") or [], wrong, right)
     corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {"items": []}
     items = [c for c in corr.get("items") or [] if isinstance(c, dict)]
-    hit = next((c for c in items if c.get("wrong") == wrong and c.get("state") == "pending"), None)
-    if hit is None:
-        hit = {"wrong": wrong, "confidence": "medium"}
-        items.append(hit)
-    hit.update(right=right, state="applied", count=n, ts=ts or hit.get("ts") or [])
+    pend = [c for c in items if c.get("wrong") == wrong and c.get("state") == "pending"]
+    # same ±WINDOW_S windows as the automatic path when the pairs carry times; else everywhere
+    ts = sorted({t for c in pend for t in clean_ts(c.get("ts"))}) or None
+    m["transcript"], n, hit_ts = replace_term(m.get("transcript") or [], wrong, right, ts)
+    if not pend:
+        pend = [{"wrong": wrong, "confidence": "medium"}]
+        items.append(pend[0])
+    for c in pend:  # every pending pair with this wrong is settled by the user's choice
+        c.update(right=right, state="applied", count=n, ts=hit_ts or c.get("ts") or [])
     m["corrections"] = {"items": items, "at": now_ms()}
     m["translations"] = {}
 
@@ -391,8 +434,13 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
         if action == "edit" and (not isinstance(text, str) or not text.strip()):
             raise HTTPException(400, "請輸入改正後的內容")
         text = text.strip() if isinstance(text, str) else None
+        def apply(m):
+            cur = get_jobs().read(m.get("aiJobId")) if m.get("aiJobId") else None
+            if m.get("status") == "summarizing" and cur and cur.get("state") in ACTIVE_JOB_STATES:
+                raise HTTPException(409, "整理中，請稍後再確認")
+            review_action(m, rid, action, text)
         try:
-            return store.update(mid, lambda m: review_action(m, rid, action, text))
+            return store.update(mid, apply)
         except BadId:
             raise HTTPException(400, "會議 id 不合法")
         except KeyError as e:
@@ -406,8 +454,8 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
         if mode not in MODES:
             raise HTTPException(400, "模式只能是講座或會議")
         # transcript unchanged: no new correction / slip pass, only summary (+ notes) and verify
-        return start_reprocess(store, get_jobs(), mid, {"correction": False, "slips": False},
-                               prepare=lambda m: m.update(mode=mode))
+        # meeting.mode changes only when the job's final write succeeds (a failed run keeps the old one)
+        return start_reprocess(store, get_jobs(), mid, {"mode": mode, "correction": False, "slips": False})
 
     @r.post("/meetings/{mid}/restore-raw")
     def restore_raw(mid: str):
@@ -421,8 +469,12 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
                 for c in corr.get("items") or []:
                     if isinstance(c, dict):
                         c["state"] = "pending"
-                        c["count"], c["ts"] = count_term(raw, str(c.get("wrong") or ""))
+                        n, occ = count_term(raw, str(c.get("wrong") or ""), str(c.get("right") or ""))
+                        c["count"], c["ts"] = n, clean_ts(c.get("ts")) or occ
                 corr["at"] = now_ms()
+            rv = m.get("review") if isinstance(m.get("review"), dict) else None
+            if rv:  # term items are rebuilt (pending) from the reset corrections by the next verify
+                rv["items"] = [x for x in rv.get("items") or [] if not (isinstance(x, dict) and x.get("kind") == "term")]
             m["translations"] = {}
         # no automatic correction afterwards: every correction is now a pending review item
         return start_reprocess(store, get_jobs(), mid, {"correction": False}, prepare=prepare)

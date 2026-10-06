@@ -85,6 +85,9 @@ def meeting_to_markdown(m: dict) -> str:
     secs, qa = _sections(m)
     out = [f"# {m.get('title') or '未命名會議'}", "", f"日期：{_date(m)}（台北）",
            f"分類：{_group_name(m)}", f"長度：{_fmt_dur(m.get('durationSec'))}", ""]
+    warns = [w for w in m.get("warnings") or [] if isinstance(w, str) and w]
+    if warns:
+        out += [f"> ⚠️ {w}" for w in warns] + [""]
     for title, xs in secs:
         out += [f"## {title}", *[f"- {x}" for x in xs], ""]
     out += ["## Q&A"]
@@ -103,6 +106,9 @@ def meeting_to_docx(m: dict, path: Path) -> None:
     d.add_paragraph(f"日期：{_date(m)}（台北）")
     d.add_paragraph(_x(f"分類：{_group_name(m)}"))
     d.add_paragraph(f"長度：{_fmt_dur(m.get('durationSec'))}")
+    for w in m.get("warnings") or []:
+        if isinstance(w, str) and w:
+            d.add_paragraph(_x(f"⚠️ {w}"))
     for title, xs in secs:
         d.add_heading(title, 1)
         for x in xs:
