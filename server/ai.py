@@ -66,9 +66,9 @@ ABORT_CHECK_S = 1.0              # poll interval while claude runs
 HEARTBEAT_S = 30.0               # job heartbeat while claude runs (requeue_stale is 10 min)
 
 ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess", "deep_correct",
-           "filter_pending"}
+           "filter_pending", "recheck_names"}
 # status "summarizing" + aiJobId (409 while one runs); they report their own steps
-PIPELINE_ACTIONS = ("reprocess", "deep_correct", "filter_pending")
+PIPELINE_ACTIONS = ("reprocess", "deep_correct", "filter_pending", "recheck_names")
 LABELS = {"summary": "摘要", "notes": "學習筆記", "ask": "回答問題", "terms": "挑專有名詞",
           "translate": "翻譯"}
 DEFAULT_MODEL = "opus"
@@ -302,7 +302,8 @@ def merge_window_proposals(per_window: list, wins: list[tuple[int, int]], segs: 
             wrong, right = str(p.get("wrong") or "").strip(), str(p.get("right") or "").strip()
             if wrong and right and wrong != right:
                 conf = p.get("confidence") if p.get("confidence") in _CONF_RANK else "low"
-                raw.append((a, b, wrong, right, conf, str(p.get("reason") or "").strip()))
+                pub = str(p.get("identity") or "").strip() or "?" if p.get("publicFigure") is True else ""
+                raw.append((a, b, wrong, right, conf, str(p.get("reason") or "").strip(), pub))
     rights = Counter(x[3] for x in raw)
 
     def canon(r: str) -> str:
@@ -311,7 +312,7 @@ def merge_window_proposals(per_window: list, wins: list[tuple[int, int]], segs: 
             return g
         return max([r] + [r2 for r2 in rights if _variant_of(r, r2)], key=lambda x: (rights[x], x == r))
     acc: dict[tuple, dict] = {}
-    for a, b, wrong, right, conf, reason in raw:
+    for a, b, wrong, right, conf, reason, pub in raw:
         right = canon(right)
         if right == wrong:
             continue
@@ -321,9 +322,11 @@ def merge_window_proposals(per_window: list, wins: list[tuple[int, int]], segs: 
         e = acc.get((wrong, right))
         if e is None:
             e = acc[(wrong, right)] = {"wrong": wrong, "right": right, "confidence": conf, "reason": reason,
-                                       "ts": set(), "votes": set(), "order": len(acc)}
+                                       "ts": set(), "votes": set(), "order": len(acc), "pub": pub}
         elif _CONF_RANK[conf] > _CONF_RANK[e["confidence"]]:
             e["confidence"], e["reason"] = conf, reason or e["reason"]
+        if pub and e["pub"] in ("", "?"):
+            e["pub"] = pub
         e["votes"].add(a)
         e["ts"].update(float(s["t"]) for s in hits if isinstance(s.get("t"), (int, float))
                        and not isinstance(s.get("t"), bool))
@@ -332,9 +335,14 @@ def merge_window_proposals(per_window: list, wins: list[tuple[int, int]], segs: 
     for e in acc.values():
         if e["wrong"] not in best or rank(e) > rank(best[e["wrong"]]):
             best[e["wrong"]] = e
-    return [{"wrong": e["wrong"], "right": e["right"], "confidence": e["confidence"], "reason": e["reason"],
+    out = []
+    for e in sorted(best.values(), key=lambda e: (min(e["ts"], default=float("inf")), e["order"])):
+        p = {"wrong": e["wrong"], "right": e["right"], "confidence": e["confidence"], "reason": e["reason"],
              "ts": sorted(e["ts"])[:CORRECTION_MAX_TS]}
-            for e in sorted(best.values(), key=lambda e: (min(e["ts"], default=float("inf")), e["order"]))]
+        if e["pub"]:  # a public-figure name: always a pending row (merge_corrections never applies it)
+            R.mark_public(p, e["right"], "" if e["pub"] == "?" else e["pub"])
+        out.append(p)
+    return out
 
 
 def _keywords(q: str) -> set[str]:
@@ -742,10 +750,12 @@ def candidate_contexts(transcript, wrong: str, right: str = "", limit: int = VER
     return out
 
 
-def verify_candidates(ctx: Ctx, cands: list[dict], transcript, pct=(14, 15), stage: str = "correction") -> dict:
+def verify_candidates(ctx: Ctx, cands: list[dict], transcript, pct=(14, 15), stage: str = "correction",
+                      public: dict | None = None) -> dict:
     """VERIFY_CANDIDATES (strict second opinion) over cands [{wrong, right, confidence, reason, contexts?}]:
     VERIFY_BATCH per call, VERIFY_CONCURRENCY calls at a time, progress 「AI 複核可能錯字中（i/N 批）」.
     Returns {(wrong, right): (decision, reason)}; a candidate the AI did not answer is "unsure".
+    public (dict, filled in): {(wrong, right): (publicFigure True / False / None = not said, identity)}.
     Claude errors propagate (the caller decides: optional step or job failure)."""
     uniq: dict[tuple, dict] = {}
     for c in cands:
@@ -772,7 +782,8 @@ def verify_candidates(ctx: Ctx, cands: list[dict], transcript, pct=(14, 15), sta
             if cx is None:
                 cx = candidate_contexts(transcript, key[0], key[1])
             rows.append({"id": cid, "wrong": key[0], "right": key[1], "confidence": c.get("confidence"),
-                         "reason": str(c.get("reason") or "").strip(), "contexts": cx})
+                         "reason": str(c.get("reason") or "").strip(), "contexts": cx,
+                         "publicFigure": c.get("publicFigure") is True, "identity": c.get("identity") or ""})
         r = ctx.call(P.VERIFY_CANDIDATES, P.verify_candidates_user_message(rows, ctx.glossary),
                      P.VERIFY_CANDIDATES_SCHEMA)
         got = {}
@@ -784,6 +795,10 @@ def verify_candidates(ctx: Ctx, cands: list[dict], transcript, pct=(14, 15), sta
                 continue
             d = x.get("decision") if x.get("decision") in ("confirm", "reject", "unsure") else "unsure"
             got[key] = (d, re.sub(r"\s+", " ", str(x.get("reason") or "")).strip()[:200])
+            if public is not None:
+                pf = x.get("publicFigure") if isinstance(x.get("publicFigure"), bool) else None
+                with lock:
+                    public[key] = (pf, re.sub(r"\s+", " ", str(x.get("identity") or "")).strip()[:40])
         return {key: got.get(key, ("unsure", "")) for key in batch}
     out: dict = {}
     futs: list = []
@@ -801,13 +816,34 @@ def verify_candidates(ctx: Ctx, cands: list[dict], transcript, pct=(14, 15), sta
     return out
 
 
-def _filtered(proposals: list[dict], verdicts: dict) -> tuple[list[dict], list[dict], set]:
+def public_verdict(d: str, was_public: bool, said) -> tuple[str, bool]:
+    """Public-figure rule over one AI filter verdict -> (decision, public?). said = (publicFigure, identity)
+    from the AI (publicFigure None = not said). The AI calling it a public figure makes it one (confirm /
+    unsure only); a public-figure candidate is rejected only when the AI says it is NOT that person
+    (publicFigure false): a reject for lack of corroboration becomes unsure (kept for the human)."""
+    pf = said[0] if said else None
+    if d == "reject":
+        if was_public and pf is not False:
+            return "unsure", True
+        return "reject", False
+    return d, pf is True or (was_public and pf is not False)
+
+
+def _filtered(proposals: list[dict], verdicts: dict, public: dict | None = None) -> tuple[list[dict], list[dict], set]:
     """Split proposals by the AI filter's verdicts -> (kept, rejected, unsure keys). confirm: unchanged;
-    unsure: kept with confidence low; reject: out (with filterReason). Unjudged proposals: unchanged."""
+    unsure: kept with confidence low; reject: out (with filterReason). Unjudged proposals: unchanged.
+    public: the AI's public-figure answers (verify_candidates) -> public_verdict."""
     kept, rejected, unsure = [], [], set()
     for p in proposals:
         key = (p.get("wrong"), p.get("right"))
         d, why = verdicts.get(key, ("confirm", ""))
+        if key in verdicts:
+            said = (public or {}).get(key)
+            d, pub = public_verdict(d, R.is_public(p), said)
+            if pub:
+                p = R.mark_public(dict(p), key[1], (said[1] if said and said[1] else p.get("identity")) or "")
+            elif R.is_public(p):
+                p = {k: v for k, v in p.items() if k not in ("publicFigure", "identity")}
         if d == "reject":
             rejected.append({**p, "filterReason": why})
         elif d == "unsure":
@@ -825,10 +861,13 @@ def filter_proposals(ctx: Ctx, proposals: list[dict], transcript, old_correction
     old = old_corrections.get("items") if isinstance(old_corrections, dict) else None
     settled = {(c.get("wrong"), c.get("right")) for c in old or [] if isinstance(c, dict)
                and c.get("state") != "pending"}
+    proposals = [{**p, "confidence": R.cap_public(p.get("confidence"))} if R.is_public(p) else p for p in proposals]
     todo = [p for p in proposals if p.get("confidence") != "high" and (p["wrong"], p["right"]) not in settled]
     if not todo:
         return list(proposals), [], set()
-    return _filtered(proposals, verify_candidates(ctx, todo, transcript, pct, stage))
+    public: dict = {}
+    verdicts = verify_candidates(ctx, todo, transcript, pct, stage, public=public)
+    return _filtered(proposals, verdicts, public)
 
 
 def _cap_unsure(cards: list, pm: dict, unsure: set) -> list:
@@ -858,8 +897,10 @@ def pending_filter_candidates(m: dict) -> dict:
             if isinstance(c, dict) and c.get("state") == "pending"}
     out: dict[tuple, dict] = {}
 
-    def add(key, conf, card=None, flag=None):
+    def add(key, conf, card=None, flag=None, row=None):
         e = out.setdefault(key, {"wrong": key[0], "right": key[1], "confidence": conf, "cards": [], "flags": []})
+        if R.is_public(row) and not e.get("publicFigure"):
+            e.update(publicFigure=True, identity=row.get("identity") or "")
         if _CONF_RANK.get(conf, 1) < _CONF_RANK.get(e["confidence"], 1):
             e["confidence"] = conf
         if card:
@@ -873,11 +914,11 @@ def pending_filter_candidates(m: dict) -> dict:
             if (r.get("action") == "replace" and r.get("origin") != "leftover" and r.get("suggestion")
                     and r.get("confidence") in ("medium", "low")
                     and any(isinstance(t, dict) and t.get("where") == "transcript" for t in r.get("targets") or [])):
-                add((r["span"], r["suggestion"]), r["confidence"], card=r["id"])
+                add((r["span"], r["suggestion"]), r["confidence"], card=r["id"], row=r)
         elif r.get("kind") == "term" and r.get("text") and r.get("suggestion"):
             c = pend.get((r["text"], r["suggestion"]))
             if c is not None and c.get("confidence") in ("medium", "low"):
-                add((r["text"], r["suggestion"]), c["confidence"], flag=r["id"])
+                add((r["text"], r["suggestion"]), c["confidence"], flag=r["id"], row=c)
     return out
 
 
@@ -1077,6 +1118,21 @@ def _unsure_row(m: dict, e: dict) -> None:
             c["confidence"] = "low"
 
 
+def _public_row(m: dict, e: dict, identity: str) -> None:
+    """Candidate e (pending_filter_candidates entry) is a public-figure name: its pending cards and the
+    pending correction behind it become public-figure rows (confidence <= medium, fixed reason)."""
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    for r in review.get("items") or []:
+        if W.is_card(r) and r.get("id") in e["cards"] and r.get("state") == "pending":
+            R.mark_public(r, e["right"], identity)
+            r["detail"] = r["reason"]
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
+    for c in corr.get("items") or []:
+        if (isinstance(c, dict) and c.get("state") == "pending"
+                and (c.get("wrong"), c.get("right")) == (e["wrong"], e["right"])):
+            R.mark_public(c, e["right"], identity)
+
+
 def _filter_pending(ctx: Ctx, payload):
     """「AI 再篩一次」 on a meeting's current checklist: VERIFY_CANDIDATES over the pending medium / low rows
     about the transcript (pending_filter_candidates). reject -> rejected (resolvedBy "ai-filter", reason
@@ -1086,7 +1142,8 @@ def _filter_pending(ctx: Ctx, payload):
     fp = _fingerprint(m0.get("transcript"))
     cands = list(pending_filter_candidates(m0).values())
     ctx.report(2, f"{VERIFY_MSG}（共 {len(cands)} 項）", "correction")
-    verdicts = verify_candidates(ctx, cands, m0.get("transcript"), (5, 95)) if cands else {}
+    public: dict = {}
+    verdicts = verify_candidates(ctx, cands, m0.get("transcript"), (5, 95), public=public) if cands else {}
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
@@ -1097,6 +1154,10 @@ def _filter_pending(ctx: Ctx, payload):
             e = now.get(key)
             if e is None:
                 continue
+            d, pub = public_verdict(d, e.get("publicFigure") is True, public.get(key))
+            if pub:
+                said = public.get(key)
+                _public_row(m, e, (said[1] if said and said[1] else e.get("identity")) or "")
             if d == "reject":
                 _reject_row(m, e, why)
                 stats["rejected"] += 1
@@ -1108,6 +1169,135 @@ def _filter_pending(ctx: Ctx, payload):
         _reverify(m, ctx)
         m["aiFilter"] = {**stats, "at": int(time.time() * 1000)}
         log.info("filter_pending %s: %s", m.get("id"), stats)
+    return apply
+
+
+# ---------------------------------------------------------------- public-figure recheck (user decision 2026-10-07)
+RECHECK_MSG = "AI 重新檢查被否決的人名中"
+
+
+def _term_flag_id(wrong: str, right: str) -> str:
+    from .items import hash8
+    return hash8(f"term|transcript||{wrong}|{right}")
+
+
+def rejected_name_candidates(m: dict) -> dict:
+    """Name-like corrections / cards the AI filter rejected (resolvedBy "ai-filter") that still occur in the
+    transcript -> {(wrong, right): {"wrong", "right", "confidence", "reason", "corr": bool, "cards": [ids]}}.
+    Rows the user handled are never among them."""
+    out: dict[tuple, dict] = {}
+    tx = m.get("transcript")
+
+    def add(wrong, right, conf, reason):
+        if not (wrong and right and wrong != right and W.name_like_pair(wrong, right)):
+            return None
+        e = out.get((wrong, right))
+        if e is None:
+            if not R.count_term(tx, wrong, right)[0]:
+                return None
+            e = out[(wrong, right)] = {"wrong": wrong, "right": right, "confidence": conf or "medium",
+                                       "reason": reason or "", "corr": False, "cards": []}
+        return e
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else {}
+    for c in corr.get("items") or []:
+        if isinstance(c, dict) and c.get("state") == "rejected" and c.get("resolvedBy") == R.FILTER_BY:
+            e = add(str(c.get("wrong") or ""), str(c.get("right") or ""), c.get("confidence"), c.get("reason"))
+            if e is not None:
+                e["corr"] = True
+    review = m.get("review") if isinstance(m.get("review"), dict) else {}
+    for r in review.get("items") or []:
+        if (W.is_card(r) and r.get("state") == "rejected" and r.get("resolvedBy") == R.FILTER_BY
+                and r.get("action") == "replace" and r.get("suggestion")):
+            e = add(r["span"], str(r["suggestion"]), r.get("confidence"), "")
+            if e is not None:
+                e["cards"].append(r["id"])
+    return out
+
+
+def _revive_public(m: dict, e: dict, identity: str) -> str | None:
+    """Rejected candidate e (rejected_name_candidates) -> pending public-figure row: the correction goes
+    back to pending, the rejected cards come back (pending, medium, fixed reason) or a new card is added;
+    the term flag is merged into the card. -> card id, or None when nothing could be revived."""
+    wrong, right = e["wrong"], e["right"]
+    tx = m.get("transcript")
+    corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else None
+    hit = False
+    for c in (corr or {}).get("items") or []:
+        if (isinstance(c, dict) and (c.get("wrong"), c.get("right")) == (wrong, right)
+                and c.get("state") == "rejected" and c.get("resolvedBy") == R.FILTER_BY):
+            n, ts = R.count_term(tx, wrong, right)
+            for k in ("resolvedBy", "filterReason", "decidedAt", "demoted"):
+                c.pop(k, None)
+            c.update(state="pending", confidence="medium", count=n, ts=R.clean_ts(c.get("ts")) or ts,
+                     revivedAt=R.now_ms())
+            R.mark_public(c, right, identity)
+            hit = True
+    if corr is not None and hit:
+        corr["at"] = R.now_ms()
+    review = m.get("review") if isinstance(m.get("review"), dict) else {"items": []}
+    items = [r for r in review.get("items") or [] if isinstance(r, dict)]
+    card = None
+    for r in items:
+        if W.is_card(r) and r.get("id") in e["cards"] and r.get("state") == "rejected" and r.get("resolvedBy") == R.FILTER_BY:
+            for k in ("resolvedBy", "resolution", "filterReason", "decidedAt", "keepReason"):
+                r.pop(k, None)
+            r.update(state="pending", confidence="medium", revivedAt=R.now_ms())
+            R.mark_public(r, right, identity)
+            r["detail"] = r["reason"]
+            card = card or r
+    m["review"] = {**review, "items": items, "at": R.now_ms()}
+    return card["id"] if card else ("" if hit else None)
+
+
+def _recheck_names(ctx: Ctx, payload):
+    """「重新檢查人名」: corrections / cards the AI filter rejected that look like person names are judged
+    again by VERIFY_CANDIDATES under the public-figure rule. The AI says it is a well-known public figure
+    (confirm / unsure + publicFigure true) -> pending public-figure row (medium at most, never auto-applied,
+    never in 全部照建議); anything else stays rejected. Ordinary names keep the strict rule."""
+    m0 = ctx.m
+    fp = _fingerprint(m0.get("transcript"))
+    cands = list(rejected_name_candidates(m0).values())
+    ctx.report(2, f"{RECHECK_MSG}（共 {len(cands)} 項）", "correction")
+    public: dict = {}
+    verdicts = verify_candidates(ctx, cands, m0.get("transcript"), (5, 95), public=public) if cands else {}
+
+    def apply(m):
+        if _fingerprint(m.get("transcript")) != fp:
+            raise ClaudeError("逐字稿在 AI 重新檢查期間被修改，請再試一次")
+        now = rejected_name_candidates(m)  # only rows still rejected by the filter now
+        revived, flags = [], {}
+        for key, (d, _why) in verdicts.items():
+            e = now.get(key)
+            said = public.get(key)
+            if e is None or d == "reject" or not said or said[0] is not True:
+                continue
+            cid = _revive_public(m, e, said[1])
+            if cid is None:
+                continue
+            revived.append({"wrong": key[0], "right": key[1], "identity": said[1]})
+            flags[key] = (cid, said[1])
+        _reverify(m, ctx)
+        review = m.get("review") if isinstance(m.get("review"), dict) else {"items": []}
+        by_id = {r.get("id"): r for r in review.get("items") or [] if isinstance(r, dict)}
+        add = []
+        for (wrong, right), (cid, ident) in flags.items():
+            fid = _term_flag_id(wrong, right)
+            fl = by_id.get(fid)
+            if cid and cid in by_id:
+                if isinstance(fl, dict) and fl.get("state") == "pending":
+                    fl["state"], fl["mergedInto"] = W.MERGED, cid
+                    card = by_id[cid]
+                    card["fromFlags"] = list(card.get("fromFlags") or []) + [fid]
+            else:
+                add.append({"span": wrong, "action": "replace", "suggestion": right, "reason": "",
+                            "confidence": "medium", "itemIds": [], "fromFlags": [fid] if fl else [],
+                            "publicFigure": True, "identity": ident})
+        if add:
+            W.add_ai_cards(m, add)
+        stats = {"candidates": len(cands), "revived": len(revived), "items": revived,
+                 "at": int(time.time() * 1000)}
+        m["nameRecheck"] = stats
+        log.info("recheck_names %s: %d candidates, %d revived", m.get("id"), len(cands), len(revived))
     return apply
 
 
@@ -1471,7 +1661,7 @@ def _translate(ctx: Ctx, payload):
 
 HANDLERS = {"summary": _summary, "enhance": _enhance, "notes": _notes, "notes_enhance": _notes_enhance,
             "ask": _ask, "terms": _terms, "translate": _translate, "reprocess": _reprocess,
-            "deep_correct": _deep_correct, "filter_pending": _filter_pending}
+            "deep_correct": _deep_correct, "filter_pending": _filter_pending, "recheck_names": _recheck_names}
 
 
 # ---------------------------------------------------------------- job handling

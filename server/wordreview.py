@@ -147,7 +147,7 @@ def migrate_cards(m: dict) -> bool:
     for r in (review or {}).get("items") or []:
         if not is_card(r):
             continue
-        if r.get("action") == "keep" and r.get("state") in OPEN_STATES:
+        if r.get("action") == "keep" and r.get("state") in OPEN_STATES and r.get("publicFigure") is not True:
             auto_keep(r)
             changed = True
         if r.get("from") is None or r.get("to") is None:
@@ -323,9 +323,7 @@ def normalize_cards(raw, m: dict, flags: dict) -> list[dict]:
     suggestion becomes keep (low); a delete whose span is only in the transcript becomes keep (low);
     same (span, action, suggestion) -> one card (flags merged, best reason kept)."""
     out: dict[tuple, dict] = {}
-    for x in raw if isinstance(raw, list) else []:
-        if not isinstance(x, dict):
-            continue
+    for x in _public_cards(raw, flags):
         span = str(x.get("span") or "").strip()
         action = x.get("action")
         if not span or action not in CARD_ACTIONS:
@@ -349,8 +347,14 @@ def normalize_cards(raw, m: dict, flags: dict) -> list[dict]:
         if not tg:
             continue
         key = (span, action, sug)
+        pf = x.get("publicFigure") is True and action == "replace"
+        if pf:
+            conf = "medium" if conf == "high" else conf
         if key in out:
             c = out[key]
+            if pf and not c.get("publicFigure"):
+                c.update(publicFigure=True, identity=x.get("identity") or "")
+                c["confidence"] = "medium" if c["confidence"] == "high" else c["confidence"]
             c["fromFlags"] += [f for f in ff if f not in c["fromFlags"]]
             if _RANK[conf] > _RANK[c["confidence"]]:
                 c["confidence"], c["reason"] = conf, reason or c["reason"]
@@ -359,14 +363,59 @@ def normalize_cards(raw, m: dict, flags: dict) -> list[dict]:
             continue
         out[key] = {"span": span, "action": action, "suggestion": sug, "reason": reason,
                     "confidence": conf, "fromFlags": ff, "tg": tg}
+        if pf:
+            out[key].update(publicFigure=True, identity=x.get("identity") or "")
     cards = []
     for c in out.values():
         kinds = sorted({flags[f].get("kind") for f in c["fromFlags"] if flags[f].get("kind")})
         card = make_card(m, c["span"], c["action"], c["suggestion"], c["reason"], c["confidence"],
                          c["fromFlags"], kinds or ["ai"], tg=c["tg"])
+        if c.get("publicFigure"):
+            from .review import mark_public
+            mark_public(card, _public_right(c, flags), c.get("identity"))
         card["detail"] = card["reason"]
         cards.append(card)
     return cards
+
+
+def _public_right(c: dict, flags: dict) -> str:
+    """The corrected name shown in a public-figure reason: the term flag's suggestion, else the card's."""
+    for f in c.get("fromFlags") or []:
+        fl = flags.get(f) or {}
+        if fl.get("publicFigure") is True and fl.get("suggestion"):
+            return str(fl["suggestion"])
+    return c.get("suggestion") or ""
+
+
+def _public_cards(raw, flags: dict) -> list[dict]:
+    """Adjudicate output with the public-figure rule enforced: a card answering a public-figure term flag
+    is a public-figure replace card (an AI "keep" on it would hide it: it becomes the flag's wrong -> right
+    replace instead, for the human to decide); identity comes from the flag when the AI left it out."""
+    out = []
+    for x in raw if isinstance(raw, list) else []:
+        if not isinstance(x, dict):
+            continue
+        pubs = [flags[f] for f in x.get("fromFlags") or [] if isinstance(f, str) and f in flags
+                and flags[f].get("kind") == "term" and flags[f].get("publicFigure") is True]
+        if not pubs:
+            out.append(x)
+            continue
+        fl = pubs[0]
+        ident = str(x.get("identity") or "").strip() or str(fl.get("identity") or "")
+        if x.get("action") == "replace" and str(x.get("suggestion") or "").strip():
+            out.append({**x, "publicFigure": True, "identity": ident})
+            continue
+        mine = [f for f in x.get("fromFlags") or [] if f in flags and flags[f].get("publicFigure") is True]
+        rest = [f for f in x.get("fromFlags") or [] if f not in mine]
+        if rest:
+            out.append({**x, "fromFlags": rest})
+        for f in mine:
+            t = flags[f]
+            if t.get("text") and t.get("suggestion"):
+                out.append({"span": t["text"], "action": "replace", "suggestion": t["suggestion"], "reason": "",
+                            "confidence": "medium", "itemIds": [], "fromFlags": [f], "publicFigure": True,
+                            "identity": str(x.get("identity") or "").strip() or str(t.get("identity") or "")})
+    return out
 
 
 def leftover_cards(m: dict) -> list[dict]:
@@ -429,7 +478,7 @@ def finalize_review(m: dict, items: list[dict], prev: list[dict] | None = None) 
     for r in out:
         if is_card(r):
             set_pair(r)
-            if r.get("action") == "keep" and r.get("state") in OPEN_STATES:
+            if r.get("action") == "keep" and r.get("state") in OPEN_STATES and r.get("publicFigure") is not True:
                 auto_keep(r)  # "not an error": the AI settles it, it never reaches the checklist
                 continue
             if r.get("state") in OPEN_STATES and r.get("origin") != "leftover":
@@ -544,9 +593,25 @@ def looks_like_name(s: str) -> bool:
     return 2 <= len(s) <= 4 and all("一" <= c <= "鿿" for c in s) and s[0] in _NAME_SURNAMES
 
 
+def name_core(s: str) -> str:
+    """s without a trailing title (餘萬如委員 -> 餘萬如, 張前生董事長 -> 張前生)."""
+    s = str(s or "").strip()
+    for t in sorted(_TITLES, key=len, reverse=True):
+        if s.endswith(t) and len(s) - len(t) >= 2:
+            return s[:-len(t)]
+    return s
+
+
+def name_like_pair(wrong: str, right: str) -> bool:
+    """A correction that looks like a person-name fix: wrong or right (title stripped) is name-like."""
+    return looks_like_name(name_core(wrong)) or looks_like_name(name_core(right))
+
+
 def accept_high_eligible(r) -> bool:
-    """Pending card, high confidence, no program 'name' flag behind it, span / suggestion not name-like."""
+    """Pending card, high confidence, no program 'name' flag behind it, span / suggestion not name-like,
+    never a public-figure name correction (general knowledge: always the human's call)."""
     return (is_card(r) and r.get("state") == "pending" and r.get("confidence") == "high"
+            and r.get("publicFigure") is not True
             and "name" not in (r.get("sources") or [])
             and not looks_like_name(r.get("span")) and not looks_like_name(r.get("suggestion")))
 

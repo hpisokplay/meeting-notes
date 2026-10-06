@@ -627,11 +627,17 @@ def term_items(corrections) -> list[dict]:
         conf = {"high": "高", "medium": "中", "low": "低"}.get(c.get("confidence"), "未知")
         ts = [t for t in (parse_time(x) for x in c.get("ts") or []) if t is not None]
         cnt = c.get("count")
+        public = c.get("publicFigure") is True
+        who = str(c.get("identity") or "").strip() or "身分請查證"
         detail = (f"語音辨識可能聽錯：「{wrong}」→「{right}」（信心：{conf}"
                   + (f"，出現 {cnt} 次" if isinstance(cnt, int) else "")
-                  + (f"，例如 {_hms(ts[0])}" if ts else "") + "）。確認或改正後會套用到逐字稿。")
+                  + (f"，例如 {_hms(ts[0])}" if ts else "") + "）。"
+                  + (f"公眾人物（{who}），正確寫法依常識、逐字稿沒有，請人工確認。" if public else "")
+                  + "確認或改正後會套用到逐字稿。")
         r = review_item("term", "transcript", None, wrong, detail, suggestion=right, t=ts[0] if ts else None)
         r["id"] = hash8(f"term|transcript||{wrong}|{right}")  # same wrong, different right = different item
+        if public:
+            r.update(publicFigure=True, identity=str(c.get("identity") or "").strip())
         out.append(r)
     return out
 

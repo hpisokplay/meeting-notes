@@ -112,6 +112,26 @@ def _numbers(s: str) -> list:
     return [sorted(n["values"]) for n in extract_numbers(s)]
 
 
+def is_public(x) -> bool:
+    """A public-figure name correction (general knowledge, not the transcript): ALWAYS a checklist row
+    for the human — never auto-applied, never auto-confirmed, never in 「全部照建議」."""
+    return isinstance(x, dict) and x.get("publicFigure") is True
+
+
+def cap_public(conf: str) -> str:
+    """Public-figure rows are at most medium confidence."""
+    return "medium" if conf == "high" else conf
+
+
+def mark_public(x: dict, right: str, identity: str = "") -> dict:
+    """x becomes a public-figure row (in place): publicFigure, identity, the fixed reason, confidence <= medium."""
+    from .prompts import public_reason
+    identity = re.sub(r"\s+", " ", str(identity or "")).strip()[:40]
+    x.update(publicFigure=True, identity=identity, reason=public_reason(right, identity))
+    x["confidence"] = cap_public(x.get("confidence") if x.get("confidence") in ("high", "medium", "low") else "medium")
+    return x
+
+
 def auto_apply_ok(wrong: str, right: str, ts: list[float], transcript) -> bool:
     """Controller ruling: a high-confidence pair is applied automatically only when ALL hold."""
     if wrong in right or right in wrong:                      # (a) no 股利 -> 股利所得 doubling
@@ -144,6 +164,9 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
         if not wrong or not right or wrong == right:
             continue
         conf = p.get("confidence") if p.get("confidence") in ("high", "medium", "low") else "low"
+        public = is_public(p)
+        if public:
+            conf = cap_public(conf)
         ts = clean_ts(p.get("ts"))
         if wrong in applied_rights:
             continue
@@ -153,8 +176,10 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
                 n, _ = count_term(transcript, wrong, right)
                 if n:
                     o["count"] = n
+                if public and not is_public(o):
+                    mark_public(o, right, p.get("identity"))
             continue
-        if conf == "high" and auto_apply_ok(wrong, right, ts, transcript):
+        if conf == "high" and not public and auto_apply_ok(wrong, right, ts, transcript):
             transcript, n, hit = replace_term(transcript, wrong, right, ts)
             applied_rights.add(right)
             c = {"wrong": wrong, "right": right, "confidence": conf, "count": n, "ts": hit, "state": "applied"}
@@ -169,6 +194,8 @@ def merge_corrections(old, proposals: list, transcript) -> tuple[list, dict]:
         reason = str(p.get("reason") or "").strip()
         if reason:
             c["reason"] = reason
+        if public:
+            mark_public(c, right, p.get("identity"))
         items.append(c)
         by_key[(wrong, right)] = c
     # pending pairs that no longer occur (e.g. fixed by hand) are dropped; history of the rest kept

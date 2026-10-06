@@ -78,13 +78,18 @@ def adjudicate_items(stdin):
 
 def verify_items(stdin):
     """VERIFY_CANDIDATES: every 「[C:id] 「wrong」→「right」」 candidate in stdin gets the decision
-    FAKE_CLAUDE_VERIFY[wrong] (JSON object, default "confirm"); "skip" leaves it unanswered."""
+    FAKE_CLAUDE_VERIFY[wrong] (JSON object, default "confirm"); "skip" leaves it unanswered. A value may be
+    an object {"decision", "publicFigure", "identity"} (public-figure answers)."""
     want = json.loads(os.environ.get("FAKE_CLAUDE_VERIFY", "{}"))
     out = []
     for cid, wrong, right in re.findall(r"^\[C:([^\]]+)\] 「(.+?)」→「(.+?)」", stdin, re.M):
         d = want.get(wrong, "confirm")
+        extra = {}
+        if isinstance(d, dict):  # {"decision", "publicFigure", "identity"}
+            extra = {k: v for k, v in d.items() if k != "decision"}
+            d = d.get("decision", "confirm")
         if d != "skip":
-            out.append({"id": cid, "decision": d, "reason": f"測試：{wrong}→{right} {d}"})
+            out.append({"id": cid, "decision": d, "reason": f"測試：{wrong}→{right} {d}", **extra})
     return out
 
 

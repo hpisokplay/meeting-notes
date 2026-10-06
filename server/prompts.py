@@ -325,7 +325,8 @@ GROUNDING_RULES = (
     "\n"
     "【規則對照範例】\n"
     "- 人名：逐字稿只出現「許會」「許會計師」→ 寫「許會計師」。✗「許崑源會計師」（全名逐字稿沒有出現）。\n"
-    "- 人名不可憑常識「更正」：逐字稿寫「王文曹」→ 照寫「王文曹」。✗ 改成「王文洋」「王文淵」（你猜的名字）。\n"
+    "- 人名不可憑常識「更正」：逐字稿寫「王文曹」→ 照寫「王文曹」。✗ 改成「王文洋」「王文淵」（你猜的名字）。"
+    "知名公眾人物的人名聽錯也一樣照逐字稿寫：更正交給校對清單由人確認，條目裡不可自己改。\n"
     "- 職稱／機構：逐字稿「宋秀玲宋署長」→ 寫「宋秀玲署長」。✗「前財政部賦稅署署長宋秀玲」（「前」「財政部賦稅署」是自己補的）。\n"
     "- 口誤：逐字稿「我繳一億的稅，如果對砍，只要繳五千塊」→ ✓「講者原話為『只要繳五千塊』，依上下文（稅額減半）疑為五千萬」。"
     "✗「應納稅額由 1 億元降至約 5000 元」（把口誤當事實）；✗「降至 5000 萬元」（默默改掉、沒有標示）。\n"
@@ -434,6 +435,33 @@ SUMMARY_LECTURE_PROMPT = (
 
 SUMMARY_MAIN_POINT_CAP = {"lecture": 25, "meeting": 15}
 
+# ---------------------------------------------------------------- public figures (user decision 2026-10-07)
+PUBLIC_REASON = "公眾人物，依常識應為「{right}」（{identity}）；請確認"
+PUBLIC_FIGURE_RULE = (
+    "【知名公眾人物的人名：可以用常識建議，但一律交給人確認】\n"
+    "對象只限「知名公眾人物」：政府官員、立法委員／民意代表、上市櫃公司的董事長／創辦人／高階主管、知名企業家、"
+    "公家機關或公共機構的首長。逐字稿把這些人的名字聽錯（同音或近音），而上下文（職位、公司、事件）明確指向那個人時，"
+    "可以依你的一般常識建議正確寫法，即使正確寫法沒有在逐字稿或【詞庫】出現。這種建議：\n"
+    "  - publicFigure 填 true，identity 填身分（例：日月光董事長、內政部長、立委）；\n"
+    "  - confidence 最高只能 medium（永遠不會自動套用，一定由人確認）；\n"
+    "  - reason 寫成「公眾人物，依常識應為「正確寫法」（身分）；請確認」。\n"
+    "  ✓「張前生」→「張虔生」（上下文講日月光的老闆；張虔生是日月光董事長）。\n"
+    "  ✓「曹新成」→「曹興誠」（上下文講放棄國籍的知名企業家；曹興誠是聯電創辦人）。\n"
+    "  ✓「曾帆成」→「曾繁城」（上下文講台積電副董事長；曾繁城是台積電前副董事長）。\n"
+    "  ✓「餘萬如委員」→「余宛如委員」（上下文講推動資金匯回的立委；余宛如是立委）。\n"
+    "  ✓「劉思芳」→「劉世芳」（上下文講同期的委員；劉世芳是內政部長、前立委）。\n"
+    "  ✗ 一般人（客戶、朋友、親戚、同事、講者本人、沒有公眾身分的人）的名字：不可改成發音相近的名人名字"
+    "（例：講者的客戶「陳志明」→ ✗「陳致中」）。一般人名照舊規則：正確寫法要在逐字稿別處或【詞庫】出現過才可以建議。\n"
+    "  ✗ 不確定逐字稿講的是不是那位公眾人物（上下文沒有職位、公司、事件可以對上）→ 不要當成公眾人物"
+    "（publicFigure false；校對時不列，複核時回答 unsure）。\n"
+)
+
+
+def public_reason(right: str, identity: str = "") -> str:
+    """Reason text of a public-figure name correction (always a checklist row for the human)."""
+    return PUBLIC_REASON.format(right=right, identity=(identity or "").strip() or "身分請查證")
+
+
 # ---------------------------------------------------------------- correction (ASR mishearings)
 CORRECTION_SCHEMA = {
     "type": "object",
@@ -448,6 +476,8 @@ CORRECTION_SCHEMA = {
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                     "reason": {"type": "string"},
                     "ts": {"type": "array", "items": {"type": "number"}},
+                    "publicFigure": {"type": "boolean"},
+                    "identity": {"type": "string"},
                 },
                 "required": ["wrong", "right", "confidence", "reason", "ts"],
             },
@@ -483,14 +513,19 @@ CORRECTION_PROMPT = (
     "- confidence：\n"
     "  high＝發音吻合、上下文只有這一種解讀，而且正確寫法在【詞庫】或逐字稿別處出現過，或是常見詞的明顯同音錯字。"
     "high 會「自動套用」到逐字稿，寧缺勿濫。\n"
-    "  medium＝很可能，但需要人聽錄音確認。人名、公司名的正確寫法若沒有在【詞庫】或逐字稿別處出現，最高只能 medium。\n"
+    "  medium＝很可能，但需要人聽錄音確認。人名、公司名的正確寫法若沒有在【詞庫】或逐字稿別處出現，最高只能 medium"
+    "（一般人名這種情況不收，除非符合下面的公眾人物規則）。\n"
     "  low＝只是推測。\n"
     "  牽涉數字的修正（金額、天數、稅率、年份）一律不可為 high。\n"
     "- reason：一句繁體中文說明依據（例：「上下文講分離課稅 28%，應為股利所得」）。\n"
     "- ts：這個錯字出現的時間（秒），取該行開頭時間換算，例：[00:21:10] → 1270；最多列 5 個。\n"
+    "- publicFigure／identity：只有知名公眾人物的人名更正才填 publicFigure true 和 identity（見下方規則）；其他一律 false、空字串。\n"
+    "\n"
+    + PUBLIC_FIGURE_RULE +
     "\n"
     "同一個錯字只列一筆（列出它的各個時間）。沒有就回空陣列。\n"
-    '只輸出 JSON {"items":[{"wrong":"…","right":"…","confidence":"high|medium|low","reason":"…","ts":[秒數]}]}。'
+    '只輸出 JSON {"items":[{"wrong":"…","right":"…","confidence":"high|medium|low","reason":"…","ts":[秒數],'
+    '"publicFigure":false,"identity":""}]}。'
     + LANG_RULE
 )
 
@@ -718,6 +753,8 @@ ADJUDICATE_SCHEMA = {
                     "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
                     "itemIds": {"type": "array", "items": {"type": "string"}},
                     "fromFlags": {"type": "array", "items": {"type": "string"}},
+                    "publicFigure": {"type": "boolean"},
+                    "identity": {"type": "string"},
                 },
                 "required": ["span", "action", "suggestion", "reason", "confidence", "itemIds", "fromFlags"],
             },
@@ -756,12 +793,15 @@ ADJUDICATE_PROMPT = (
     "- confidence：high＝逐字稿有明確依據；medium＝依據充分但需要人看一眼；low＝不確定。\n"
     "- itemIds：span 出現在哪些條目，填條目編號（[I:…] 裡的 8 碼）；只在逐字稿裡的填空陣列。\n"
     "- fromFlags：這張卡回應了哪些程式旗標（[F:…] 裡的 8 碼）；你自己發現的問題填空陣列。\n"
+    "- publicFigure／identity：知名公眾人物的人名更正（見下方公眾人物規則）填 true 和身分；其他一律 false、空字串。\n"
     "\n"
     "【硬規則】\n"
     "1. span 必須是給你的文字中真實存在的字串，逐字複製，不可改寫、不可拼接兩處。\n"
     "2. suggestion 必須以逐字稿為依據，並在 reason 引用時間與原話。逐字稿別處有正確寫法 → 用那個寫法。\n"
     "3. 不可捏造事實：不可用你的常識補人名、職稱、法條、數字。逐字稿裡找不到正確寫法的人名 → keep、confidence low，"
-    "reason 寫「逐字稿只有○○寫法，真名請查證」。\n"
+    "reason 寫「逐字稿只有○○寫法，真名請查證」。唯一例外是知名公眾人物的人名聽錯（見下方規則）：可以出 replace 卡，"
+    "publicFigure true、confidence medium，reason 用規定的格式；標著「公眾人物」的待確認聽錯字（term）也照這樣出 replace 卡，"
+    "除非上下文明確顯示講的不是那個人。\n"
     "4. 不確定 → action keep、confidence low，reason 寫要查什麼（例：「請回聽 [01:10:02] 稅率是 40 還是 48」）。\n"
     "5. 同一個 span 改成同一個 suggestion 只出一張卡（把所有相關條目放進 itemIds、所有相關旗標放進 fromFlags）。\n"
     "6. 程式旗標不可略過：每個 [F:…] 都要出現在某一張卡的 fromFlags 裡。誤報就出 keep 卡說明理由。\n"
@@ -784,8 +824,12 @@ ADJUDICATE_PROMPT = (
     "✗ 錯誤示範：span 寫成條目裡沒有的字（例如把「黃任宗（逐字稿另寫作黃任中）」縮寫成「黃任宗另寫作黃任中」）；"
     "suggestion 用常識補全名（逐字稿只有「李明基司長」，卻建議改成別的名字）；reason 沒有時間和原話；同一個 span 出好幾張相同的卡。\n"
     "\n"
+    "\n"
+    + PUBLIC_FIGURE_RULE +
+    "\n"
     "沒有問題的條目不用出卡。寧可少而準，每張卡都要讓使用者按「照建議」就對。\n"
-    '只輸出 JSON {"items":[{"span":"…","action":"replace|keep|delete","suggestion":"…","reason":"…","confidence":"high|medium|low","itemIds":[…],"fromFlags":[…]}]}。'
+    '只輸出 JSON {"items":[{"span":"…","action":"replace|keep|delete","suggestion":"…","reason":"…","confidence":"high|medium|low","itemIds":[…],"fromFlags":[…],'
+    '"publicFigure":false,"identity":""}]}。'
     + LANG_RULE + "\n\n（審稿資料在使用者訊息中。）"
 )
 ADJUDICATE = ADJUDICATE_PROMPT
@@ -803,6 +847,8 @@ VERIFY_CANDIDATES_SCHEMA = {
                     "id": {"type": "string"},
                     "decision": {"type": "string", "enum": ["confirm", "reject", "unsure"]},
                     "reason": {"type": "string"},
+                    "publicFigure": {"type": "boolean"},
+                    "identity": {"type": "string"},
                 },
                 "required": ["id", "decision", "reason"],
             },
@@ -828,7 +874,8 @@ VERIFY_CANDIDATES_PROMPT = (
     "  · 正字會改變講者原意，或只是你「覺得比較好」的另一種說法；\n"
     "  · 只是文法、語氣、贅字、語助詞、標點、用字風格、寫法差異（臺／台、瞭解／了解、蠻／滿）；\n"
     "  · 把一個說得通的中文詞換成另一個也說得通的詞，而上下文沒有明確支持；\n"
-    "  · 人名、公司名：除非同一個正確寫法在逐字稿別處（或【詞庫】）出現過，否則一律 reject；\n"
+    "  · 一般人名、公司名：除非同一個正確寫法在逐字稿別處（或【詞庫】）出現過，否則一律 reject"
+    "（知名公眾人物例外，見下方規則）；\n"
     "  · 講者自己的口誤、數字講錯：那是原話，不是辨識錯誤。\n"
     "- unsure：可能是聽錯，但上下文不足以判斷（需要人回聽錄音）。不要把 unsure 當成「懶得判斷」：能判斷就判斷。\n"
     "\n"
@@ -839,15 +886,21 @@ VERIFY_CANDIDATES_PROMPT = (
     "✗ reject 語助詞或口語的改動：「好啊」→「好」、「對嘛」→「對嗎」、「這樣齁」→「這樣喔」。\n"
     "✗ reject 用字風格：「蠻高」→「滿高」、「台灣」→「臺灣」。\n"
     "✗ reject 沒有上下文支持的換詞：「他很認真」→「他很任真」或「規劃」→「規畫」這類原文本來就通的句子。\n"
-    "✗ reject 人名：「王小明」→「王曉明」，逐字稿別處沒有「王曉明」。\n"
+    "✗ reject 一般人名：「王小明」→「王曉明」，逐字稿別處沒有「王曉明」，也不是公眾人物。\n"
+    "\n"
+    + PUBLIC_FIGURE_RULE +
+    "  複核時：符合公眾人物規則的人名候選 → confirm（上下文不夠明確就 unsure），publicFigure true、identity 填身分，"
+    "reason 用規定格式；不可只因為正確寫法沒有在逐字稿或【詞庫】出現就 reject。"
+    "只有上下文明確顯示講的不是那位公眾人物（例如是講者的客戶、親戚）才 reject，此時 publicFigure 填 false。\n"
     "\n"
     "【欄位】\n"
     "- id：候選編號（[C:…] 裡的字串，原樣照抄）。每一筆候選都要回答，不可略過。\n"
     "- decision：confirm｜reject｜unsure。\n"
     "- reason：繁體中文一句話（40 字內），說明依據（引用上下文的關鍵字）。\n"
+    "- publicFigure／identity：知名公眾人物的人名更正填 true 和身分；其他一律 false、空字串。\n"
     "\n"
     "寧可少放行，也不要放行誤報：沒有把握就 unsure，明顯不是聽錯就 reject。\n"
-    '只輸出 JSON {"items":[{"id":"…","decision":"confirm|reject|unsure","reason":"…"}]}。'
+    '只輸出 JSON {"items":[{"id":"…","decision":"confirm|reject|unsure","reason":"…","publicFigure":false,"identity":""}]}。'
     + LANG_RULE + "\n\n（候選資料在使用者訊息中。）"
 )
 VERIFY_CANDIDATES = VERIFY_CANDIDATES_PROMPT
@@ -861,7 +914,8 @@ def verify_candidates_user_message(cands: list[dict], glossary) -> str:
     blocks = []
     for c in cands:
         why = f"；初判理由：{c['reason']}" if c.get("reason") else ""
-        b = [f"[C:{c['id']}] 「{c['wrong']}」→「{c['right']}」（初判信心：{c.get('confidence') or 'low'}{why}）"]
+        pf = f"；初判為公眾人物：{c.get('identity') or '身分未填'}" if c.get("publicFigure") else ""
+        b = [f"[C:{c['id']}] 「{c['wrong']}」→「{c['right']}」（初判信心：{c.get('confidence') or 'low'}{why}{pf}）"]
         b += [f"  {x}" for x in c.get("contexts") or []] or ["  （逐字稿找不到出現位置）"]
         blocks.append("\n".join(b))
     return f"【詞庫】\n{'、'.join(terms) or '（無）'}\n\n【候選】\n" + "\n\n".join(blocks)
