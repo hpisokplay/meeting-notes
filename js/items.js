@@ -222,3 +222,60 @@ export function segIndexAt(t, transcript) {
   });
   return best;
 }
+
+// ---- 單字訂正卡（ReviewItem v2：有 span 的項目）----
+export const isWordReview = (r) => !!r && typeof r.span === 'string' && r.span.length > 0;
+// 會改到哪些地方：逐字稿幾處、摘要／筆記幾條
+export function reviewScope(r) {
+  let transcript = 0;
+  let items = 0;
+  (Array.isArray(r && r.targets) ? r.targets : []).forEach((x) => {
+    if (!x) return;
+    const n = Math.max(0, Number(x.count) || 0);
+    if (x.where === 'transcript') transcript += n;
+    else if (/^(summary|notes)\./.test(String(x.where || ''))) items += n || 1;
+  });
+  return { transcript, items };
+}
+export const scopeText = (s, prefix) => `${prefix}逐字稿 ${Number(s.transcript) || 0} 處、摘要 ${Number(s.items) || 0} 條`;
+// "[01:02:03]" / "[02:03]" → 秒數
+export function hmsToSec(s) {
+  const p = String(s).split(':').map(Number);
+  if (p.some((x) => !isFinite(x))) return null;
+  return p.reduce((a, x) => a * 60 + x, 0);
+}
+// 把字串切成 [{text}|{t, label}]：[HH:MM:SS] 或 [MM:SS] 變成時間片段
+export function splitTimes(s) {
+  const out = [];
+  const re = /\[(\d{1,2}:\d{2}(?::\d{2})?)\]/g;
+  const str = String(s || '');
+  let last = 0;
+  let mm;
+  while ((mm = re.exec(str))) {
+    if (mm.index > last) out.push({ text: str.slice(last, mm.index) });
+    out.push({ t: hmsToSec(mm[1]), label: mm[1] });
+    last = mm.index + mm[0].length;
+  }
+  if (last < str.length) out.push({ text: str.slice(last) });
+  return out;
+}
+// 上下文：【…】之間的字標示起來；其他照原樣（呼叫端負責跳脫）→ [{text, hit}]
+export function splitContext(ctx) {
+  const out = [];
+  const re = /【([^【】]*)】/g;
+  const str = String(ctx || '');
+  let last = 0;
+  let mm;
+  while ((mm = re.exec(str))) {
+    if (mm.index > last) out.push({ text: str.slice(last, mm.index), hit: false });
+    out.push({ text: mm[1], hit: true });
+    last = mm.index + mm[0].length;
+  }
+  if (last < str.length) out.push({ text: str.slice(last), hit: false });
+  return out;
+}
+// 未辨識段落總分鐘數（四捨五入，至少 1）
+export function gapMinutes(gaps) {
+  const sec = (Array.isArray(gaps) ? gaps : []).reduce((a, g) => a + Math.max(0, (Number(g && g.end) || 0) - (Number(g && g.start) || 0)), 0);
+  return sec > 0 ? Math.max(1, Math.round(sec / 60)) : 0;
+}

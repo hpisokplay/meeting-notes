@@ -905,6 +905,126 @@ describe('app（整合，假 NAS）', () => {
     expect(document.getElementById('toast').textContent).toContain('整理中，完成後再修改');
     expect(api.getMeeting.mock.calls.length).toBeGreaterThanOrEqual(2);
   });
+
+  // ---- 單字訂正卡（ReviewItem v2）----
+  const wordMeeting = () => {
+    const m = JSON.parse(JSON.stringify(MEETING));
+    m.id = 'w-1';
+    m.updatedAt = Date.now() + Math.random();
+    m.summary.mainPoints = [{ id: 'mp000001', text: '王小明說要測試', src: [{ t: 700, quote: '我明天開始測試' }] }];
+    m.review = {
+      items: [
+        {
+          id: 'rw000001', span: '王曉明', action: 'replace', suggestion: '王小明', reason: '[00:11:40] 講者說「王小明明天測試」', confidence: 'high',
+          targets: [{ where: 'transcript', count: 2 }, { where: 'summary.mainPoints', itemId: 'mp000001', count: 1 }, { where: 'notes.outline', count: 1 }],
+          context: '由<b>【王曉明】</b>負責測試', sources: ['name'], state: 'pending',
+        },
+        { id: 'rw000002', span: '48%', action: 'keep', suggestion: '', reason: '原話如此', confidence: 'low', targets: [{ where: 'transcript', count: 1 }], context: '成長【48%】', sources: ['number'], state: 'pending' },
+        { id: 'rw000003', span: '嗯那個', action: 'delete', suggestion: '', reason: '口誤', confidence: 'medium', targets: [{ where: 'summary.mainPoints', count: 1 }], context: '【嗯那個】測試', sources: ['slip'], state: 'pending' },
+        { id: 'rw000004', span: '王曉明', action: 'replace', suggestion: '王小明', reason: 'x', confidence: 'high', targets: [], context: '【王曉明】', state: 'merged' },
+        { id: 'rv000009', kind: 'quote', section: 'summary.mainPoints', itemId: 'mp000001', text: '王小明說要測試', detail: '找不到原句', t: 700, state: 'pending' },
+      ],
+    };
+    m.gaps = [{ start: 60, end: 150 }, { start: 400, end: 490 }];
+    return m;
+  };
+  const wordReply = (applied, mutate) => async (id, rid, action, text) => {
+    nas.calls.push(['reviewAction', id, rid, action, text]);
+    const m = nas.meetings[id];
+    m.review.items.find((x) => x.id === rid).state = action === 'keep' ? 'confirmed' : 'edited';
+    if (mutate) mutate(m);
+    m.updatedAt += 1;
+    return { ...JSON.parse(JSON.stringify(m)), applied };
+  };
+
+  it('單字訂正卡：上下文標示（跳脫）、三種建議、低信心標籤、理由時間鈕、影響範圍；merged 不顯示不計數；舊格式退回舊卡', async () => {
+    nas.meetings['w-1'] = wordMeeting();
+    await go('#/m/w-1');
+    const box = document.getElementById('reviewCard');
+    expect(document.getElementById('reviewCount').textContent).toBe('4'); // merged 不算
+    expect(box.querySelector('[data-rid="rw000004"]')).toBeNull();
+    expect(box.textContent).toContain('AI 已逐項判斷並給建議；沒問題按「照建議」即可');
+    const c1 = box.querySelector('.word-card[data-rid="rw000001"]');
+    expect(c1.querySelector('mark.word-hit').textContent).toBe('王曉明');
+    expect(c1.querySelector('.word-ctx b')).toBeNull(); // 上下文裡的 HTML 要跳脫
+    expect(c1.querySelector('.word-ctx').textContent).toContain('<b>');
+    expect(c1.querySelector('.word-sugg').innerHTML).toContain('建議改成：<b>王小明</b>');
+    expect(c1.querySelector('.word-scope').textContent).toBe('會改到：逐字稿 2 處、摘要 2 條');
+    expect(c1.querySelector('.word-low')).toBeNull();
+    const chip = c1.querySelector('.word-reason [data-rt="700"]');
+    expect(chip.textContent).toContain('00:11:40');
+    expect(c1.querySelector('[data-wv="accept"]').textContent).toContain('照建議');
+    const c2 = box.querySelector('[data-rid="rw000002"]');
+    expect(c2.textContent).toContain('建議：保留（不是錯誤）');
+    expect(c2.querySelector('.word-low').textContent).toContain('請自行判斷');
+    expect(box.querySelector('[data-rid="rw000003"]').textContent).toContain('建議：刪除這段');
+    // 舊格式（沒有 span）用舊卡片
+    const old = box.querySelector('.review-row[data-rid="rv000009"]');
+    expect(old.classList.contains('word-card')).toBe(false);
+    expect(old.querySelector('[data-rv="confirm"]')).toBeTruthy();
+    expect(old.textContent).toContain('找不到原句');
+    // 時間鈕跳到逐字稿那一句
+    chip.click();
+    expect(document.querySelector('.seg[data-seg="2"]').classList.contains('flash')).toBe(true);
+  });
+
+  it('單字訂正卡：照建議送 accept，toast 顯示套用數並依回傳重畫', async () => {
+    nas.meetings['w-1'] = wordMeeting();
+    await go('#/m/w-1');
+    api.reviewAction.mockImplementationOnce(
+      wordReply({ transcript: 2, items: 1 }, (m) => (m.summary.mainPoints[0].text = '王小明說要測試（已改）'))
+    );
+    document.querySelector('[data-rid="rw000001"] [data-wv="accept"]').click();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['reviewAction', 'w-1', 'rw000001', 'accept', undefined]);
+    expect(document.getElementById('toast').textContent).toBe('已改：逐字稿 2 處、摘要 1 條');
+    expect(document.getElementById('reviewCount').textContent).toBe('3');
+    expect(document.querySelector('[data-rid="rw000001"]')).toBeNull();
+    expect(document.getElementById('view').innerHTML).toContain('（已改）');
+  });
+
+  it('單字訂正卡：保留原文送 keep；自己改送 edit＋文字；送出中按鈕停用', async () => {
+    nas.meetings['w-1'] = wordMeeting();
+    await go('#/m/w-1');
+    let release;
+    api.reviewAction.mockImplementationOnce(async (...a) => {
+      await new Promise((r) => (release = r));
+      return wordReply({ transcript: 0, items: 0 })(...a);
+    });
+    document.querySelector('[data-rid="rw000002"] [data-wv="keep"]').click();
+    await tick();
+    expect(document.querySelector('[data-rid="rw000001"] [data-wv="accept"]').disabled).toBe(true);
+    release();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['reviewAction', 'w-1', 'rw000002', 'keep', undefined]);
+    expect(document.getElementById('toast').textContent).toContain('已保留原文');
+
+    api.reviewAction.mockImplementationOnce(wordReply({ transcript: 2, items: 2 }));
+    document.querySelector('[data-rid="rw000001"] [data-wv="edit"]').click();
+    const inp = document.querySelector('[data-rid="rw000001"] .word-input');
+    expect(inp.value).toBe('王小明');
+    inp.value = '王筱明';
+    document.querySelector('[data-rid="rw000001"] [data-re="save"]').click();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['reviewAction', 'w-1', 'rw000001', 'edit', '王筱明']);
+    expect(document.getElementById('toast').textContent).toBe('已改：逐字稿 2 處、摘要 2 條');
+  });
+
+  it('未辨識段落：匯出列下方顯示約 X 分鐘，展開列出時間鈕；沒有 gaps 不顯示', async () => {
+    nas.meetings['w-1'] = wordMeeting();
+    await go('#/m/w-1');
+    const g = document.getElementById('gapsLine');
+    expect(g.querySelector('summary').textContent).toBe('⚠️ 約 3 分鐘未辨識');
+    const chips = g.querySelectorAll('[data-gap-t]');
+    expect(chips.length).toBe(2);
+    expect(chips[0].textContent).toContain('1:00–2:30');
+    const h = document.getElementById('view').innerHTML;
+    expect(h.indexOf('id="exportLock"')).toBeLessThan(h.indexOf('id="gapsLine"'));
+    chips[1].click();
+    expect(document.querySelector('.seg[data-seg="1"]').classList.contains('flash')).toBe(true);
+    await go('#/m/test-1');
+    expect(document.getElementById('gapsLine')).toBeNull();
+  });
 });
 
 describe('播放與狀態的純函式', () => {

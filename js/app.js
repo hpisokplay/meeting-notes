@@ -20,9 +20,15 @@ import {
   srcSegIndex,
   listItemIds,
   confirmOnly,
+  isWordReview,
+  reviewScope,
+  scopeText,
+  splitTimes,
+  splitContext,
+  gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v104';
+const APP_VERSION = 'v105';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -414,6 +420,45 @@ const taskId = (meetingId, key) => `${meetingId}|${key}`;
 function currentDetailId() {
   return location.hash.startsWith('#/m/') ? decodeURIComponent(location.hash.slice(4)) : '';
 }
+// ---- 單字訂正卡（ReviewItem v2：有 span 的待確認項目）----
+const timeChip = (t, label) =>
+  t != null && isFinite(t) ? `<button class="src-chip" type="button" data-rt="${Number(t)}">▶ ${esc(label || fmtSec(t))}</button>` : esc(label || '');
+function wordReviewCardHtml(r) {
+  const ctx = splitContext(r.context || `【${r.span}】`)
+    .map((p) => (p.hit ? `<mark class="word-hit">${esc(p.text)}</mark>` : esc(p.text)))
+    .join('');
+  const act = r.action === 'keep' || r.action === 'delete' ? r.action : 'replace';
+  const sugg =
+    act === 'keep' ? '建議：保留（不是錯誤）' : act === 'delete' ? '建議：刪除這段' : `建議改成：<b>${esc(r.suggestion || '')}</b>`;
+  const low = r.confidence === 'low' ? ' <span class="word-low">⚠️ 請自行判斷</span>' : '';
+  const reason = splitTimes(r.reason || '')
+    .map((p) => (p.label ? timeChip(p.t, p.label) : esc(p.text)))
+    .join('');
+  return `<div class="review-row word-card" data-rid="${esc(r.id)}">
+    <div class="word-ctx">${ctx}</div>
+    <div class="word-sugg">${sugg}${low}</div>
+    ${reason ? `<div class="word-reason">${reason}</div>` : ''}
+    <div class="word-scope">${esc(scopeText(reviewScope(r), '會改到：'))}</div>
+    <div class="review-ops word-ops">
+      <button class="act-btn primary word-accept" type="button" data-wv="accept">✅ 照建議</button>
+      <div class="word-sec">
+        <button class="act-btn" type="button" data-wv="keep">保留原文</button>
+        <button class="act-btn" type="button" data-wv="edit">✏️ 自己改</button>
+      </div>
+    </div>
+  </div>`;
+}
+// 未辨識段落：匯出列下方一行，點開列出各段時間（時間鈕跳逐字稿＋播放）
+function gapsLineHtml(m) {
+  const gaps = (Array.isArray(m && m.gaps) ? m.gaps : []).filter((g) => g && isFinite(Number(g.start)) && isFinite(Number(g.end)));
+  const min = gapMinutes(gaps);
+  if (!min) return '';
+  const chips = gaps
+    .map((g) => `<button class="src-chip" type="button" data-gap-t="${Number(g.start)}">▶ ${esc(fmtSec(g.start))}–${esc(fmtSec(g.end))}</button>`)
+    .join(' ');
+  return `<details class="gaps-line" id="gapsLine"><summary>⚠️ 約 ${min} 分鐘未辨識</summary><div class="gaps-list">${chips}</div></details>`;
+}
+
 // 把執行中的工作狀態畫回按鈕（畫面可能剛重繪過）
 function paintDetailTasks() {
   const id = currentDetailId();
@@ -1393,6 +1438,7 @@ async function renderDetail(id, preloaded) {
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
       <div class="export-lock" id="exportLock" hidden></div>
+      ${gapsLineHtml(m)}
       ${(Array.isArray(m.warnings) ? m.warnings : []).filter((w) => typeof w === 'string' && w).map((w) => `<div class="export-warn">⚠️ ${esc(w)}</div>`).join('')}
       <div class="lang-toggle" id="modeToggle" style="margin-top:10px">
         <button data-mode="meeting">📋 ${meetingMode(m) === 'lecture' ? '講座摘要' : '會議摘要'}</button>
@@ -2334,6 +2380,7 @@ async function renderDetail(id, preloaded) {
   // 待確認項目的時間鈕要找哪一句：優先用它指向的條目在該秒數附近的出處原句，否則用項目文字比對
   const reviewQuote = (r, t) => {
     if (!r) return '';
+    if (isWordReview(r)) return r.span;
     const [box, key] = String(r.section || '').split('.');
     const arr = ((m[box] || {})[key]) || [];
     const at = r.itemId ? listItemIds(arr).indexOf(String(r.itemId)) : -1;
@@ -2343,7 +2390,7 @@ async function renderDetail(id, preloaded) {
   };
   let reviewOpen = true;
   const drawReviewInner = () => {
-    const all = reviewItems(m);
+    const all = reviewItems(m).filter((r) => r && r.state !== 'merged'); // 已併進別張卡的不顯示、不計數
     paintExportLock();
     if (!all.length) {
       reviewBox.hidden = true;
@@ -2359,8 +2406,10 @@ async function renderDetail(id, preloaded) {
     }
     reviewBox.className = 'review-box';
     const rows = pend
-      .map(
-        (r) => `<div class="review-row" data-rid="${esc(r.id)}">
+      .map((r) =>
+        isWordReview(r)
+          ? wordReviewCardHtml(r)
+          : `<div class="review-row" data-rid="${esc(r.id)}">
           <div class="review-top"><span class="review-kind k-${esc(r.kind)}">${esc(REVIEW_KIND[r.kind] || r.kind || '待確認')}</span>${r.t != null && isFinite(Number(r.t)) ? `<button class="src-chip" type="button" data-rt="${Number(r.t)}">▶ ${esc(fmtSec(r.t))}</button>` : ''}</div>
           <div class="review-text">${esc(r.text)}</div>
           ${r.detail ? `<div class="review-detail">${esc(r.detail)}</div>` : ''}
@@ -2375,9 +2424,14 @@ async function renderDetail(id, preloaded) {
         </div>`
       )
       .join('');
+    const anyWord = pend.some(isWordReview);
+    const hint = anyWord
+      ? `<div class="hint review-hint">AI 已逐項判斷並給建議；沒問題按「照建議」即可</div>
+        <details class="review-why"><summary>為什麼要確認？</summary>錄音轉文字常把人名、專有名詞、數字聽錯，摘要也可能跟著寫錯。AI 已對照逐字稿原話提出建議，請你最後確認一次；全部處理完才能分享／匯出。</details>`
+      : `<div class="hint" style="margin:0 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>`;
     reviewBox.innerHTML = `<div class="review-head" id="reviewHead">⚠️ 待確認清單（<span id="reviewCount">${pend.length}</span>）<span class="chev">${reviewOpen ? '▾' : '▸'}</span></div>
       <div class="review-list"${reviewOpen ? '' : ' hidden'}>
-        <div class="hint" style="margin:0 0 6px">程式在逐字稿裡找不到依據的內容。逐一確認、改正或刪除；清空前不能分享／匯出。</div>
+        ${hint}
         ${rows}
       </div>`;
     document.getElementById('reviewHead').onclick = () => {
@@ -2389,6 +2443,16 @@ async function renderDetail(id, preloaded) {
         const t = Number(b.dataset.rt);
         const r = pend.find((x) => String(x.id) === b.closest('.review-row').dataset.rid);
         if (curJump) curJump(t, reviewQuote(r, t), true);
+      };
+    });
+    reviewBox.querySelectorAll('[data-wv]').forEach((b) => {
+      b.onclick = () => {
+        const row = b.closest('.review-row');
+        const r = pend.find((x) => String(x.id) === row.dataset.rid);
+        if (!r || reviewSending) return;
+        const act = b.dataset.wv;
+        if (act === 'edit') return openWordEdit(row, r);
+        sendReview(r, act);
       };
     });
     reviewBox.querySelectorAll('[data-rv]').forEach((b) => {
@@ -2425,6 +2489,28 @@ async function renderDetail(id, preloaded) {
       sendReview(r, 'edit', v);
     };
   };
+  // 單字訂正卡的「自己改」：一行輸入框 → 送 edit（text 為替換文字）
+  const openWordEdit = (row, r) => {
+    const ops = row.querySelector('.review-ops');
+    ops.outerHTML = `<div class="review-edit word-edit"><input class="word-input" type="text" enterkeyhint="done" aria-label="改成">
+      <div class="seg-edit-ops"><button class="act-btn primary" type="button" data-re="save">送出</button><button class="act-btn" type="button" data-re="cancel">取消</button></div></div>`;
+    const inp = row.querySelector('.word-input');
+    inp.value = r.action === 'replace' && r.suggestion ? r.suggestion : r.span || '';
+    inp.focus();
+    row.querySelector('[data-re="cancel"]').onclick = () => drawReview();
+    const save = () => {
+      const v = inp.value.trim();
+      if (!v) {
+        alert('請填入要改成的文字');
+        return;
+      }
+      sendReview(r, 'edit', v);
+    };
+    row.querySelector('[data-re="save"]').onclick = save;
+    inp.onkeydown = (e) => {
+      if (e.key === 'Enter') save();
+    };
+  };
   let reviewSending = false;
   const sendReview = async (r, action, text) => {
     if (reviewSending) return;
@@ -2432,11 +2518,14 @@ async function renderDetail(id, preloaded) {
     reviewBox.querySelectorAll('button').forEach((x) => (x.disabled = true));
     try {
       const r2 = await api.reviewAction(id, r.id, action, text);
+      const applied = r2 && typeof r2 === 'object' ? r2.applied : null;
+      if (applied) delete r2.applied; // 只是這次套用的統計，不存進會議
       // 伺服器回傳更新後的會議；沒有的話重抓
       const fresh = r2 && typeof r2 === 'object' && r2.id ? r2 : await api.getMeeting(id);
       await cacheMeeting(fresh);
       m = fresh;
-      toast(action === 'confirm' ? '已確認 ✓' : action === 'edit' ? '已改正 ✓' : '已刪除 ✓');
+      if (isWordReview(r)) toast(action === 'keep' ? '已保留原文 ✓' : scopeText(applied || {}, '已改：'));
+      else toast(action === 'confirm' ? '已確認 ✓' : action === 'edit' ? '已改正 ✓' : '已刪除 ✓');
       // 條目內容可能變了（改正／刪除）→ 整頁重繪
       if (currentDetailId() === id) renderDetail(id, fresh);
     } catch (e) {
@@ -2462,6 +2551,11 @@ async function renderDetail(id, preloaded) {
   };
   drawReview();
   drawCorr();
+  document.querySelectorAll('#gapsLine [data-gap-t]').forEach((b) => {
+    b.onclick = () => {
+      if (curJump) curJump(Number(b.dataset.gapT), '', true);
+    };
+  });
 
   // 加強某一區塊（分段掃整份逐字稿抓完整清單）
   const doEnhance = async (section, btn) => {
