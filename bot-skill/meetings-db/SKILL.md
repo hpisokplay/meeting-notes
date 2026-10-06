@@ -11,7 +11,7 @@ description: 會議記錄資料庫。使用者問會議、會議紀錄、開會�
 index.json            會議清單 [{id,title,createdAt(毫秒),group,durationSec,status}]
 meetings/<id>.json    會議主檔（完整資料）
 meetings/<id>.md      純文字版：標題、日期、摘要、逐字稿（含說話者與時間）← 回答問題讀這個
-exports/<id>.docx     Word 匯出
+exports/<id>.docx     Word 匯出（還有待確認項目時不會有這個檔）
 audio/<id>/<n>-<檔名>  原始錄音
 groups.json           分類 [{id,name,color}]
 inbox/                丟錄音進來會自動建立會議並轉錄
@@ -26,8 +26,11 @@ inbox/                丟錄音進來會自動建立會議並轉錄
 4. 「最近的會議」就按 createdAt 由新到舊排。
 
 ## 要檔案
-- Word：`cp /projects/meetings/exports/<id>.docx /projects/_outbox/`
-- 文字版：`cp /projects/meetings/meetings/<id>.md /projects/_outbox/`
+- Word：先確認 `exports/<id>.docx` 存在（`ls /projects/meetings/exports/<id>.docx`）。
+  - 存在：`cp /projects/meetings/exports/<id>.docx /projects/_outbox/`
+  - 不存在：代表這場還有待確認的內容（伺服器在待確認清單清空前不產生 Word 檔）。讀 `meetings/<id>.json` 的 `review.items`，數 `state` 為 `"pending"` 的項目數 N，回覆「這場還有 N 項待確認，請先到網頁處理完再傳」並附網頁連結。
+  - 絕對不要拿 .md 文字版代替 Word 檔交差，也不要自己把 .md 轉成 Word：沒確認過的內容不能給董事長。
+- 文字版：`cp /projects/meetings/meetings/<id>.md /projects/_outbox/`（第一行若是「⚠️ 尚有 N 項待確認，內容未經確認，請勿轉交」，傳之前要先把這句話原樣告訴使用者；要轉給董事長的一律用上面的 Word 流程）
 - 錄音：只有檔案 ≤ 45 MB 才 `cp` 到 `/projects/_outbox/`（先 `ls -l` 確認大小）；超過就只給網頁連結。
 - 放進 `_outbox/` 後這次任務結束，系統會自動傳給使用者。檔名維持原樣即可。
 
