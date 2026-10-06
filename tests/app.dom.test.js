@@ -1154,6 +1154,55 @@ describe('播放與狀態的純函式', () => {
     expect(appMod.uploadInProgress(null)).toBe(false);
   });
 
+  it('sortByName：無數字的檔名排在同基底有數字之前', async () => {
+    const appMod = await import('../js/app.js');
+    const names = (a) => appMod.sortByName(a.map((name) => ({ name }))).map((f) => f.name);
+    expect(names(['國立臺灣大學 - 醫學院 3.m4a', '國立臺灣大學 - 醫學院 2.m4a', '國立臺灣大學 - 醫學院.m4a'])).toEqual([
+      '國立臺灣大學 - 醫學院.m4a',
+      '國立臺灣大學 - 醫學院 2.m4a',
+      '國立臺灣大學 - 醫學院 3.m4a',
+    ]);
+    expect(names(['錄音10.m4a', '錄音2.m4a', '錄音1.m4a'])).toEqual(['錄音1.m4a', '錄音2.m4a', '錄音10.m4a']);
+    expect(names(['a_3.mp3', 'a.mp3', 'a (2).mp3'])).toEqual(['a.mp3', 'a (2).mp3', 'a_3.mp3']);
+  });
+
+  it('新增會議：↑↓ 調整順序、頭尾停用、createMeeting 照畫面順序、標題跟第一個檔但手改後不動', async () => {
+    api.uploadFile.mockReset();
+    api.createMeeting.mockReset();
+    api.uploadFile.mockImplementation(async (f) => 'u-' + f.name);
+    api.createMeeting.mockResolvedValue({ id: 'new-1', title: 'x', audio: [], status: 'queued', createdAt: 1, updatedAt: 1 });
+    await go('#/new');
+    const mk = (name) => new File(['x'], name);
+    const input = document.getElementById('audio');
+    Object.defineProperty(input, 'files', { configurable: true, value: [mk('b 3.m4a'), mk('b.m4a'), mk('b 2.m4a')] });
+    input.onchange({ target: input });
+    const rows = () => Array.from(document.querySelectorAll('#fileList .file-row'));
+    const order = () => rows().map((r) => r.querySelector('.fr-name').textContent.replace(/（.*/, ''));
+    expect(order()).toEqual(['b.m4a', 'b 2.m4a', 'b 3.m4a']);
+    expect(document.getElementById('newTitle').value).toBe('b');
+    expect(rows()[0].querySelector('[data-mv=up]').disabled).toBe(true);
+    expect(rows()[2].querySelector('[data-mv=down]').disabled).toBe(true);
+    rows()[0].querySelector('[data-mv=down]').click();
+    expect(order()).toEqual(['b 2.m4a', 'b.m4a', 'b 3.m4a']);
+    expect(document.getElementById('newTitle').value).toBe('b 2');
+    rows()[2].querySelector('[data-mv=up]').click();
+    expect(order()).toEqual(['b 2.m4a', 'b 3.m4a', 'b.m4a']);
+    // 手改標題後不再跟著
+    const t = document.getElementById('newTitle');
+    t.value = '我的標題';
+    t.dispatchEvent(new Event('input'));
+    rows()[2].querySelector('[data-mv=up]').click();
+    rows()[1].querySelector('[data-mv=up]').click();
+    expect(order()).toEqual(['b.m4a', 'b 2.m4a', 'b 3.m4a']);
+    expect(t.value).toBe('我的標題');
+    document.getElementById('go').click();
+    await tick(200);
+    expect(api.createMeeting).toHaveBeenCalledTimes(1);
+    expect(api.createMeeting.mock.calls[0][0].uploads).toEqual(['u-b.m4a', 'u-b 2.m4a', 'u-b 3.m4a']);
+    expect(api.createMeeting.mock.calls[0][0].title).toBe('我的標題');
+    expect(api.uploadFile.mock.calls.map((c) => c[0].name)).toEqual(['b.m4a', 'b 2.m4a', 'b 3.m4a']);
+  });
+
   it('sortByName：多檔依檔名數字順序', async () => {
     const appMod = await import('../js/app.js');
     const fs = ['part10.m4a', 'part2.m4a', 'part1.m4a'].map((name) => ({ name }));

@@ -30,7 +30,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v107';
+const APP_VERSION = 'v108';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -932,8 +932,20 @@ const mmss = (sec) => {
   const ss = String(s % 60).padStart(2, '0');
   return h ? `${h}:${String(m).padStart(2, '0')}:${ss}` : `${m}:${ss}`;
 };
+// 檔名拆成「基底＋結尾數字」：沒有結尾數字的算 0（排在同基底的 1、2、3… 之前）
+const splitTrailingNum = (name) => {
+  const stem = String(name).replace(/\.[^./\\]+$/, '').trim();
+  const m = stem.match(/^(.*?)[\s_\-(]*\(?(\d+)\)?$/);
+  if (m && m[1].trim()) return { base: m[1].trim(), num: Number(m[2]) };
+  return { base: stem, num: 0 };
+};
+const collate = (a, b) => a.localeCompare(b, undefined, { numeric: true });
 export const sortByName = (files) =>
-  files.slice().sort((a, b) => a.name.localeCompare(b.name, undefined, { numeric: true }));
+  files.slice().sort((a, b) => {
+    const x = splitTrailingNum(a.name);
+    const y = splitTrailingNum(b.name);
+    return collate(x.base, y.base) || x.num - y.num || collate(a.name, b.name);
+  });
 
 function paintUpload() {
   const c = document.getElementById('upprog');
@@ -983,7 +995,7 @@ function paintUpload() {
 }
 
 async function uploadAndCreate(files, title, group) {
-  const list = sortByName(files);
+  const list = files.slice(); // 順序＝畫面上使用者看到的順序，不再重排
   const ac = new AbortController();
   upload = {
     files: list.map((f) => ({ name: f.name, size: f.size, sent: 0 })),
@@ -1065,6 +1077,7 @@ function renderNew() {
         <span class="fp-name" id="fileName">尚未選擇檔案</span>
       </label>
       <input type="file" id="audio" accept="audio/*,video/*,.m4a,.mp3,.wav,.aac,.caf,.aiff,.mp4,.mov" multiple hidden />
+      <div id="fileList" class="file-list"></div>
       <p style="margin-bottom:6px"><b>標題</b></p>
       <input type="text" id="newTitle" placeholder="（預設用檔名）" />
       <p style="margin-bottom:6px"><b>分類</b></p>
@@ -1085,27 +1098,54 @@ function renderNew() {
       </details>
     </div>`;
   const titleInp = document.getElementById('newTitle');
-  document.getElementById('audio').onchange = (e) => {
-    const fs = sortByName(Array.from(e.target.files || []));
+  let selected = []; // 目前順序（上傳與 createMeeting 都照這個）
+  let titleEdited = false;
+  titleInp.addEventListener('input', () => {
+    titleEdited = true;
+  });
+  const paintList = () => {
     const nameEl = document.getElementById('fileName');
-    if (!fs.length) {
-      nameEl.textContent = '尚未選擇檔案';
-    } else if (fs.length === 1) {
-      nameEl.textContent = `${fs[0].name}（${fmtMB(fs[0].size)}）`;
-    } else {
-      nameEl.textContent = `已選 ${fs.length} 支（依此順序接合）：\n` + fs.map((f, i) => `${i + 1}. ${f.name}（${fmtMB(f.size)}）`).join('\n');
+    const listEl = document.getElementById('fileList');
+    const fs = selected;
+    if (!fs.length) nameEl.textContent = '尚未選擇檔案';
+    else if (fs.length === 1) nameEl.textContent = `${fs[0].name}（${fmtMB(fs[0].size)}）`;
+    else nameEl.textContent = `已選 ${fs.length} 支（依此順序接合）：`;
+    listEl.innerHTML =
+      fs.length > 1
+        ? fs
+            .map(
+              (f, i) => `<div class="file-row"><span class="fr-no">${i + 1}.</span><span class="fr-name">${esc(f.name)}（${fmtMB(f.size)}）</span>` +
+                `<button type="button" class="fr-btn" data-mv="up" data-i="${i}" aria-label="上移"${i === 0 ? ' disabled' : ''}>↑</button>` +
+                `<button type="button" class="fr-btn" data-mv="down" data-i="${i}" aria-label="下移"${i === fs.length - 1 ? ' disabled' : ''}>↓</button></div>`
+            )
+            .join('')
+        : '';
+    if (fs.length) {
+      titleInp.placeholder = defaultTitle(fs[0].name, Date.now());
+      if (!titleEdited) titleInp.value = defaultTitle(fs[0].name, Date.now());
     }
-    if (fs.length) titleInp.placeholder = defaultTitle(fs[0].name, Date.now());
     document.getElementById('filePick').classList.toggle('picked', !!fs.length);
   };
+  document.getElementById('fileList').addEventListener('click', (e) => {
+    const btn = e.target.closest && e.target.closest('button[data-mv]');
+    if (!btn || btn.disabled) return;
+    const i = Number(btn.dataset.i);
+    const j = btn.dataset.mv === 'up' ? i - 1 : i + 1;
+    if (j < 0 || j >= selected.length) return;
+    [selected[i], selected[j]] = [selected[j], selected[i]];
+    paintList();
+  });
+  document.getElementById('audio').onchange = (e) => {
+    selected = sortByName(Array.from(e.target.files || []));
+    paintList();
+  };
   document.getElementById('go').onclick = async () => {
-    const fs = Array.from(document.getElementById('audio').files || []);
-    if (!fs.length) {
+    if (!selected.length) {
       alert('請先選擇音檔');
       return;
     }
-    const title = titleInp.value.trim() || defaultTitle(sortByName(fs)[0].name, Date.now());
-    await uploadAndCreate(fs, title, document.getElementById('newGroup').value || null);
+    const title = titleInp.value.trim() || defaultTitle(selected[0].name, Date.now());
+    await uploadAndCreate(selected.slice(), title, document.getElementById('newGroup').value || null);
   };
 }
 

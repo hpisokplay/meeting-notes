@@ -467,3 +467,11 @@ a.big.secondary { background: var(--bg); color: var(--ink); }
 .gaps-line { margin-top: 6px; font-size: 13px; font-weight: 600; color: #b35900; }
 .gaps-line summary { cursor: pointer; min-height: 32px; display: flex; align-items: center; }
 .gaps-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 4px; font-weight: 400; }
+
+/* 多檔順序調整 */
+.file-list { margin: 8px 0 4px; }
+.file-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 14px; }
+.file-row .fr-no { min-width: 1.8em; color: var(--muted); }
+.file-row .fr-name { flex: 1; min-width: 0; word-break: break-all; }
+.file-row .fr-btn { min-width: 44px; min-height: 44px; padding: 0; font-size: 20px; line-height: 1; }
+.file-row .fr-btn:disabled { opacity: 0.3; }
