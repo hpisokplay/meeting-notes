@@ -21,6 +21,7 @@ from fastapi import APIRouter, Body, HTTPException
 
 from . import prompts as P
 from . import review as R
+from . import wordreview as W
 from .items import ensure_ids, item_text, normalize_item, normalize_src
 from .storage import BadId, Store
 
@@ -64,7 +65,9 @@ STEP_MODE = ("mode", 15, "判斷講座／會議")
 STEP_SUMMARY = ("summary", 25, "整理摘要中")
 STEP_NOTES = ("notes", 50, "整理筆記中")
 STEP_SLIPS = ("slips", 75, "檢查口誤中")
-STEP_VERIFY = ("verify", 92, "驗證中")
+STEP_VERIFY = ("verify", 90, "驗證中")
+STEP_ADJUDICATE = ("adjudicate", 93, "AI 審稿中")
+ADJUDICATE_BUDGET = 150_000  # chars per adjudicate call (items + context); more -> several calls
 
 
 class ClaudeError(Exception):
@@ -596,7 +599,8 @@ def _summary(ctx: Ctx, payload):
 
 
 def _reprocess(ctx: Ctx, payload):
-    """correction -> mode -> summary -> notes (if any) -> slips -> verify; one write at the end."""
+    """correction -> mode -> summary -> notes (if any) -> slips -> verify -> adjudicate (word-review
+    cards); one write at the end."""
     m0 = ctx.m
     fp = _fingerprint(m0.get("transcript"))
     transcript = copy.deepcopy(m0.get("transcript") or [])
@@ -634,6 +638,21 @@ def _reprocess(ctx: Ctx, payload):
         slips = _optional(lambda: [x for text in chunk_lines(lines, ctx.budget)
                                    for x in _a(ctx.call(P.SLIPS, text, P.SLIPS_SCHEMA).get("items"))], "檢查口誤", warnings)
     ctx.step(STEP_VERIFY)
+    cards = None
+    if payload.get("adjudicate", True):
+        # verify a preview of the final meeting, then let the AI turn flags into word cards
+        pm = copy.deepcopy(m0)
+        pm.update(transcript=transcript, mode=mode, summary=summary)
+        if corrections is not None:
+            pm["corrections"] = corrections
+        if notes is not None:
+            pm["notes"] = notes
+        _reverify(pm, ctx, slips)
+        ctx.step(STEP_ADJUDICATE)
+        budget = min(ctx.budget, ADJUDICATE_BUDGET)
+        cards = _optional(lambda: [x for text in W.adjudicate_messages(pm, budget)
+                                   for x in _a(ctx.call(P.ADJUDICATE, text, P.ADJUDICATE_SCHEMA).get("items"))],
+                          "AI 審稿", warnings)
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
@@ -659,6 +678,8 @@ def _reprocess(ctx: Ctx, payload):
         else:
             m.pop("warnings", None)
         _reverify(m, ctx, slips)
+        # new cards replace the open ones; on an adjudicate failure the program flags stay as they are
+        W.apply_ai_cards(m, cards or [])
     return apply
 
 

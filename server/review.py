@@ -15,6 +15,7 @@ from fastapi import APIRouter, Body, HTTPException
 
 from .items import NOTES_LIST_KEYS, ensure_ids, item_text, normalize_src, parse_time
 from .storage import BadId, Store
+from . import wordreview as W
 from .verify import TranscriptIndex, extract_numbers, review_item, verify_meeting
 
 MODES = ("lecture", "meeting")
@@ -232,6 +233,8 @@ def verify_review(m: dict, glossary, extra: list | None = None, *, replace_slips
     for r in items:
         if r.get("kind") == "term" and r.get("state") == "pending":
             r["detail"] = term_detail(m, r)
+    # word-review cards: flags merged into cards stay merged, leftover cards, card targets refreshed
+    items = W.finalize_review(m, items, prev_items)
     return {"items": items, "at": now_ms()}
 
 
@@ -396,14 +399,26 @@ def _reject_term(m: dict, wrong: str) -> None:
     corr["at"] = now_ms()
 
 
-def review_action(m: dict, rid: str, action: str, text: str | None = None) -> None:
+def review_action(m: dict, rid: str, action: str, text: str | None = None) -> dict | None:
     """Mutate meeting m for one review action. KeyError if the review item does not exist;
-    ValueError for edit / delete on an item without a target entry (slip etc., term excepted)."""
+    ValueError for edit / delete on an item without a target entry (slip etc., term excepted).
+
+    Word-review cards (kind "word"): accept / keep / edit (legacy confirm = accept, delete = keep)
+    change the transcript and every summary / notes entry containing the span; returns
+    applied {transcript, items}. Legacy items: accept / keep act as confirm; returns None."""
     review = m.get("review") if isinstance(m.get("review"), dict) else {}
     items = [r for r in review.get("items") or [] if isinstance(r, dict)]
     r = next((x for x in items if x.get("id") == rid), None)
     if r is None:
         raise KeyError(rid)
+    if W.is_card(r):
+        applied = W.card_action(m, r, action, text)
+        review["items"] = items
+        review["at"] = now_ms()
+        m["review"] = review
+        return applied
+    if action in ("accept", "keep"):
+        action = "confirm"
     kind, section, item_id = r.get("kind"), str(r.get("section") or ""), r.get("itemId")
 
     if kind == "term":
@@ -496,22 +511,29 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
     @r.post("/meetings/{mid}/review/{rid}")
     def review(mid: str, rid: str, body: dict = Body(...)):
         action = body.get("action")
-        if action not in ("confirm", "edit", "delete"):
+        if action not in ("accept", "keep", "edit", "confirm", "delete"):
             raise HTTPException(400, "未知的動作")
         text = body.get("text")
         if action == "edit" and (not isinstance(text, str) or not text.strip()):
             raise HTTPException(400, "請輸入改正後的內容")
         text = text.strip() if isinstance(text, str) else None
+        got: dict = {}
+
         def apply(m):
             cur = get_jobs().read(m.get("aiJobId")) if m.get("aiJobId") else None
             if m.get("status") == "summarizing" and cur and cur.get("state") in ACTIVE_JOB_STATES:
                 raise HTTPException(409, "整理中，請稍後再確認")
             try:
-                review_action(m, rid, action, text)
+                applied = review_action(m, rid, action, text)
             except ValueError as e:
                 raise HTTPException(400, str(e))
+            if applied is not None:
+                got["applied"] = applied
+                # pure program re-verify (no AI): handled cards / merged flags are carried over
+                m["review"] = verify_review(m, store.glossary_list())
         try:
-            return store.update(mid, apply)
+            saved = store.update(mid, apply)
+            return {**saved, "applied": got["applied"]} if "applied" in got else saved
         except BadId:
             raise HTTPException(400, "會議 id 不合法")
         except KeyError as e:

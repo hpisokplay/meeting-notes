@@ -14,7 +14,8 @@ transcript translation calls.
 Grounded prompts (2026-10-06): MODE_DETECT answers env FAKE_CLAUDE_KIND (default "meeting");
 SUMMARY_MEETING / SUMMARY_LECTURE / enhance-with-src / NOTES-with-src return Items whose src quotes
 the first "[HH:MM:SS] 說話者: 內容" line of stdin; CORRECTION returns env FAKE_CLAUDE_CORRECTIONS
-(JSON list, default []); SLIPS returns env FAKE_CLAUDE_SLIPS (JSON list, default []).
+(JSON list, default []); SLIPS returns env FAKE_CLAUDE_SLIPS (JSON list, default []); ADJUDICATE returns
+env FAKE_CLAUDE_ADJUDICATE (see adjudicate_items); FAKE_CLAUDE_ADJUDICATE_FAIL=1 fails that call only.
 FAKE_CLAUDE_LOG=<path> appends {"argv": [...], "stdin": "..."} as one JSON line per call.
 """
 import json
@@ -56,6 +57,23 @@ def first_src(stdin):
         return []
     h, mi, se, text = m.groups()
     return [{"t": int(h) * 3600 + int(mi) * 60 + int(se), "quote": text[:20]}]
+
+
+def adjudicate_items(stdin):
+    """FAKE_CLAUDE_ADJUDICATE (JSON list, default []); a fromFlags entry "*<kind>" expands to the ids
+    of every [F:<id>] <kind> flag in stdin, "*<kind>:<text>" to those whose line contains <text>."""
+    items = json.loads(os.environ.get("FAKE_CLAUDE_ADJUDICATE", "[]"))
+    flags = re.findall(r"\[F:([0-9a-f]{8})\] (\w+)：([^\n]*)", stdin)
+    for it in items:
+        out = []
+        for f in it.get("fromFlags") or []:
+            if f.startswith("*"):
+                kind, _, needle = f[1:].partition(":")
+                out += [i for i, k, line in flags if k == kind and needle in line]
+            else:
+                out.append(f)
+        it["fromFlags"] = out
+    return items
 
 
 def is_obj_list(schema, key):
@@ -102,6 +120,8 @@ def auto(schema, system, stdin):
             return {"items": json.loads(os.environ.get("FAKE_CLAUDE_CORRECTIONS", "[]"))}
         if "issue" in ip:
             return {"items": json.loads(os.environ.get("FAKE_CLAUDE_SLIPS", "[]"))}
+        if "span" in ip:
+            return {"items": adjudicate_items(stdin)}
         if "src" in ip and (it["properties"]["src"].get("items") or {}).get("type") == "object":
             return {"items": [{"text": "加強一", "src": src}, {"text": "加強二", "src": src}]}
         if "src" in ip:
@@ -131,6 +151,9 @@ def main():
             f.write(json.dumps({"argv": sys.argv[1:], "stdin": stdin}, ensure_ascii=False) + "\n")
     mode = os.environ.get("FAKE_CLAUDE_MODE", "auto")
     out = sys.stdout.buffer
+    if os.environ.get("FAKE_CLAUDE_ADJUDICATE_FAIL") and '"span"' in (arg("--json-schema") or ""):
+        sys.stderr.write("boom: adjudicate broke\n")
+        return 2
     if mode == "sleep":
         time.sleep(60)
         return 0

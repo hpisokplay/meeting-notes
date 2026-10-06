@@ -25,7 +25,7 @@ STATIC_FILES = {"index.html", "sw.js", "manifest.webmanifest"}
 STATIC_DIRS = {"css", "js", "icons"}
 # owned by the server (job pipeline): a client PUT never changes them
 SERVER_OWNED = ("status", "progress", "jobId", "aiJobId", "audio", "error",
-                "transcriptRaw", "corrections", "review", "mode", "warnings")
+                "transcriptRaw", "corrections", "review", "mode", "warnings", "gaps")
 # a client PUT that changes any of these re-runs program verification (review.verify_review)
 VERIFIED_CONTENT = ("summary", "notes", "transcript")
 

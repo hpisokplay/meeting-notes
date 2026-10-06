@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from .gaps import compute_gaps
 from .render import meeting_to_docx, meeting_to_markdown
 
 log = logging.getLogger(__name__)
@@ -137,6 +138,11 @@ class Store:
     def save(self, m: dict, touch: bool = True) -> dict:
         mid = m["id"]
         with self._lock(mid):
+            # every transcript save recomputes the unrecognised stretches (word-review spec)
+            if isinstance(m.get("transcript"), list) and m["transcript"]:
+                m["gaps"] = compute_gaps(m["transcript"], m.get("durationSec"))
+            else:
+                m.pop("gaps", None)
             if touch or not m.get("updatedAt"):
                 m["updatedAt"] = int(time.time() * 1000)
             atomic_write_json(self._mpath(mid), m)

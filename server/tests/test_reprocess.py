@@ -93,10 +93,11 @@ def test_pipeline_after_transcription_lecture(sj, fake_env, monkeypatch, tmp_pat
     monkeypatch.undo()
 
     stages = [s[0] for s in seen if s[0] != "claude"]
-    assert stages == ["correction", "mode", "summary", "slips", "verify"]  # no notes yet
+    assert stages == ["correction", "mode", "summary", "slips", "verify", "adjudicate"]  # no notes yet
     msgs = {s[0]: s[1] for s in seen}
     assert msgs["correction"] == "名詞校正中" and msgs["mode"] == "判斷講座／會議"
     assert msgs["summary"] == "整理摘要中" and msgs["slips"] == "檢查口誤中" and msgs["verify"] == "驗證中"
+    assert msgs["adjudicate"] == "AI 審稿中"
     # the meeting carried the stage + action while summarizing (checked at the next report)
     assert ("summary", "reprocess", "summarizing") in [(s[2], s[3], s[4]) for s in seen]
 
@@ -341,7 +342,9 @@ def test_mode_endpoint(app_client, tmp_path, monkeypatch):
     assert m["mode"] == "lecture"
     assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa"}
     schemas = [c_[0] for c_ in log_calls(log)]
-    assert len(schemas) == 1 and "conclusions" in schemas[0]["properties"]  # no correction / slips / mode
+    # no correction / slips / mode: the summary, then the word-review adjudicate
+    assert len(schemas) == 2 and "conclusions" in schemas[0]["properties"]
+    assert "span" in schemas[1]["properties"]["items"]["items"]["properties"]
     assert any(r["kind"] == "slip" for r in m["review"]["items"])  # existing slip list kept
 
 

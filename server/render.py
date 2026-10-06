@@ -6,6 +6,7 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+from .gaps import gaps_line, meeting_gaps
 from .items import item_text
 
 _BAD_XML = re.compile('[^' + chr(9) + chr(10) + chr(13) + chr(0x20) + '-' + chr(0xD7FF) + chr(0xE000) + '-' + chr(0xFFFD) + chr(0x10000) + '-' + chr(0x10FFFF) + ']')
@@ -85,6 +86,9 @@ def meeting_to_markdown(m: dict) -> str:
     secs, qa = _sections(m)
     out = [f"# {m.get('title') or '未命名會議'}", "", f"日期：{_date(m)}（台北）",
            f"分類：{_group_name(m)}", f"長度：{_fmt_dur(m.get('durationSec'))}", ""]
+    gl = gaps_line(meeting_gaps(m))
+    if gl:
+        out += [f"> {gl}", ""]
     warns = [w for w in m.get("warnings") or [] if isinstance(w, str) and w]
     if warns:
         out += [f"> ⚠️ {w}" for w in warns] + [""]
@@ -106,6 +110,9 @@ def meeting_to_docx(m: dict, path: Path) -> None:
     d.add_paragraph(f"日期：{_date(m)}（台北）")
     d.add_paragraph(_x(f"分類：{_group_name(m)}"))
     d.add_paragraph(f"長度：{_fmt_dur(m.get('durationSec'))}")
+    gl = gaps_line(meeting_gaps(m))
+    if gl:
+        d.add_paragraph(_x(gl))
     for w in m.get("warnings") or []:
         if isinstance(w, str) and w:
             d.add_paragraph(_x(f"⚠️ {w}"))
