@@ -1,6 +1,6 @@
 // Service Worker：快取 App 靜態殼，離線也能開啟（會議資料的離線快取在 IndexedDB，由 app 自己管）。
 // /api/* 一律直接走網路、絕不快取；錄音的 Range 請求（播放器拖曳）也不攔，交給瀏覽器直接跟 NAS 談。
-const CACHE = 'meeting-app-v109';
+const CACHE = 'meeting-app-v110';
 const ASSETS = [
   './',
   './index.html',

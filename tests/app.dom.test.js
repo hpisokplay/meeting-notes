@@ -1,6 +1,6 @@
 // 整合測試：以 jsdom 實際載入 app.js（api.js 換成記憶體裡的假 NAS），渲染清單、詳情、進度、設定頁。
 import 'fake-indexeddb/auto';
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import * as api from '../js/api.js';
 
 const nas = vi.hoisted(() => ({ meetings: {}, groups: [], jobs: {}, calls: [] }));
@@ -194,7 +194,7 @@ describe('app（整合，假 NAS）', () => {
     expect(html).toContain('📄 PDF');
     expect(html).toContain('📝 Word');
     expect(html).toContain('📤 分享');
-    expect(html).toContain('加強待辦');
+    expect(html).toContain('加強重點');
     expect(html).toContain('data-enh="qa"');
     expect(html).not.toContain('spk-chip'); // 講者改名只在編輯模式
     expect(html).toContain('English');
@@ -229,7 +229,7 @@ describe('app（整合，假 NAS）', () => {
     ['#shareBtn', '#pdfBtn', '#wordBtn', '#copyAllBtn', '#exportLock'].forEach((x) => expect(inGroup('export', x)).toBe(true));
     ['#langToggle', '#modeToggle', '[data-kind="lecture"]', '[data-kind="meeting"]'].forEach((x) => expect(inGroup('view', x)).toBe(true));
     expect(inGroup('review', '#reviewBtn')).toBe(true);
-    ['#reprocessBtn', '#enhBtn', '#retrBtn', '#editModeBtn', '#enhGrid'].forEach((x) => expect(inGroup('ai', x)).toBe(true));
+    ['#reprocessBtn', '[data-enh="mainPoints"]', '[data-enh="qa"]', '#retrBtn', '#editModeBtn'].forEach((x) => expect(inGroup('ai', x)).toBe(true));
     // 舊的分散卡片都不在了
     expect(document.getElementById('termsCard')).toBeNull();
     expect(document.getElementById('reviewHead')).toBeNull();
@@ -279,24 +279,123 @@ describe('app（整合，假 NAS）', () => {
     expect(document.getElementById('editModeBtn').getAttribute('aria-pressed')).toBe('false');
   });
 
-  it('加強 ▾：選單平常收起，點開列出目前模式的加強項目，點了送 runAI', async () => {
+  it('AI 處理：沒有「加強 ▾」選單，直接有「加強重點」「加強Q&A」；點了送 runAI；學習筆記模式多一顆筆記鈕', async () => {
     await go('#/m/test-1');
-    const grid = document.getElementById('enhGrid');
-    expect(grid.hidden).toBe(true);
-    document.getElementById('enhBtn').click();
-    expect(grid.hidden).toBe(false);
-    expect([...grid.querySelectorAll('[data-enh]')].map((b) => b.dataset.enh)).toEqual(['actionItems', 'mainPoints', 'qa']);
-    grid.querySelector('[data-enh="qa"]').click();
+    expect(document.getElementById('enhBtn')).toBeNull();
+    expect(document.getElementById('enhGrid')).toBeNull();
+    const ai = document.querySelector('#toolbar [data-group="ai"]');
+    expect([...ai.querySelectorAll('[data-enh]')].map((b) => [b.dataset.enh, b.textContent])).toEqual([
+      ['mainPoints', '📌 加強重點'],
+      ['qa', '❓ 加強Q&A'],
+    ]);
+    expect(ai.textContent).not.toContain('▾');
+    expect(ai.querySelector('[data-gen-notes]')).toBeNull();
+    ai.querySelector('[data-enh="qa"]').click();
     await tick(120);
     expect(nas.calls).toContainEqual(['runAI', 'test-1', 'enhance', { section: 'qa' }]);
-    // 學習筆記模式（還沒產生）：選單只有「產生學習筆記」
     document.querySelector('#modeToggle [data-mode="notes"]').click();
     await tick();
-    const g2 = document.getElementById('enhGrid');
-    expect(g2.querySelector('[data-nenh]')).toBeNull();
-    expect(g2.querySelector('[data-gen-notes]').textContent).toContain('產生學習筆記');
+    const ai2 = document.querySelector('#toolbar [data-group="ai"]'); // 加強後整頁重畫過
+    expect(ai2.querySelector('[data-enh="mainPoints"]')).toBeTruthy();
+    expect(ai2.querySelector('[data-gen-notes]').textContent).toContain('產生學習筆記');
     document.querySelector('#modeToggle [data-mode="meeting"]').click();
     await tick();
+  });
+
+  it('分享鈕不是 primary（跟 PDF／Word／複製全文同款），重新整理鈕文字精簡但保留完整提示', async () => {
+    await go('#/m/test-1');
+    expect(document.getElementById('shareBtn').classList.contains('primary')).toBe(false);
+    expect(document.querySelectorAll('#toolbar .act-btn.primary').length).toBe(0);
+    const rp = document.getElementById('reprocessBtn');
+    expect(rp.textContent.trim()).toBe('🔁 重新整理');
+    expect(rp.getAttribute('aria-label')).toBe('重新整理（不重新轉錄）');
+    expect(rp.title).toBe('重新整理（不重新轉錄）');
+  });
+
+  describe('錄音停止／浮動膠囊／逐字稿快速捲動軸', () => {
+    let ios;
+    beforeEach(() => {
+      ios = [];
+      globalThis.IntersectionObserver = class {
+        constructor(cb) { this.cb = cb; this.els = []; ios.push(this); }
+        observe(el) { this.els.push(el); }
+        disconnect() { this.els = []; }
+        fire(el, isIntersecting) { this.cb([{ target: el, isIntersecting }]); }
+      };
+    });
+    afterEach(() => { delete globalThis.IntersectionObserver; });
+    const ioFor = (el) => ios.find((o) => o.els.includes(el));
+
+    it('停止鈕：暫停、回到這次播放的起點、取消浮動', async () => {
+      await go('#/m/test-1');
+      document.querySelector('[data-seek="2"]').click(); // 第 2 支 100 秒
+      const parts = document.querySelectorAll('#audioCard .audio-part');
+      const a = parts[1].querySelector('audio');
+      a.pause = vi.fn();
+      a.currentTime = 150;
+      document.getElementById('audioStopBtn').click();
+      expect(a.pause).toHaveBeenCalled();
+      expect(a.currentTime).toBe(100);
+      expect(parts[1].classList.contains('floating')).toBe(false);
+    });
+
+    it('播放中且錄音卡不在畫面 → 浮出膠囊（暫停／繼續、停止、時間）；卡片進入畫面或停止就消失', async () => {
+      await go('#/m/test-1');
+      const card = document.getElementById('audioCard');
+      const pill = document.getElementById('audioPill');
+      expect(pill.hidden).toBe(true);
+      const a = card.querySelector('audio');
+      a.pause = vi.fn();
+      a.dispatchEvent(new Event('play'));
+      ioFor(card).fire(card, true); // 卡片看得到 → 不顯示
+      expect(pill.hidden).toBe(true);
+      ioFor(card).fire(card, false);
+      expect(pill.hidden).toBe(false);
+      const tg = document.getElementById('pillToggle');
+      expect(tg.textContent).toContain('暫停');
+      tg.click();
+      expect(a.pause).toHaveBeenCalled();
+      a.dispatchEvent(new Event('pause'));
+      expect(tg.textContent).toContain('繼續');
+      expect(pill.hidden).toBe(false);
+      expect(document.getElementById('pillTime').textContent).toMatch(/\d+:\d\d/);
+      document.getElementById('pillStop').click();
+      expect(pill.hidden).toBe(true);
+      a.dispatchEvent(new Event('play'));
+      expect(pill.hidden).toBe(false);
+      ioFor(card).fire(card, true);
+      expect(pill.hidden).toBe(true);
+    });
+
+    it('快速捲動軸：只在逐字稿在畫面上時顯示；⤒／⤓ 呼叫捲動；拖曳 thumb 依位置捲動並顯示時間氣泡', async () => {
+      await go('#/m/test-1');
+      const view = document.getElementById('view');
+      const tr = document.getElementById('trBody');
+      const rail = document.getElementById('trRail');
+      expect(rail.hidden).toBe(true);
+      ioFor(tr).fire(tr, true);
+      expect(rail.hidden).toBe(false);
+      view.scrollTo = vi.fn();
+      document.getElementById('trTopBtn').click();
+      document.getElementById('trBotBtn').click();
+      expect(view.scrollTo).toHaveBeenCalledTimes(2);
+      expect(view.scrollTo.mock.calls[0][0].top).toBeLessThanOrEqual(view.scrollTo.mock.calls[1][0].top);
+      const track = document.getElementById('railTrack');
+      track.getBoundingClientRect = () => ({ top: 100, height: 456, bottom: 556, left: 0, right: 44, width: 44 });
+      const thumb = document.getElementById('railThumb');
+      Object.defineProperty(thumb, 'offsetHeight', { value: 56, configurable: true });
+      thumb.setPointerCapture = vi.fn();
+      const ev = (type, y) => Object.assign(new Event(type, { bubbles: true }), { clientY: y, pointerId: 1 });
+      thumb.dispatchEvent(ev('pointerdown', 100 + 28));
+      const bubble = document.getElementById('railBubble');
+      expect(bubble.hidden).toBe(false);
+      expect(view.scrollTo).toHaveBeenCalledTimes(3);
+      thumb.dispatchEvent(ev('pointermove', 100 + 456 - 28));
+      expect(view.scrollTo).toHaveBeenCalledTimes(4);
+      expect(bubble.textContent.length).toBeGreaterThan(0);
+      thumb.dispatchEvent(ev('pointerup', 0));
+      expect(bubble.hidden).toBe(true);
+    });
   });
 
   it('複製全文：目前畫面的各區＋逐字稿串起來；待確認沒清空前擋下', async () => {
@@ -598,7 +697,7 @@ describe('app（整合，假 NAS）', () => {
 
   it('重新整理（不重新轉錄）：送 ai reprocess', async () => {
     await go('#/m/test-1');
-    expect(document.getElementById('reprocessBtn').textContent).toContain('重新整理（不重新轉錄）');
+    expect(document.getElementById('reprocessBtn').getAttribute('aria-label')).toBe('重新整理（不重新轉錄）');
     document.getElementById('reprocessBtn').click();
     await tick(120);
     expect(nas.calls).toContainEqual(['runAI', 'test-1', 'reprocess', {}]);
@@ -1228,6 +1327,20 @@ describe('app（整合，假 NAS）', () => {
 });
 
 describe('播放與狀態的純函式', () => {
+  it('railMap／railFrac：thumb 位置與捲動位置互相換算，並夾在範圍內', async () => {
+    const { railMap, railFrac } = await import('../js/app.js');
+    // 逐字稿從 1000 到 5000，畫面高 600 → 可捲範圍 1000..4400
+    expect(railMap(0, 1000, 5000, 600)).toBe(1000);
+    expect(railMap(1, 1000, 5000, 600)).toBe(4400);
+    expect(railMap(0.5, 1000, 5000, 600)).toBe(2700);
+    expect(railMap(2, 1000, 5000, 600)).toBe(4400);
+    expect(railMap(-1, 1000, 5000, 600)).toBe(1000);
+    expect(railFrac(2700, 1000, 5000, 600)).toBeCloseTo(0.5);
+    expect(railFrac(0, 1000, 5000, 600)).toBe(0);
+    expect(railFrac(9999, 1000, 5000, 600)).toBe(1);
+    expect(railFrac(50, 100, 300, 600)).toBe(0); // 逐字稿比一個畫面還短
+  });
+
   it('seekTarget：絕對秒數依各支長度換算；舊資料 fi 直接指定第幾支', async () => {
     const appMod = await import('../js/app.js');
     const audio = [{ durationSec: 600 }, { durationSec: 600 }];

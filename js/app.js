@@ -30,7 +30,7 @@ import {
   gapMinutes,
 } from './items.js';
 
-const APP_VERSION = 'v109';
+const APP_VERSION = 'v110';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -193,6 +193,18 @@ export function seekTarget(seg, audio) {
 }
 
 // 找出「這條摘要最可能出自哪一段逐字稿」：用字元二字組（bigram）重疊評分，免 API、即時
+// 快速捲動軸：thumb 位置（0~1）↔ 頁面捲動位置。範圍從逐字稿頂端捲到「逐字稿底端剛好貼住畫面底」
+export function railMap(frac, topY, bottomY, viewH) {
+  const end = Math.max(topY, bottomY - viewH);
+  const f = Math.min(1, Math.max(0, Number(frac) || 0));
+  return topY + f * (end - topY);
+}
+export function railFrac(scrollY, topY, bottomY, viewH) {
+  const end = Math.max(topY, bottomY - viewH);
+  if (end <= topY) return 0;
+  return Math.min(1, Math.max(0, (scrollY - topY) / (end - topY)));
+}
+
 // 秒數 → 顯示字串。單檔錄音用 h:mm:ss；多檔則標明是第幾支，方便回去找那個檔案。
 export function timeLabel(seg) {
   const s = Math.max(0, Math.round((seg && seg.t) || 0));
@@ -1304,6 +1316,16 @@ async function renderProgress(id) {
   tick();
 }
 
+// 詳情頁的浮動元件（錄音膠囊、逐字稿快速捲動軸）與觀察器；重畫或離開時卸掉
+const detailWidgets = [];
+function releaseDetailWidgets() {
+  while (detailWidgets.length) {
+    try {
+      detailWidgets.pop()();
+    } catch (_) {}
+  }
+}
+
 async function renderDetail(id, preloaded) {
   // 先秒開快取，再向 NAS 拿最新版；有變就重畫
   let m = preloaded || null;
@@ -1475,6 +1497,7 @@ async function renderDetail(id, preloaded) {
             `<audio controls preload="none" src="${esc(api.audioUrl(id, n))}"></audio><button class="audio-x" type="button" title="收起">✕</button></div>`
         )
         .join('')}
+      <button type="button" class="act-btn audio-stop" id="audioStopBtn" aria-label="停止播放">⏹ 停止</button>
       <div class="hint">點逐字稿裡的<b>時間標記</b>可以從那裡開始播放。</div>
     </div>`
     : '';
@@ -1497,7 +1520,7 @@ async function renderDetail(id, preloaded) {
       <div class="tb-group" data-group="export">
         <div class="tb-label">📤 匯出</div>
         <div class="tb-row tb-4">
-          <button class="act-btn primary" id="shareBtn" type="button">📤 分享</button>
+          <button class="act-btn" id="shareBtn" type="button">📤 分享</button>
           <button class="act-btn" id="pdfBtn" type="button">📄 PDF</button>
           <button class="act-btn" id="wordBtn" type="button">📝 Word</button>
           <button class="act-btn" id="copyAllBtn" type="button">📋 複製全文</button>
@@ -1526,12 +1549,11 @@ async function renderDetail(id, preloaded) {
       <div class="tb-group" data-group="ai">
         <div class="tb-label">🤖 AI 處理</div>
         <div class="tb-row tb-2">
-          ${hasTranscript ? '<button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess">🔁 重新整理（不重新轉錄）</button>' : ''}
-          <button type="button" class="act-btn" id="enhBtn" aria-controls="enhGrid" aria-expanded="false">⚡ 加強 ▾</button>
+          ${hasTranscript ? '<button type="button" class="act-btn" id="reprocessBtn" data-task="reprocess" title="重新整理（不重新轉錄）" aria-label="重新整理（不重新轉錄）">🔁 重新整理</button>' : ''}
+          <span class="ai-dyn" id="aiDyn"></span>
           ${audioParts.length ? '<button type="button" class="act-btn" id="retrBtn">🎙 重新轉錄</button>' : ''}
           <button type="button" class="tb-btn" id="editModeBtn" aria-pressed="false">✏️ 編輯模式</button>
         </div>
-        <div class="enh-menu" id="enhGrid" data-autoshow hidden></div>
       </div>
     </div>
     <div class="card review-panel" id="reviewPanel" data-autoshow hidden>
@@ -1559,6 +1581,65 @@ async function renderDetail(id, preloaded) {
   const trBody = document.getElementById('trBody'); // 逐字稿（隨語言重畫）
 
   // ===== 錄音播放 =====
+  releaseDetailWidgets(); // 重畫詳情頁：先卸掉上一次的浮動元件／觀察器
+  let audioActive = null; // 目前（最近一次）播放中的 <audio>；停止後為 null
+  let audioCardVisible = true;
+  view.insertAdjacentHTML(
+    'beforeend',
+    `<div class="audio-pill" id="audioPill" hidden><button type="button" id="pillToggle">⏸ 暫停</button><button type="button" id="pillStop" aria-label="停止">⏹</button><span class="pill-t" id="pillTime">0:00</span></div>`
+  );
+  const pill = document.getElementById('audioPill');
+  const paintPill = () => {
+    if (!pill) return;
+    const show = !!audioActive && !audioCardVisible;
+    pill.hidden = !show;
+    if (!audioActive) return;
+    const playing = audioActive._playing === true;
+    document.getElementById('pillToggle').textContent = playing ? '⏸ 暫停' : '▶ 繼續';
+    document.getElementById('pillTime').textContent = fmtSec(audioActive.currentTime || 0);
+  };
+  view.querySelectorAll('#audioCard audio').forEach((a) => {
+    a.addEventListener('play', () => {
+      view.querySelectorAll('#audioCard audio').forEach((o) => o !== a && !o.paused && o.pause());
+      a._playing = true;
+      audioActive = a;
+      paintPill();
+    });
+    a.addEventListener('pause', () => {
+      a._playing = false;
+      paintPill();
+    });
+    a.addEventListener('ended', () => {
+      a._playing = false;
+      audioActive = null;
+      paintPill();
+    });
+    a.addEventListener('timeupdate', paintPill);
+  });
+  if (pill) {
+    document.getElementById('pillToggle').onclick = () => {
+      const a = audioActive;
+      if (!a) return;
+      if (a._playing === true) a.pause();
+      else {
+        const pr = a.play && a.play();
+        if (pr && pr.catch) pr.catch(() => {});
+      }
+    };
+    document.getElementById('pillStop').onclick = () => stopAllAudio();
+  }
+  const audioCardEl = document.getElementById('audioCard');
+  if (audioCardEl && typeof IntersectionObserver === 'function') {
+    audioCardVisible = false; // 等觀察器回報；回報前不亂顯示
+    const io = new IntersectionObserver((es) => {
+      es.forEach((e) => (audioCardVisible = e.isIntersecting));
+      paintPill();
+    });
+    io.observe(audioCardEl);
+    detailWidgets.push(() => io.disconnect());
+  }
+  detailWidgets.push(() => pill && pill.remove());
+
   // 點時間標記：找出是第幾支、第幾秒，該支浮到畫面下方播放（不用捲回頂端找播放器）
   const seekTo = (seg) => {
     const tgt = seekTarget(seg, audioParts);
@@ -1575,6 +1656,7 @@ async function renderDetail(id, preloaded) {
     const a = w && w.querySelector('audio');
     if (!a) return;
     w.classList.add('floating');
+    a._playStart = tgt.time;
     const go = () => {
       try {
         a.currentTime = tgt.time;
@@ -1597,6 +1679,25 @@ async function renderDetail(id, preloaded) {
       if (a) a.pause();
     };
   });
+  // 停止：暫停並回到這次播放的起點（沒有指定起點就回 0）；從時間標記／出處鈕開始的播放也一併停掉
+  const stopAllAudio = () => {
+    view.querySelectorAll('#audioCard .audio-part').forEach((w) => {
+      w.classList.remove('floating');
+      const a = w.querySelector('audio');
+      if (!a) return;
+      try {
+        a.pause();
+      } catch (_) {}
+      try {
+        a.currentTime = a._playStart || 0;
+      } catch (_) {}
+      a._playStart = 0;
+    });
+    audioActive = null;
+    paintPill();
+  };
+  const stopBtn = document.getElementById('audioStopBtn');
+  if (stopBtn) stopBtn.onclick = stopAllAudio;
   const retrBtn = document.getElementById('retrBtn');
   if (retrBtn)
     retrBtn.onclick = async () => {
@@ -1647,32 +1748,21 @@ async function renderDetail(id, preloaded) {
     mm[id] = mode;
     localStorage.setItem(MODE_KEY, JSON.stringify(mm));
     document.querySelectorAll('#modeToggle button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
-    // 「加強 ▾」選單：依目前模式列出可加強的區塊；學習筆記另有產生／重新產生
-    const eg = document.getElementById('enhGrid');
+    // AI 處理：「加強重點」「加強Q&A」直接放在工具列（講座模式的 mainPoints／qa 也是同一組 key）；學習筆記另有產生／重新產生
+    const eg = document.getElementById('aiDyn');
     if (eg) {
       const genNotesBtn = `<button class="act-btn" type="button" data-gen-notes data-task="notes">📚 ${m.notes ? '重新產生學習筆記' : '產生學習筆記'}</button>`;
       eg.innerHTML =
-        mode === 'notes'
-          ? (m.notes ? NOTE_ENH.map((x) => `<button class="act-btn" type="button" data-nenh="${x.k}" data-task="nenh:${x.k}">${x.label}</button>`).join('') : '') + genNotesBtn
-          : (meetingMode(m) === 'lecture' ? LECT_ENH : MEET_ENH).map((x) => `<button class="act-btn" type="button" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('');
+        ENH_DIRECT.map((x) => `<button class="act-btn" type="button" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('') +
+        (mode === 'notes' ? genNotesBtn : '');
       wireEnhButtons();
     }
     drawBody(lang);
   };
 
-  const MEET_ENH = [
-    { k: 'actionItems', label: '✅ 加強待辦' },
+  const ENH_DIRECT = [
     { k: 'mainPoints', label: '📌 加強重點' },
     { k: 'qa', label: '❓ 加強Q&A' },
-  ];
-  // 講座模式沒有待辦
-  const LECT_ENH = MEET_ENH.filter((x) => x.k !== 'actionItems');
-  const NOTE_ENH = [
-    { k: 'outline', label: '📑 加強大綱' },
-    { k: 'concepts', label: '💡 加強概念' },
-    { k: 'tables', label: '📊 加強表格' },
-    { k: 'figures', label: '🔢 加強數據' },
-    { k: 'quiz', label: '✍️ 加強測驗' },
   ];
 
   const tableHtml = (t, del) => {
@@ -1754,11 +1844,12 @@ async function renderDetail(id, preloaded) {
       <div class="sec-body" data-secbody="nt-f"${coll['nt-f'] ? ' hidden' : ''}>${figures || none}</div>
       ${secHead('nt-q', '✍️ 自我測驗 Quiz', 'nt-q')}
       <div class="sec-body" data-secbody="nt-q"${coll['nt-q'] ? ' hidden' : ''}>${quiz || none}</div>
-      <div class="hint" style="margin-top:10px">點章節可跳到它在逐字稿中的出處；標題可摺疊／展開。重新產生在上方「加強 ▾」。</div>
+      <div class="hint" style="margin-top:10px">點章節可跳到它在逐字稿中的出處；標題可摺疊／展開。重新產生在上方「AI 處理」。</div>
     </div>`;
   };
 
   let editSec = null; // 目前處於編輯模式的區塊代碼（一次只開一區）
+  let railSegs = []; // drawBody 設定：目前檢視語言的逐字稿（快速捲動軸的時間氣泡用）
   let copyAllText = () => ''; // drawBody 設定：目前畫面的全文
   let curJump = null; // drawBody 設定：(秒數, 原句) → 跳到逐字稿那一句（待確認清單的時間鈕也用）
 
@@ -1769,6 +1860,7 @@ async function renderDetail(id, preloaded) {
       trBody.innerHTML = '';
       return;
     }
+    railSegs = c.transcript || [];
     const s = c.summary || {};
     const actionItems = s.actionItems || [];
     const mainPoints = s.mainPoints || s.keyPoints || [];
@@ -2794,13 +2886,6 @@ async function renderDetail(id, preloaded) {
   wireEnhButtons();
 
   // ---- 工具列：AI 處理／檢視 ----
-  const enhBtn = document.getElementById('enhBtn');
-  const enhGrid = document.getElementById('enhGrid');
-  enhBtn.onclick = () => {
-    enhGrid.hidden = !enhGrid.hidden;
-    enhBtn.setAttribute('aria-expanded', String(!enhGrid.hidden));
-    enhBtn.textContent = enhGrid.hidden ? '⚡ 加強 ▾' : '⚡ 加強 ▴';
-  };
   const editModeBtn = document.getElementById('editModeBtn');
   const paintEditMode = () => {
     editModeBtn.classList.toggle('on', detailUi.edit);
@@ -3012,6 +3097,83 @@ async function renderDetail(id, preloaded) {
   }, { passive: true });
 
   setMode(mode, true); // 套用記住的模式（同時會畫出內容）
+
+  // ===== 逐字稿快速捲動軸：右緣窄軸＋可拖曳 thumb＋「⤒ ⤓」兩顆圓鈕；只在逐字稿區塊在畫面上時出現 =====
+  view.insertAdjacentHTML(
+    'beforeend',
+    `<div class="tr-rail" id="trRail" hidden><button type="button" class="rail-btn" id="trTopBtn" aria-label="捲到逐字稿頂端">⤒</button><button type="button" class="rail-btn" id="trBotBtn" aria-label="捲到逐字稿底端">⤓</button><div class="rail-track" id="railTrack"><div class="rail-thumb" id="railThumb" role="slider" aria-label="逐字稿位置"><span class="rail-bubble" id="railBubble" hidden></span></div></div></div>`
+  );
+  {
+    const rail = document.getElementById('trRail');
+    const track = document.getElementById('railTrack');
+    const thumb = document.getElementById('railThumb');
+    const bubble = document.getElementById('railBubble');
+    // 捲動的是 #view（App 外殼版面，整頁不捲）；座標都換算成 #view 內容座標
+    const range = () => {
+      const r = trBody.getBoundingClientRect();
+      const base = view.getBoundingClientRect().top - view.scrollTop;
+      return { top: r.top - base - 8, bottom: r.bottom - base };
+    };
+    const vh = () => view.clientHeight || window.innerHeight || 700;
+    const scrollView = (y, smooth) => {
+      if (view.scrollTo) view.scrollTo(smooth ? { top: y, behavior: 'smooth' } : { top: y });
+      else view.scrollTop = y;
+    };
+    let dragging = false;
+    const placeThumb = (frac) => {
+      const room = Math.max(0, track.clientHeight - thumb.offsetHeight);
+      thumb.style.transform = `translateY(${Math.round(frac * room)}px)`;
+    };
+    const syncFromScroll = () => {
+      if (!rail.isConnected) return cleanupRail();
+      if (dragging) return;
+      const { top, bottom } = range();
+      placeThumb(railFrac(view.scrollTop || 0, top, bottom, vh()));
+    };
+    const cleanupRail = () => view.removeEventListener('scroll', syncFromScroll);
+    view.addEventListener('scroll', syncFromScroll, { passive: true });
+    detailWidgets.push(cleanupRail, () => rail.remove());
+    document.getElementById('trTopBtn').onclick = () => scrollView(Math.max(0, range().top), true);
+    document.getElementById('trBotBtn').onclick = () => scrollView(Math.max(0, range().bottom - vh()), true);
+    const dragTo = (clientY) => {
+      const tr = track.getBoundingClientRect();
+      const room = Math.max(1, tr.height - thumb.offsetHeight);
+      const frac = Math.min(1, Math.max(0, (clientY - tr.top - thumb.offsetHeight / 2) / room));
+      const { top, bottom } = range();
+      scrollView(railMap(frac, top, bottom, vh()), false);
+      placeThumb(frac);
+      const n = railSegs.length;
+      const seg = n ? railSegs[Math.min(n - 1, Math.round(frac * (n - 1)))] : null;
+      bubble.textContent = seg ? timeLabel(seg) || `${Math.round(frac * 100)}%` : `${Math.round(frac * 100)}%`;
+    };
+    thumb.addEventListener('pointerdown', (e) => {
+      dragging = true;
+      thumb.classList.add('drag');
+      bubble.hidden = false;
+      try {
+        thumb.setPointerCapture(e.pointerId);
+      } catch (_) {}
+      e.preventDefault();
+      dragTo(e.clientY);
+    });
+    thumb.addEventListener('pointermove', (e) => dragging && dragTo(e.clientY));
+    const endDrag = () => {
+      dragging = false;
+      thumb.classList.remove('drag');
+      bubble.hidden = true;
+    };
+    thumb.addEventListener('pointerup', endDrag);
+    thumb.addEventListener('pointercancel', endDrag);
+    if (typeof IntersectionObserver === 'function') {
+      rail.hidden = true;
+      const io2 = new IntersectionObserver((es) => {
+        es.forEach((e) => (rail.hidden = !e.isIntersecting));
+        if (!rail.hidden) syncFromScroll();
+      });
+      io2.observe(trBody);
+      detailWidgets.push(() => io2.disconnect());
+    } else rail.hidden = false;
+  }
   // 重繪後把仍在跑的作業狀態畫回按鈕（離開再回來時才看得出它還在跑）
   paintDetailTasks();
   // 校對確認後：直接帶到逐字稿（展開、捲過去）
