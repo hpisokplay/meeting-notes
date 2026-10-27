@@ -90,3 +90,36 @@ def test_docx_report(tmp_path):
     texts = [x.text for x in d.paragraphs]
     assert "引言一段。" in texts and "i. 做事" in texts
     assert texts.index("引言一段。") < texts.index("1. 大一")
+
+
+LECTURE_EXTRA = dict(conclusions=[_it("結論甲")], advice=[_it("建議乙")], risks=[], cases=[_it("案例丁")],
+                     actionItems=[_it("做事")], qa=[_it("問：Q\n答：A")])
+
+
+def test_md_lecture_report_keeps_four_sections():
+    m = _m([_it("小標：說明", "大一")], **LECTURE_EXTRA)
+    m["mode"] = "lecture"
+    md = meeting_to_markdown(m)
+    keys = ["## 1. 大一", "## 核心結論", "1. 結論甲", "## 講者建議", "1. 建議乙", "## 案例", "1. 案例丁",
+            "## Action Items", "## Q&A"]
+    idx = [md.index(k) for k in keys]
+    assert idx == sorted(idx)
+    assert "風險提醒" not in md  # empty list -> section omitted
+    m["mode"] = "meeting"
+    md = meeting_to_markdown(m)
+    assert "核心結論" not in md and "結論甲" not in md
+
+
+def test_docx_lecture_report_keeps_four_sections(tmp_path):
+    m = _m([_it("小標：說明", "大一")], **LECTURE_EXTRA)
+    m["mode"] = "lecture"
+    p = tmp_path / "l.docx"
+    meeting_to_docx(m, p)
+    heads = [x.text for x in Document(str(p)).paragraphs if x.style.name == "Heading 1"]
+    assert heads[:6] == ["1. 大一", "核心結論", "講者建議", "案例", "Action Items", "Q&A"]
+    texts = [x.text for x in Document(str(p)).paragraphs]
+    assert "1. 結論甲" in texts and "1. 案例丁" in texts
+    m["mode"] = "meeting"
+    meeting_to_docx(m, p)
+    heads = [x.text for x in Document(str(p)).paragraphs if x.style.name == "Heading 1"]
+    assert "核心結論" not in heads

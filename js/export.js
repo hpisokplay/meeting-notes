@@ -74,6 +74,7 @@ export function safeFileName(title) {
 }
 
 // 完整整理版面：引言 → 編號大標題＋圓點子標題 → Action Items（i. ii.）→ Q&A（i. ii.）；空區塊整段省略
+const REPORT_LECTURE_KEYS = ['conclusions', 'advice', 'risks', 'cases'];
 function reportHtml(meeting, want) {
   const s = meeting.summary || {};
   const { intro, sections } = reportOutline(s);
@@ -92,6 +93,13 @@ function reportHtml(meeting, want) {
       lis.push(t ? `<li><strong>${esc(t)}：</strong>${esc(x)}</li>` : `<li>${esc(x)}</li>`);
     }
     if (lis.length) html += `<ul>${lis.join('')}</ul>`;
+  }
+  // 講座：核心結論／講者建議／風險提醒／案例 照舊格式接在報告本文之後（空的整段省略）
+  if (meetingMode(meeting) === 'lecture') {
+    for (const sec of LECTURE_SECTIONS.filter((x) => REPORT_LECTURE_KEYS.includes(x.k))) {
+      const arr = s[sec.k] || [];
+      if (want[sec.k] && arr.length) html += `<h2>${esc(sec.label)}</h2>${ol(arr)}`;
+    }
   }
   const actionItems = s.actionItems || [];
   if (want.actionItems && actionItems.length) {

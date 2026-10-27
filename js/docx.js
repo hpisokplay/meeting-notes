@@ -218,6 +218,7 @@ export function roman(n) {
 }
 
 // 完整整理版面：引言 → 編號大標題＋圓點子標題 → Action Items → Q&A
+const REPORT_LECTURE_KEYS = ['conclusions', 'advice', 'risks', 'cases'];
 const IND = '<w:ind w:left="720" w:hanging="360"/>';
 function reportBody(meeting, want) {
   const s = meeting.summary || {};
@@ -237,6 +238,15 @@ function reportBody(meeting, want) {
       body.push(para(runs, IND));
     }
   });
+  // 講座：核心結論／講者建議／風險提醒／案例 照舊格式接在報告本文之後（空的整段省略）
+  if (meetingMode(meeting) === 'lecture') {
+    for (const sec of LECTURE_SECTIONS.filter((x) => REPORT_LECTURE_KEYS.includes(x.k))) {
+      const arr = s[sec.k] || [];
+      if (!want[sec.k] || !arr.length) continue;
+      body.push(heading(sec.label));
+      arr.forEach((x, i) => body.push(line(`${i + 1}. ${itemText(x)}`)));
+    }
+  }
   const actionItems = s.actionItems || [];
   if (want.actionItems && actionItems.length) {
     body.push(heading('✅ 待辦事項 Action Item'));

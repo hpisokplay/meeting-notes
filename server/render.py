@@ -114,6 +114,18 @@ def _report_outline(m: dict):
     return intro, [(g, by[g]) for g in order]
 
 
+_REPORT_LECTURE = _LECTURE[:4]  # 核心結論／講者建議／風險提醒／案例: kept after the report body for lectures
+
+
+def _report_lecture(m: dict):
+    """Lecture meeting with a report: [(heading, [texts])] for the four lecture sections (empty ones dropped)."""
+    if m.get("mode") != "lecture":
+        return []
+    s = m.get("summary") if isinstance(m.get("summary"), dict) else {}
+    secs = [(title, [item_text(x) for x in s.get(k) or [] if item_text(x).strip()]) for k, title in _REPORT_LECTURE]
+    return [(t, xs) for t, xs in secs if xs]
+
+
 def _report_blocks(m: dict):
     """Printable pieces: (intro, [(numbered heading or '', [(title, text)])], action texts, [(q, a)])."""
     intro, secs = _report_outline(m)
@@ -140,6 +152,8 @@ def _markdown_report(m: dict, out: list) -> list:
             out += [f"## {h}"]
         out += [f"- **{t}：**{x}" if t else f"- {x}" for t, x in subs]
         out += [""]
+    for title, xs in _report_lecture(m):
+        out += [f"## {title}", *[f"{i}. {x}" for i, x in enumerate(xs, 1)], ""]
     if actions:
         out += ["## Action Items", *[f"{_roman(i)}. {x}" for i, x in enumerate(actions, 1)], ""]
     if qa:
@@ -199,6 +213,10 @@ def meeting_to_docx(m: dict, path: Path) -> None:
                 if t:
                     p.add_run(_x(f"{t}：")).bold = True
                 p.add_run(_x(x))
+        for title, xs in _report_lecture(m):
+            d.add_heading(title, 1)
+            for i, x in enumerate(xs, 1):
+                d.add_paragraph(_x(f"{i}. {x}"))
         if actions:
             d.add_heading("Action Items", 1)
             for i, x in enumerate(actions, 1):

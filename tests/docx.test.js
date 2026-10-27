@@ -193,3 +193,43 @@ describe('完整整理：修正輪', () => {
     expect(x).toContain('說明');
   });
 });
+
+describe('完整整理：講座保留四個區塊', () => {
+  const docXml = (m, o) => new TextDecoder().decode(buildDocxBytes(m, o));
+  const lec = (mode) => ({
+    title: 't',
+    createdAt: 1,
+    mode,
+    transcript: [{ speaker: '甲', text: '你好' }],
+    summary: {
+      reportIntro: ['引言'],
+      reportPoints: [{ text: '小標：說明', group: '大項' }],
+      conclusions: ['結論甲'],
+      advice: ['建議乙'],
+      risks: ['風險丙'],
+      cases: ['案例丁'],
+      actionItems: ['做事'],
+      qa: ['問：甲 答：乙'],
+    },
+  });
+  it('lecture + report: four sections between report body and Action Items/Q&A', () => {
+    const x = docXml(lec('lecture'));
+    const idx = ['1. 大項', '核心結論', '1. 結論甲', '講者建議', '1. 建議乙', '風險提醒', '1. 風險丙', '案例', '1. 案例丁', '待辦事項', '會議提問'].map((k) => x.indexOf(k));
+    expect(idx.every((i) => i >= 0)).toBe(true);
+    expect([...idx].sort((a, b) => a - b)).toEqual(idx);
+  });
+  it('lecture + report: toggles and empty lists omit a section', () => {
+    const m = lec('lecture');
+    m.summary.risks = [];
+    const x = docXml(m, { advice: false });
+    expect(x).toContain('核心結論');
+    expect(x).not.toContain('講者建議');
+    expect(x).not.toContain('風險提醒');
+    expect(x).not.toContain('（無）');
+  });
+  it('meeting mode + report: no lecture sections', () => {
+    const x = docXml(lec('meeting'));
+    expect(x).not.toContain('核心結論');
+    expect(x).not.toContain('結論甲');
+  });
+});

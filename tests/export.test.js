@@ -264,3 +264,41 @@ describe('完整整理 HTML', () => {
     expect(h).not.toContain('<A&B>');
   });
 });
+
+describe('完整整理 HTML：講座保留四個區塊', () => {
+  const lec = (mode) => ({
+    title: 'T',
+    createdAt: 1,
+    mode,
+    transcript: [{ speaker: 'A', text: 'hi' }],
+    summary: {
+      reportIntro: ['引言'],
+      reportPoints: [{ text: '小標：說明', group: '大項' }],
+      conclusions: ['結論甲'],
+      advice: ['建議乙'],
+      risks: ['風險丙'],
+      cases: ['案例丁'],
+      actionItems: ['做事'],
+      qa: ['問：甲？答：乙'],
+    },
+  });
+  it('lecture + report: four sections between report body and Action Items/Q&A', () => {
+    const h = meetingToHtmlBody(lec('lecture'));
+    const idx = ['<h2>1. 大項</h2>', '核心結論</h2><ol><li>結論甲', '講者建議</h2><ol><li>建議乙', '風險提醒</h2><ol><li>風險丙', '案例</h2><ol><li>案例丁', '待辦事項', '會議提問'].map((k) => h.indexOf(k));
+    expect(idx.every((i) => i >= 0)).toBe(true);
+    expect([...idx].sort((a, b) => a - b)).toEqual(idx);
+  });
+  it('lecture + report: toggles and empty lists omit a section', () => {
+    const m = lec('lecture');
+    m.summary.cases = [];
+    const h = meetingToHtmlBody(m, { conclusions: false });
+    expect(h).not.toContain('核心結論');
+    expect(h).toContain('講者建議');
+    expect(h).not.toContain('案例</h2>');
+  });
+  it('meeting mode + report: no lecture sections', () => {
+    const h = meetingToHtmlBody(lec('meeting'));
+    expect(h).not.toContain('核心結論');
+    expect(h).not.toContain('結論甲');
+  });
+});
