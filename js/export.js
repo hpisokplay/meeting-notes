@@ -83,7 +83,7 @@ function reportHtml(meeting, want) {
   let hn = 0;
   for (const sec of sections) {
     const h = String(sec.heading || '').trim();
-    if (h) html += `<h2 class="rp-h">${++hn}. ${esc(h)}</h2>`;
+    if (h) html += `<h2>${++hn}. ${esc(h)}</h2>`;
     const lis = [];
     for (const sub of sec.subs) {
       const t = String(sub.title || '').trim();
