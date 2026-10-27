@@ -1,5 +1,7 @@
 # 完整整理（引言＋大標題＋子標題）Implementation Plan
 
+> 2026-10-27 使用者決定：不使用 Claude API，完整整理改走 Max 訂閱；本文中 API 相關段落已作廢
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 新增 AI 動作「完整整理」（引言＋大標題＋子標題，走 Claude API、失敗退回 Max），並讓 Word／PDF／伺服器匯出照新結構排版。
