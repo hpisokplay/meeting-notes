@@ -16,6 +16,3 @@ services:
       - /volume1/docker/tgbridge/token:/run/tg/token:ro
       - /volume1/docker/tgbridge/allowed_ids:/run/tg/allowed_ids:ro
       - /volume1/docker/meetings/worker.key:/run/meetings/worker.key:ro
-      # 完整整理的 API 金鑰檔：host 上必須先建好這個「檔案」（空檔 = 關閉 API）。
-      # 若不存在，docker 會自動建出同名資料夾；程式會視為沒有金鑰（不當機）。
-      - /volume1/docker/meetings/anthropic.key:/run/meetings/anthropic.key:ro

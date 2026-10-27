@@ -21,7 +21,6 @@ from typing import Callable
 
 from fastapi import APIRouter, Body, HTTPException
 
-from . import anthropic_api as A
 from . import prompts as P
 from . import report as RP
 from . import review as R
@@ -549,12 +548,11 @@ def _dedupe(xs):
 class Ctx:
     """What an action needs: the meeting, a Claude caller and a progress reporter."""
 
-    def __init__(self, meeting: dict, call, report, model: str = DEFAULT_MODEL, glossary=None, api_call=None):
+    def __init__(self, meeting: dict, call, report, model: str = DEFAULT_MODEL, glossary=None):
         self.m = meeting
         self.model = model
         self.budget = HAIKU_MAX_CHARS if "haiku" in (model or "").lower() else MAX_CHARS
         self.call = call  # call(system, user, schema) -> dict  (Claude Max via `claude -p`)
-        self.api_call = api_call  # same signature via the Claude API (完整整理 only); None = API off
         self.report = report  # report(pct, msg, stage=None)
         self.lines = transcript_lines(meeting.get("transcript"))
         self.glossary = list(glossary or [])
@@ -1439,8 +1437,7 @@ def _reprocess(ctx: Ctx, payload):
             kept_report = {}
         m["summary"] = {**summary, **kept_report}
         if built:
-            m["reportMeta"] = {"via": built["via"], "model": built["model"], "at": int(time.time() * 1000),
-                               "fp": _fingerprint(transcript), "stale": False}
+            m["reportMeta"] = {"at": int(time.time() * 1000), "fp": _fingerprint(transcript), "stale": False}
         elif isinstance(m.get("reportMeta"), dict) and m["reportMeta"].get("fp") != _fingerprint(transcript):
             m["reportMeta"]["stale"] = True  # the kept report no longer matches this transcript
         if notes is not None:
@@ -1756,65 +1753,29 @@ def _apply_report_order(points: list[dict], raw) -> list[dict]:
     return [x for g in order for x in by[g]]
 
 
-def _generate_report(ctx: Ctx, call) -> dict:
-    """REPORT_PROMPT per chunk through `call` (API or Max), merged by program; with several chunks a
-    REPORT_MERGE call regroups / reorders by index. -> {"reportIntro": [Item], "reportPoints": [Item]}"""
+def _build_report(ctx: Ctx) -> dict:
+    """REPORT_PROMPT per chunk through ctx.call (Max), merged by program; with several chunks a
+    REPORT_MERGE call regroups / reorders by index. -> {"reportIntro": [Item], "reportPoints": [Item]}.
+    Raises ClaudeError(REPORT_EMPTY_MSG) when nothing came out; Claude errors propagate as usual."""
     chunks = chunk_lines(ctx.lines, ctx.budget)
     parts = []
     for i, text in enumerate(chunks):
         if len(chunks) > 1:
             ctx.report(30 + 50 * i // len(chunks), f"完整整理中（第 {i + 1}/{len(chunks)} 段）")
-        parts.append(RP.normalize_report(call(P.REPORT_PROMPT, text, P.REPORT_SCHEMA)))
+        parts.append(RP.normalize_report(ctx.call(P.REPORT_PROMPT, text, P.REPORT_SCHEMA)))
     out = RP.merge_reports(parts)
     if len(chunks) > 1 and len(out["reportPoints"]) > 1:
         ctx.report(85, "完整整理合併段落中")
-        order = call(P.REPORT_MERGE_PROMPT, _report_drafts(out["reportPoints"]), P.REPORT_MERGE_SCHEMA)
+        order = ctx.call(P.REPORT_MERGE_PROMPT, _report_drafts(out["reportPoints"]), P.REPORT_MERGE_SCHEMA)
         out["reportPoints"] = _apply_report_order(out["reportPoints"], order)
+    if not out["reportPoints"]:
+        raise ClaudeError(REPORT_EMPTY_MSG)
     return out
-
-
-def _safe_reason(e: BaseException) -> str:
-    """Why the API path failed, for log / error text. ApiError / ClaudeError messages are our own
-    (never the key or request text); anything else only by its class name."""
-    if isinstance(e, (A.ApiError, ClaudeError)):
-        return str(e) or type(e).__name__
-    return type(e).__name__
-
-
-def _build_report(ctx: Ctx) -> dict:
-    """One whole 完整整理 on ONE path: the API when enabled; any API failure (except a cancel) reruns
-    everything on Max. -> {"reportIntro", "reportPoints", "via": "api"|"max", "model"}.
-    Raises ClaudeError(REPORT_EMPTY_MSG) when nothing came out; limit / transient errors of the Max
-    path propagate (job retry); when both paths fail the message names both reasons."""
-    api_err = None
-    if ctx.api_call is not None:
-        try:
-            out = _generate_report(ctx, ctx.api_call)
-            if not out["reportPoints"]:
-                raise ClaudeError(REPORT_EMPTY_MSG)
-            return {**out, "via": "api", "model": A.REPORT_API_MODEL}
-        except ClaudeAborted:
-            raise
-        except Exception as e:  # noqa: BLE001 — any API trouble: rerun the whole report on Max
-            api_err = _safe_reason(e)
-            log.warning("report %s: API path failed (%s); rerunning on Max", ctx.m.get("id"), api_err)
-            ctx.report(30, "API 失敗，改用 Max 完整整理中…")
-    try:
-        out = _generate_report(ctx, ctx.call)
-        if not out["reportPoints"]:
-            raise ClaudeError(REPORT_EMPTY_MSG)
-    except (ClaudeAborted, ClaudeLimitError, ClaudeTransientError):
-        raise
-    except ClaudeError as e:
-        if api_err is None:
-            raise
-        raise ClaudeError(f"完整整理失敗：API（{api_err}）；Max（{e}）") from None
-    return {**out, "via": "max", "model": ctx.model}
 
 
 def _report(ctx: Ctx, payload):
     """完整整理: intro + headings / sub-headings into summary.reportIntro / reportPoints (+ reportMeta).
-    Missing actionItems / qa are first filled by the grounded summary on Max (never the API)."""
+    Missing actionItems / qa are filled by the grounded summary first."""
     m0 = ctx.m
     fp = _fingerprint(m0.get("transcript"))
     old = m0.get("summary") if isinstance(m0.get("summary"), dict) else {}
@@ -1851,8 +1812,7 @@ def _report(ctx: Ctx, payload):
         s["reportPoints"] = built["reportPoints"]
         m["summary"] = s
         # fp = the transcript the report was built from; changed meanwhile -> stale right away
-        m["reportMeta"] = {"via": built["via"], "model": built["model"], "at": int(time.time() * 1000),
-                           "fp": fp, "stale": _fingerprint(m.get("transcript")) != fp}
+        m["reportMeta"] = {"at": int(time.time() * 1000), "fp": fp, "stale": _fingerprint(m.get("transcript")) != fp}
         _drop_report_warning(m)
         _reverify(m, ctx)
     return apply
@@ -1953,30 +1913,6 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
             raise ClaudeAborted("已取消")
         return run_claude(system, user, schema, model, cmd, abort=abort)
 
-    def api_call(system, user, schema):
-        """Claude API (完整整理 only). Runs in a helper thread so the job keeps its heartbeat and a
-        cancel is noticed; a cancel wins over whatever the call returned or raised."""
-        if abort():
-            raise ClaudeAborted("已取消")
-        box: dict = {}
-
-        def run():
-            try:
-                box["r"] = A.call_api(system, user, schema)
-            except BaseException as e:  # noqa: BLE001 — handed over to the job thread
-                box["e"] = e
-        t = threading.Thread(target=run, name=f"report-api-{jid}", daemon=True)
-        t.start()
-        while t.is_alive():
-            t.join(ABORT_CHECK_S)
-            if t.is_alive() and abort():
-                raise ClaudeAborted("已取消")  # the abandoned call ends at its own timeout
-        if abort():
-            raise ClaudeAborted("已取消")
-        if "e" in box:
-            raise box["e"]
-        return box["r"]
-
     try:
         if m is None:
             raise ClaudeError("找不到這場會議")
@@ -1985,8 +1921,7 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
             raise ClaudeError(f"未知的 AI 動作：{action}")
         if action not in PIPELINE_ACTIONS:  # reprocess / deep_correct report their own sub-steps
             report(0, f"Claude {LABELS.get(action, '處理')}中…" if action in LABELS else "Claude 處理中…")
-        api = api_call if A.api_enabled() else None  # key file missing / empty: Max only
-        apply = handler(Ctx(m, call, report, model, glossary, api_call=api), payload)
+        apply = handler(Ctx(m, call, report, model, glossary), payload)
         if abort():
             raise ClaudeAborted("已取消")
 

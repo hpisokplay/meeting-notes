@@ -6,4 +6,3 @@ tzdata
 faster-whisper==1.2.1
 numpy
 opencc-python-reimplemented
-anthropic==1.10.0

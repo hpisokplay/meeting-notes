@@ -4,4 +4,3 @@ python-docx
 httpx
 pytest
 tzdata
-anthropic==1.10.0
