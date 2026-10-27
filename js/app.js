@@ -28,6 +28,9 @@ import {
   splitTimes,
   splitContext,
   gapMinutes,
+  hasReport,
+  reportOutline,
+  REPORT_SECTIONS,
 } from './items.js';
 
 const APP_VERSION = 'v114';
@@ -101,10 +104,12 @@ const REPROCESS_STAGE_TEXT = {
   mode: '判斷講座／會議',
   summary: '整理摘要中',
   notes: '整理筆記中',
+  report: '整理完整報告中',
   slips: '檢查講者口誤',
   verify: '驗證中',
 };
-const REPROCESS_STEPS = ['correction', 'mode', 'summary', 'notes', 'verify'];
+// 順序同伺服器 _reprocess：summary → notes → report → slips → verify
+const REPROCESS_STEPS = ['correction', 'mode', 'summary', 'notes', 'report', 'verify'];
 // 只有 reprocess 才會出現的步驟：看過其中之一，就能確定這是 reprocess 工作
 const REPROCESS_ONLY = ['correction', 'mode', 'slips', 'verify'];
 // 伺服器回報的進度文字（progress.msg）→ 步驟（stage 沒給時用文字判斷）
@@ -113,6 +118,7 @@ const REPROCESS_MSG = [
   ['判斷講座', 'mode'],
   ['整理摘要', 'summary'],
   ['整理筆記', 'notes'],
+  ['整理完整報告', 'report'],
   ['口誤', 'slips'],
   ['驗證', 'verify'],
 ];
@@ -1521,6 +1527,10 @@ async function renderDetail(id, preloaded) {
     audioParts.length ? '<button type="button" class="act-btn" id="retrBtn">🎙 重新轉錄</button>' : '',
   ].filter(Boolean);
   const aiRow1 = row1Btns.length ? `<div class="tb-row tb-${row1Btns.length}">${row1Btns.join('')}</div>` : '';
+  // 完整整理（引言＋大標題＋子標題）：有逐字稿才能做，獨佔一列
+  const aiReportRow = hasTranscript
+    ? '<div class="tb-row tb-1" id="aiReportRow"><button type="button" class="act-btn" id="reportBtn" data-task="report" title="整理成引言＋大標題＋子標題的完整報告">📄 完整整理</button></div>'
+    : '';
   // 第二列：加強結論（講座）／加強待辦（會議）｜加強重點｜加強Q&A
   const enhSecs = [
     lectureNow ? { k: 'conclusions', label: '加強結論', name: '核心結論', short: '結論' } : { k: 'actionItems', label: '加強待辦', name: '待辦事項', short: '待辦' },
@@ -1570,6 +1580,7 @@ async function renderDetail(id, preloaded) {
       <div class="tb-group" data-group="ai">
         <div class="tb-label">🤖 AI 處理</div>
         ${aiRow1}
+        ${aiReportRow}
         <div class="tb-row tb-3" id="aiEnhRow">
           ${enhSecs.map((x) => `<button class="act-btn" type="button" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('')}
         </div>
@@ -1943,6 +1954,7 @@ async function renderDetail(id, preloaded) {
       lc: ['summary', 'conclusions'], la: ['summary', 'advice'], lr: ['summary', 'risks'], lk: ['summary', 'cases'],
       'nt-o': ['notes', 'outline'], 'nt-c': ['notes', 'concepts'], 'nt-t': ['notes', 'tables'],
       'nt-f': ['notes', 'figures'], 'nt-q': ['notes', 'quiz'],
+      ri: ['summary', 'reportIntro'], rp: ['summary', 'reportPoints'],
     };
     const secHead = (k, title, copyKey, extra) => {
       const src = SEC_SRC[k];
@@ -1961,11 +1973,55 @@ async function renderDetail(id, preloaded) {
 
     // 會議摘要三區 vs 學習筆記五區：只有這張卡片隨模式切換，逐字稿以下兩模式共用
     const secItems = (sec) => (sec.k === 'mainPoints' ? mainPoints : s[sec.k] || []);
+    // 完整整理（有 reportPoints 才畫，放最上方）：引言 → 大標題（粗體）→ 子標題（粗體小標＋全形冒號＋說明）
+    // ri／rp 各自可編輯；ri 的標題列只在編輯模式出現（平常引言直接接在區塊標題下）
+    const rep = hasReport({ summary: s });
+    const reportIntro = s.reportIntro || [];
+    const reportPoints = s.reportPoints || [];
+    const reportHtml = (() => {
+      if (!rep) return '';
+      const [RI, RP] = REPORT_SECTIONS;
+      const ol = reportOutline(s);
+      const meta = m.reportMeta || {};
+      const via = meta.via === 'api' ? '由 API 產生' : meta.via === 'max' ? '由 Max 產生' : '';
+      const title = `${esc(RP.label)}${via ? ` <span class="rp-via">${esc(via)}</span>` : ''}`;
+      const delIntro = editSec === RI.code;
+      const delPts = editSec === RP.code;
+      const introItem = reportIntro[0];
+      const introText = ol.intro.trim();
+      const introHtml =
+        introItem != null && (introText || delIntro)
+          ? `<p class="rp-intro"${delIntro ? '' : ' data-jump="ri:0"'}>${esc(introText)}${srcChips(introItem, delIntro)}${delIntro ? delBtn(RI.code, 0) : ''}</p>`
+          : '';
+      const showRiHead = detailUi.edit && isOrig;
+      const secsHtml = ol.sections
+        .map((g) => {
+          const subs = g.subs
+            .map((sub) => {
+              const t = sub.title.trim();
+              const x = sub.text.trim();
+              if (!t && !x) return '';
+              const i = reportPoints.indexOf(sub.item);
+              return `<li${delPts ? '' : ` data-jump="rp:${i}"`}>${t ? `<b>${esc(t)}：</b>` : ''}${esc(x)}${srcChips(sub.item, delPts)}${delPts ? delBtn(RP.code, i) : ''}</li>`;
+            })
+            .join('');
+          const head = String(g.heading || '').trim();
+          return (head ? `<div class="rp-h">${esc(head)}</div>` : '') + (subs ? `<ul class="list rp-list${delPts ? ' editing' : ''}">${subs}</ul>` : '');
+        })
+        .join('');
+      return `${secHead(RP.code, title, RP.code, 'margin-top:0')}
+        <div class="sec-body" data-secbody="${RP.code}"${coll[RP.code] ? ' hidden' : ''}>
+          ${meta.stale ? '<div class="hint rp-stale">⚠️ 逐字稿已更換，請重按完整整理</div>' : ''}
+          ${showRiHead ? secHead(RI.code, esc(RI.label), RI.code) : ''}
+          <div class="sec-body" data-secbody="${RI.code}"${showRiHead && coll[RI.code] ? ' hidden' : ''}>${introHtml}</div>
+          ${secsHtml}
+        </div>`;
+    })();
     const meetingCard = `
       <div class="card mode-pane">
-        ${SECS.map(
+        ${reportHtml}${SECS.map(
           (sec, n) =>
-            `${secHead(sec.code, esc(sec.label), sec.code, n === 0 ? 'margin-top:0' : '')}
+            `${secHead(sec.code, esc(sec.label), sec.code, n === 0 && !rep ? 'margin-top:0' : '')}
         <div class="sec-body" data-secbody="${sec.code}"${coll[sec.code] ? ' hidden' : ''}>${sec.k === 'qa' ? qaHtml(qa, editSec === 'qa') : olHtml(secItems(sec), sec.code, editSec === sec.code)}</div>`
         ).join('')}
         <div class="hint" style="margin-top:10px">點各區標題可摺疊／展開；<b>點任一條內容</b>可跳到它在逐字稿中的出處</div>
@@ -2020,7 +2076,7 @@ async function renderDetail(id, preloaded) {
     const noteAnchors = noteOutline.map((o) => o.anchor || o.title);
     const arrMap = {
       ai: actionItems, mp: mainPoints, qa, lc: s.conclusions || [], la: s.advice || [], lr: s.risks || [], lk: s.cases || [],
-      'nt': noteAnchors,
+      'nt': noteAnchors, ri: reportIntro, rp: reportPoints,
     };
     const srcMap = { ...arrMap, nt: noteOutline };
     // 有出處（src）的條目直接跳到那個時間點的那一句
@@ -2077,6 +2133,19 @@ async function renderDetail(id, preloaded) {
       la: numbered(s.advice),
       lr: numbered(s.risks),
       lk: numbered(s.cases),
+      ri: rep ? reportOutline(s).intro.trim() : '',
+      rp: rep
+        ? reportOutline(s)
+            .sections.map((g, n) => {
+              const subs = g.subs
+                .map((x) => [x.title.trim(), x.text.trim()])
+                .filter(([t, x]) => t || x)
+                .map(([t, x]) => `   - ${t ? `${t}：` : ''}${x}`);
+              const head = String(g.heading || '').trim();
+              return [head ? `${n + 1}. ${head}` : '', ...subs].filter(Boolean).join('\n');
+            })
+            .join('\n')
+        : '',
       tr: transcriptToText(c.transcript),
       'nt-o': (nt.outline || []).map((o, i) => `${i + 1}. ${o.title}\n${(o.points || []).map((p) => `   - ${itemText(p)}`).join('\n')}`).join('\n'),
       'nt-c': (nt.concepts || []).map((x) => `${x.term}：${x.plain}${x.why ? `（${x.why}）` : ''}`).join('\n'),
@@ -2095,6 +2164,7 @@ async function renderDetail(id, preloaded) {
             parts.push(`■ ${label}\n${texts[k] || '（無）'}`)
           );
       } else {
+        if (rep) parts.push(`■ 📄 完整整理\n${[texts.ri, texts.rp].filter(Boolean).join('\n\n') || '（無）'}`);
         SECS.forEach((sec) => parts.push(`■ ${sec.label}\n${texts[sec.code] || '（無）'}`));
       }
       parts.push(`■ 🗣️ 逐字稿\n${texts.tr || '（無）'}`);
@@ -2553,8 +2623,17 @@ async function renderDetail(id, preloaded) {
       alert('這場沒有逐字稿，無法重新整理');
       return;
     }
-    if (!confirm('用目前的逐字稿重新整理？會依序做：名詞校正 → 判斷講座／會議 → 整理摘要（有筆記也會重做）→ 驗證，舊版會留著可以換回來。不會重新轉錄。')) return;
+    if (!confirm('用目前的逐字稿重新整理？會依序做：名詞校正 → 判斷講座／會議 → 整理摘要（有筆記也會重做）→ 完整整理 → 驗證，舊版會留著可以換回來。不會重新轉錄。')) return;
     runAndReload('reprocess', '重新整理中…', 'reprocess', {}, '重新整理完成 ✓');
+  };
+  // 完整整理：伺服器寫入 summary.reportIntro／reportPoints（舊版備份到 alt，可換版）
+  const doReport = () => {
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法完整整理');
+      return;
+    }
+    if (hasReport(m) && !confirm('重新完整整理？會取代目前的完整整理（舊版會留著可以換回來）。')) return;
+    runAndReload('report', '完整整理中…', 'report', {}, '完整整理完成 ✓');
   };
   // 加強校對：逐段重新掃描整份逐字稿的聽錯字，只新增待確認項目（摘要／筆記不重做、已確認的不動）
   const doDeepCorrect = async () => {
@@ -2972,6 +3051,8 @@ async function renderDetail(id, preloaded) {
   document.querySelectorAll('#toolbar [data-kind]').forEach((b) => (b.onclick = () => doSetKind(b.dataset.kind)));
   const rp = document.getElementById('reprocessBtn');
   if (rp) rp.onclick = () => doReprocess();
+  const rptBtn = document.getElementById('reportBtn');
+  if (rptBtn) rptBtn.onclick = () => doReport();
   const dc = document.getElementById('deepCorrectBtn');
   if (dc) dc.onclick = () => doDeepCorrect();
   document.getElementById('copyAllBtn').onclick = async () => {

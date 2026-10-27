@@ -61,6 +61,11 @@ export function groupItems(arr) {
   return order.map((g) => ({ group: g, items: by.get(g) }));
 }
 
+// 詳情頁完整整理區的區塊代碼（編輯／換版用）：ri = 引言、rp = 大標題＋子標題
+export const REPORT_SECTIONS = [
+  { k: 'reportIntro', code: 'ri', label: '引言' },
+  { k: 'reportPoints', code: 'rp', label: '📄 完整整理' },
+];
 // ---- 完整整理：summary.reportIntro（1 條）＋ summary.reportPoints（group = 大標題、text =「子標題：說明」）----
 // 與伺服器 Python 版 report_outline 同規則：第一個全形冒號切開；沒冒號 title=''；大標題依第一次出現順序
 export function hasReport(meeting) {

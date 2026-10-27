@@ -290,13 +290,15 @@ describe('app（整合，假 NAS）', () => {
     expect(document.getElementById('enhBtn')).toBeNull();
     expect(aiRows()).toEqual([
       ['🔁 重新整理', '🎙 重新轉錄'],
+      ['📄 完整整理'],
       ['加強待辦', '加強重點', '加強Q&A'],
       ['⚡ 全部加強', '✏️ 編輯模式'],
     ]);
     const rows = [...document.querySelectorAll('#toolbar [data-group="ai"] .tb-row')];
     expect(rows[0].classList.contains('tb-2')).toBe(true);
-    expect(rows[1].classList.contains('tb-3')).toBe(true);
-    expect(rows[2].classList.contains('tb-2')).toBe(true);
+    expect(rows[1].classList.contains('tb-1')).toBe(true);
+    expect(rows[2].classList.contains('tb-3')).toBe(true);
+    expect(rows[3].classList.contains('tb-2')).toBe(true);
     const ai = document.querySelector('#toolbar [data-group="ai"]');
     expect([...ai.querySelectorAll('[data-enh]')].map((b) => b.dataset.enh)).toEqual(['actionItems', 'mainPoints', 'qa']);
     ai.querySelector('[data-enh="qa"]').click();
@@ -305,11 +307,11 @@ describe('app（整合，假 NAS）', () => {
     document.querySelector('#modeToggle [data-mode="notes"]').click();
     await tick();
     const r2 = aiRows();
-    expect(r2.length).toBe(4);
-    expect(r2[3]).toEqual([expect.stringContaining('產生學習筆記')]);
+    expect(r2.length).toBe(5);
+    expect(r2[4]).toEqual([expect.stringContaining('產生學習筆記')]);
     document.querySelector('#modeToggle [data-mode="meeting"]').click();
     await tick();
-    expect(aiRows().length).toBe(3);
+    expect(aiRows().length).toBe(4);
   });
 
   it('AI 處理：講座模式第二列是「加強結論」（conclusions）；沒錄音時「重新整理」獨佔一列', async () => {
@@ -320,6 +322,7 @@ describe('app（整合，假 NAS）', () => {
     await go('#/m/lec-a');
     expect(aiRows()).toEqual([
       ['🔁 重新整理'],
+      ['📄 完整整理'],
       ['加強結論', '加強重點', '加強Q&A'],
       ['⚡ 全部加強', '✏️ 編輯模式'],
     ]);
@@ -589,6 +592,120 @@ describe('app（整合，假 NAS）', () => {
     await tick(120);
     expect(nas.calls.some((c) => c[0] === 'saveMeeting')).toBe(true);
     expect(nas.meetings['test-1'].summary.mainPoints).toEqual(['討論上線時程']);
+  });
+
+  // ---- 完整整理 ----
+  // 詳情頁先秒開本機快取（updatedAt 沒變就不重畫）→ 每個情境用自己的會議 id
+  const withReport = (id, extra = {}) => {
+    const m = Object.assign(JSON.parse(JSON.stringify(MEETING)), { id });
+    nas.meetings[id] = m;
+    m.summary.reportIntro = [{ id: 'r0000000', text: '本次會議討論 <上線> & 測試', src: [{ t: 5, quote: '討論上線時程' }] }];
+    m.summary.reportPoints = [
+      { id: 'r1111111', group: '上線規劃', text: '時程：下週三比較穩', src: [{ t: 300, quote: '下週三比較穩' }] },
+      { id: 'r2222222', group: '上線規劃', text: '沒有冒號的說明', src: [] },
+      { id: 'r3333333', group: '測試分工', text: '測試：說話者3 明天開始', src: [{ t: 700, quote: '我明天開始測試' }] },
+    ];
+    m.reportMeta = { via: 'api', model: 'claude-opus-5-5', at: 1, fp: 'x', ...extra };
+    return id;
+  };
+
+  it('detail shows 完整整理 button when transcript exists', async () => {
+    await go('#/m/test-1');
+    const b = document.getElementById('reportBtn');
+    expect(b).toBeTruthy();
+    expect(b.textContent.trim()).toBe('📄 完整整理');
+    expect(b.closest('[data-group="ai"]')).toBeTruthy();
+    b.click();
+    await tick(120);
+    expect(nas.calls).toContainEqual(['runAI', 'test-1', 'report', {}]);
+    // 沒逐字稿 → 沒有按鈕
+    nas.meetings['no-tr'] = Object.assign(JSON.parse(JSON.stringify(MEETING)), { id: 'no-tr', transcript: [], audio: [] });
+    await go('#/m/no-tr');
+    expect(document.getElementById('reportBtn')).toBeNull();
+  });
+
+  it('detail renders intro and grouped sub titles when report exists', async () => {
+    await go('#/m/' + withReport('rep-render'));
+    const sum = document.getElementById('sumBody');
+    const area = sum.querySelector('[data-secbody="rp"]');
+    expect(area).toBeTruthy();
+    const h = sum.innerHTML;
+    // 在最上方：完整整理在待辦之前，原有區塊都還在
+    expect(h.indexOf('data-sec="rp"')).toBeGreaterThanOrEqual(0);
+    expect(h.indexOf('data-sec="rp"')).toBeLessThan(h.indexOf('data-sec="ai"'));
+    expect(h).toContain('待辦事項 Action Item');
+    expect(h).toContain('會議重點 Main Point');
+    expect(sum.querySelector('.sec-head[data-sec="rp"]').textContent).toContain('📄 完整整理');
+    // 引言（esc 過）
+    expect(area.querySelector('.rp-intro').textContent).toContain('本次會議討論 <上線> & 測試');
+    expect(h).not.toContain('<上線>');
+    // 大標題（粗體）依第一次出現順序
+    expect([...area.querySelectorAll('.rp-h')].map((x) => x.textContent)).toEqual(['上線規劃', '測試分工']);
+    // 子標題：粗體小標＋全形冒號；沒冒號整段當說明
+    const lis = [...area.querySelectorAll('li[data-jump^="rp:"]')];
+    expect(lis.map((x) => x.dataset.jump)).toEqual(['rp:0', 'rp:1', 'rp:2']);
+    expect(lis[0].querySelector('b').textContent).toBe('時程：');
+    expect(lis[0].textContent).toContain('下週三比較穩');
+    expect(lis[1].querySelector('b')).toBeNull();
+    expect(lis[1].textContent).toContain('沒有冒號的說明');
+    // 點子標題 → 跳到逐字稿出處；時間鈕也在
+    lis[2].click();
+    expect(document.querySelector('.seg[data-seg="2"]').classList.contains('flash')).toBe(true);
+    expect(area.querySelector('.src-chip[data-src-t="300"]')).toBeTruthy();
+    area.querySelector('.rp-intro').click();
+    expect(document.querySelector('.seg[data-seg="0"]').classList.contains('flash')).toBe(true);
+  });
+
+  it('detail shows via label', async () => {
+    await go('#/m/' + withReport('rep-api'));
+    expect(document.querySelector('.sec-head[data-sec="rp"]').textContent).toContain('由 API 產生');
+    await go('#/m/' + withReport('rep-max', { via: 'max' }));
+    expect(document.querySelector('.sec-head[data-sec="rp"]').textContent).toContain('由 Max 產生');
+  });
+
+  it('detail shows stale hint', async () => {
+    await go('#/m/' + withReport('rep-fresh'));
+    expect(document.getElementById('sumBody').textContent).not.toContain('逐字稿已更換，請重按完整整理');
+    await go('#/m/' + withReport('rep-stale', { stale: true }));
+    expect(document.getElementById('sumBody').textContent).toContain('逐字稿已更換，請重按完整整理');
+  });
+
+  it('detail legacy meeting has no 完整整理 section', async () => {
+    nas.meetings['legacy-1'] = Object.assign(JSON.parse(JSON.stringify(MEETING)), { id: 'legacy-1' });
+    await go('#/m/legacy-1');
+    const sum = document.getElementById('sumBody');
+    expect(sum.querySelector('[data-sec="rp"],[data-sec="ri"],[data-secbody="rp"]')).toBeNull();
+    expect(sum.textContent).not.toContain('完整整理');
+    // 第一區仍是待辦，標題沒有額外上邊距
+    expect(sum.querySelector('.sec-head').dataset.sec).toBe('ai');
+    expect(sum.querySelector('.sec-head').getAttribute('style')).toBe('margin-top:0');
+  });
+
+  it('完整整理：編輯模式可刪引言與子標題；複製文字是大綱格式', async () => {
+    const writes = [];
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText: async (t) => writes.push(t) }, configurable: true });
+    await go('#/m/' + withReport('rep-edit'));
+    await editOn();
+    const view = document.getElementById('view');
+    view.querySelector('[data-copy="rp"]').click();
+    await tick();
+    expect(writes[0]).toBe('1. 上線規劃\n   - 時程：下週三比較穩\n   - 沒有冒號的說明\n2. 測試分工\n   - 測試：說話者3 明天開始');
+    view.querySelector('[data-copy="ri"]').click();
+    await tick();
+    expect(writes[1]).toBe('本次會議討論 <上線> & 測試');
+    expect(view.querySelector('[data-edit="rp"]')).toBeTruthy();
+    expect(view.querySelector('[data-edit="ri"]')).toBeTruthy();
+    view.querySelector('[data-edit="rp"]').click();
+    await tick();
+    expect(view.querySelector('li[data-jump^="rp:"]')).toBeNull(); // 編輯中不掛跳轉
+    view.querySelector('[data-del="rp:1"]').click();
+    await tick(120);
+    expect(nas.meetings['rep-edit'].summary.reportPoints.map((x) => x.id)).toEqual(['r1111111', 'r3333333']);
+    view.querySelector('[data-edit="ri"]').click();
+    await tick();
+    view.querySelector('[data-del="ri:0"]').click();
+    await tick(120);
+    expect(nas.meetings['rep-edit'].summary.reportIntro).toEqual([]);
   });
 
   it('處理中的會議：清單有狀態徽章，進度頁顯示階段與備援轉錄器', async () => {
@@ -1500,16 +1617,20 @@ describe('播放與狀態的純函式', () => {
     expect(progressLabel({ status: 'queued', progress: { stage: 'queued' } })).toBe('排隊中（等電腦轉錄器）');
     expect(progressLabel({ status: 'transcribing', progress: {} })).toBe('轉錄中');
     // 重新整理的各步驟：stage 或伺服器訊息文字都認得
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction' } })).toBe('摘要中・名詞校正中（第 1/5 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'verify' } })).toBe('摘要中・驗證中（第 5/5 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { msg: '判斷講座／會議' } })).toBe('摘要中・判斷講座／會議（第 2/5 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction' } })).toBe('摘要中・名詞校正中（第 1/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'verify' } })).toBe('摘要中・驗證中（第 6/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { msg: '判斷講座／會議' } })).toBe('摘要中・判斷講座／會議（第 2/6 步）');
     // 「整理摘要」本身分不出是 reprocess 還是一般摘要 → 沒看過 reprocess 專屬步驟、沒標動作時維持舊標籤
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } })).toBe('摘要中');
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'summary' } })).toBe('摘要中');
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'notes', msg: '整理筆記中' } })).toBe('摘要中');
     // 看過專屬步驟（seen）或伺服器標了 action=reprocess → 編號
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } }, true)).toBe('摘要中・整理摘要中（第 3/5 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'notes', action: 'reprocess' } })).toBe('摘要中・整理筆記中（第 4/5 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } }, true)).toBe('摘要中・整理摘要中（第 3/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'notes', action: 'reprocess' } })).toBe('摘要中・整理筆記中（第 4/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'report', action: 'reprocess' } })).toBe('摘要中・整理完整報告中（第 5/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { msg: '整理完整報告中' } }, true)).toBe('摘要中・整理完整報告中（第 5/6 步）');
+    // 單獨按「完整整理」（action=report）不編號
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'report', action: 'report', msg: '整理完整報告中' } })).toBe('摘要中');
     // 伺服器標了別的動作 → 就算訊息像 reprocess 也不編號
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', action: 'summary', msg: '驗證中' } })).toBe('摘要中');
     expect(activeJobId({ status: 'summarizing', jobId: 't', aiJobId: 'a' })).toBe('a');
