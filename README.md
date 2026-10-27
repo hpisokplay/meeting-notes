@@ -34,9 +34,9 @@ npx vitest run           # 前端單元 + 整合測試（jsdom，API 以假資�
 
 - 金鑰請自己放進 NAS 的 `/volume1/docker/meetings/anthropic.key`（檔案權限 `chmod 600`），**不要貼到對話或 git**。步驟見 `deploy/nas/README.md`。
 - 沒有金鑰或檔案是空的：自動改用 Max 產生，畫面標示「由 Max 產生」。
-- 費用：每場會議一次 Opus 呼叫，長會議較貴，「重新處理」也會再呼叫一次。
+- 費用：每場會議一次 Opus 呼叫，長會議較貴，「重新處理」也會再呼叫一次（切換講座／會議不會）。
 - 關閉：清空金鑰檔即可。使用 API 時，逐字稿會送到 Anthropic。
 
 ## 隱私
 
-錄音、逐字稿與摘要只存在你自己的 NAS；AI 處理用你自己的電腦與 Claude 訂閱。App 只在 Tailscale 內網開放。
+錄音、逐字稿與摘要只存在你自己的 NAS。AI 處理用你的 Claude 訂閱；設定了 API 金鑰時，「完整整理」改用 Claude API，這時逐字稿會送到 Anthropic。App 只在 Tailscale 內網開放。

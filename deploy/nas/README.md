@@ -30,10 +30,21 @@ chmod 600 /volume1/docker/meetings/anthropic.key
 vi /volume1/docker/meetings/anthropic.key          # 貼上金鑰，只放一行
 ```
 
+- vi 的用法：按 `i` 進入輸入模式、貼上金鑰，按 `Esc`，再輸入 `:wq` 按 Enter 存檔離開。
+- 放好或清空金鑰後不用重啟容器：每次工作開始時程式都會重新讀這個檔案。
 - 這個檔案必須在 `docker compose up` 之前就存在。若不存在，docker 會自己建出一個同名資料夾，容器就讀不到金鑰；程式不會當機，但會當成沒有金鑰。
+- 已經被 docker 建成資料夾時的修復方法（先刪掉空資料夾，再建檔案）：
+
+  ```
+  rmdir /volume1/docker/meetings/anthropic.key       # 只刪空資料夾
+  touch /volume1/docker/meetings/anthropic.key
+  chmod 600 /volume1/docker/meetings/anthropic.key
+  ```
+
+  然後照上面用 vi 貼上金鑰，再執行一次 `cd /volume1/docker/meetings && sudo /usr/local/bin/docker compose up -d --force-recreate`，讓容器改掛這個檔案（這是唯一需要重建容器的情況）。
 - 沒有金鑰或檔案是空的：不會報錯，自動改用 Max 訂閱產生，畫面標示「由 Max 產生」。
-- 費用：每場會議呼叫一次 Opus；會議越長越貴；「重新處理」也會再呼叫一次。
-- 想關閉：把檔案清空（`: > /volume1/docker/meetings/anthropic.key`），再重啟容器。
+- 費用：每場會議呼叫一次 Opus；會議越長越貴；「重新處理」也會再呼叫一次（切換講座／會議不會）。
+- 想關閉：把檔案清空（`: > /volume1/docker/meetings/anthropic.key`），不用重啟容器。
 
 ## 更新程式
 在專案根目錄（Git Bash）執行：
