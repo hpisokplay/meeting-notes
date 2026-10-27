@@ -8,6 +8,7 @@ from zoneinfo import ZoneInfo
 
 from .gaps import gaps_line, meeting_gaps
 from .items import item_text
+from .report import has_report
 
 _BAD_XML = re.compile('[^' + chr(9) + chr(10) + chr(13) + chr(0x20) + '-' + chr(0xD7FF) + chr(0xE000) + '-' + chr(0xFFFD) + chr(0x10000) + '-' + chr(0x10FFFF) + ']')
 
@@ -82,6 +83,72 @@ def _lines(m: dict):
         yield (f"[{t}] " if t else "") + f"{seg.get('speaker') or ''}: {seg.get('text') or ''}"
 
 
+def _roman(n: int) -> str:
+    out = ""
+    for v, r in ((1000, "m"), (900, "cm"), (500, "d"), (400, "cd"), (100, "c"), (90, "xc"), (50, "l"),
+                 (40, "xl"), (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")):
+        while n >= v:
+            out += r
+            n -= v
+    return out
+
+
+def _report_outline(m: dict):
+    """-> (intro, [(heading, [(title, text)])]); same rules as JS reportOutline."""
+    s = m.get("summary") if isinstance(m.get("summary"), dict) else {}
+    intro_arr = s.get("reportIntro") if isinstance(s.get("reportIntro"), list) else []
+    intro = item_text(intro_arr[0]) if intro_arr else ""
+    points = s.get("reportPoints") if isinstance(s.get("reportPoints"), list) else []
+    has_group = any(isinstance(x, dict) and x.get("group") for x in points)
+    order: list[str] = []
+    by: dict[str, list] = {}
+    for x in points:
+        g = ((x.get("group") if isinstance(x, dict) else "") or "其他") if has_group else ""
+        full = item_text(x)
+        i = full.find("：")
+        sub = ("", full) if i < 0 else (full[:i], full[i + 1:])
+        if g not in by:
+            by[g] = []
+            order.append(g)
+        by[g].append(sub)
+    return intro, [(g, by[g]) for g in order]
+
+
+def _report_blocks(m: dict):
+    """Printable pieces: (intro, [(numbered heading or '', [(title, text)])], action texts, [(q, a)])."""
+    intro, secs = _report_outline(m)
+    out, n = [], 0
+    for h, subs in secs:
+        h = h.strip()
+        subs = [(t.strip(), x.strip()) for t, x in subs]
+        subs = [(t, x) for t, x in subs if t or x]
+        if h:
+            n += 1
+        out.append((f"{n}. {h}" if h else "", subs))
+    s = m.get("summary") if isinstance(m.get("summary"), dict) else {}
+    actions = [item_text(x) for x in s.get("actionItems") or [] if item_text(x).strip()]
+    qa = [_split_qa(x) for x in s.get("qa") or []]
+    return intro.strip(), out, actions, [(q, a) for q, a in qa if q or a]
+
+
+def _markdown_report(m: dict, out: list) -> list:
+    intro, secs, actions, qa = _report_blocks(m)
+    if intro:
+        out += [intro, ""]
+    for h, subs in secs:
+        if h:
+            out += [f"## {h}"]
+        out += [f"- **{t}：**{x}" if t else f"- {x}" for t, x in subs]
+        out += [""]
+    if actions:
+        out += ["## Action Items", *[f"{_roman(i)}. {x}" for i, x in enumerate(actions, 1)], ""]
+    if qa:
+        out += ["## Q&A"]
+        for i, (q, a) in enumerate(qa, 1):
+            out += [f"{_roman(i)}. **Q：{q}**", f"   A：{a}", ""]
+    return out
+
+
 def meeting_to_markdown(m: dict) -> str:
     secs, qa = _sections(m)
     out = [f"# {m.get('title') or '未命名會議'}", "", f"日期：{_date(m)}（台北）",
@@ -92,6 +159,10 @@ def meeting_to_markdown(m: dict) -> str:
     warns = [w for w in m.get("warnings") or [] if isinstance(w, str) and w]
     if warns:
         out += [f"> ⚠️ {w}" for w in warns] + [""]
+    if has_report(m.get("summary")):
+        out = _markdown_report(m, out)
+        out += ["## 逐字稿", *_lines(m), ""]
+        return "\n".join(out)
     for title, xs in secs:
         out += [f"## {title}", *[f"- {x}" for x in xs], ""]
     out += ["## Q&A"]
@@ -116,14 +187,36 @@ def meeting_to_docx(m: dict, path: Path) -> None:
     for w in m.get("warnings") or []:
         if isinstance(w, str) and w:
             d.add_paragraph(_x(f"⚠️ {w}"))
-    for title, xs in secs:
-        d.add_heading(title, 1)
-        for x in xs:
-            d.add_paragraph(_x(x), style="List Bullet")
-    d.add_heading("Q&A", 1)
-    for q, a in qa:
-        d.add_paragraph().add_run(_x(f"Q：{q}")).bold = True
-        d.add_paragraph(_x(f"A：{a}"))
+    if has_report(m.get("summary")):
+        intro, rsecs, actions, rqa = _report_blocks(m)
+        if intro:
+            d.add_paragraph(_x(intro))
+        for h, subs in rsecs:
+            if h:
+                d.add_heading(_x(h), 1)
+            for t, x in subs:
+                p = d.add_paragraph(style="List Bullet")
+                if t:
+                    p.add_run(_x(f"{t}：")).bold = True
+                p.add_run(_x(x))
+        if actions:
+            d.add_heading("Action Items", 1)
+            for i, x in enumerate(actions, 1):
+                d.add_paragraph(_x(f"{_roman(i)}. {x}"))
+        if rqa:
+            d.add_heading("Q&A", 1)
+            for i, (q, a) in enumerate(rqa, 1):
+                d.add_paragraph().add_run(_x(f"{_roman(i)}. Q：{q}")).bold = True
+                d.add_paragraph(_x(f"A：{a}"))
+    else:
+        for title, xs in secs:
+            d.add_heading(title, 1)
+            for x in xs:
+                d.add_paragraph(_x(x), style="List Bullet")
+        d.add_heading("Q&A", 1)
+        for q, a in qa:
+            d.add_paragraph().add_run(_x(f"Q：{q}")).bold = True
+            d.add_paragraph(_x(f"A：{a}"))
     d.add_heading("逐字稿", 1)
     for line in _lines(m):
         d.add_paragraph(_x(line))
