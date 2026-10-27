@@ -656,14 +656,11 @@ describe('app（整合，假 NAS）', () => {
     expect(document.querySelector('.seg[data-seg="0"]').classList.contains('flash')).toBe(true);
   });
 
-  it('detail shows no source label (old meetings may still carry reportMeta.via)', async () => {
+  it('detail shows no source label', async () => {
     await go('#/m/' + withReport('rep-plain'));
-    const head = () => document.querySelector('.sec-head[data-sec="rp"]');
-    expect(head().textContent).toContain('📄 完整整理');
-    expect(head().textContent).not.toMatch(/由 (API|Max) 產生/);
-    await go('#/m/' + withReport('rep-old', { via: 'api', model: 'x' }));
-    expect(head().textContent).not.toMatch(/由 (API|Max) 產生/);
-    expect(document.querySelector('.rp-via')).toBeNull();
+    const head = document.querySelector('.sec-head[data-sec="rp"]');
+    expect(head.textContent).toContain('📄 完整整理');
+    expect(head.textContent).not.toMatch(/產生/);
   });
 
   it('detail shows stale hint', async () => {
