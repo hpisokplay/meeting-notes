@@ -713,6 +713,8 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
             # one slot holding the latest pre-restore transcript (user edits / applied terms)
             m.setdefault("alt", {})["transcript:beforeRestore"] = copy.deepcopy(m.get("transcript") or [])
             m["transcript"] = copy.deepcopy(raw)
+            if isinstance(m.get("reportMeta"), dict):
+                m["reportMeta"]["stale"] = True  # the 完整整理 was built from the pre-restore transcript
             corr = m.get("corrections") if isinstance(m.get("corrections"), dict) else None
             if corr:
                 for c in corr.get("items") or []:

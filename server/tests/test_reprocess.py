@@ -94,7 +94,7 @@ def test_pipeline_after_transcription_lecture(sj, fake_env, monkeypatch, tmp_pat
 
     stages = [s[0] for s in seen if s[0] != "claude"]
     stages = [x for i, x in enumerate(stages) if not i or stages[i - 1] != x]  # the AI filter is a correction sub-step
-    assert stages == ["correction", "mode", "summary", "slips", "verify", "adjudicate"]  # no notes yet
+    assert stages == ["correction", "mode", "summary", "report", "slips", "verify", "adjudicate"]  # no notes yet
     corr_msgs = [s[1] for s in seen if s[0] == "correction"]
     assert corr_msgs[0] == "名詞校正中（第 1/1 段）" and "AI 複核可能錯字中（1/1 批）" in corr_msgs
     msgs = {s[0]: s[1] for s in seen}
@@ -114,7 +114,7 @@ def test_pipeline_after_transcription_lecture(sj, fake_env, monkeypatch, tmp_pat
     assert corr["Jefry"]["state"] == "pending" and corr["Jefry"]["count"] == 1
     assert "不存在" not in corr  # does not occur in the transcript
     assert m["mode"] == "lecture"
-    assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa"}
+    assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa", "reportIntro", "reportPoints"}
     it = m["summary"]["conclusions"][0]
     assert len(it["id"]) == 8 and it["src"][0]["t"] == 10.0
     kinds = {r["kind"]: r for r in m["review"]["items"]}
@@ -155,7 +155,7 @@ def test_reprocess_keeps_known_corrections_and_rejections(sj, fake_env):
     run_claimed(store, jobs)
     m = store.get("m1")
     assert "台積店" in m["transcript"][0]["text"]  # a rejected pair is never re-applied
-    assert m["mode"] == "meeting" and set(m["summary"]) == {"actionItems", "mainPoints", "qa"}
+    assert m["mode"] == "meeting" and set(m["summary"]) == {"actionItems", "mainPoints", "qa", "reportIntro", "reportPoints"}
 
 
 def test_reprocess_aborts_if_transcript_edited_meanwhile(sj, fake_env, monkeypatch):
@@ -343,12 +343,12 @@ def test_mode_endpoint(app_client, tmp_path, monkeypatch):
     handle_ai_job(app.state.store, app.state.jobs.claim(["ai"], "nas-ai"), FAKE, app.state.jobs)
     m = app.state.store.get("m1")
     assert m["mode"] == "lecture"
-    assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa"}
+    assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa", "reportIntro", "reportPoints"}
     schemas = [c_[0] for c_ in log_calls(log)]
-    # no correction / slips / mode: the summary, then the word-review adjudicate (+ one re-ask of the
-    # flags the fake left unanswered)
-    assert len(schemas) == 3 and "conclusions" in schemas[0]["properties"]
-    assert all("span" in x["properties"]["items"]["items"]["properties"] for x in schemas[1:])
+    # no correction / slips / mode: the summary, the 完整整理 report, then the word-review adjudicate
+    # (+ one re-ask of the flags the fake left unanswered)
+    assert len(schemas) == 4 and "conclusions" in schemas[0]["properties"]
+    assert all("span" in x["properties"]["items"]["items"]["properties"] for x in schemas[2:])
     assert any(r["kind"] == "slip" for r in m["review"]["items"])  # existing slip list kept
 
 

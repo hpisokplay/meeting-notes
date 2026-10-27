@@ -350,3 +350,122 @@ def test_apply_report_order_handles_model_mistakes():
     assert [p["src"] for p in out] == [pts[2]["src"], pts[0]["src"], pts[1]["src"], pts[3]["src"]]
     assert ai._apply_report_order(pts, None) == pts
     assert ai._apply_report_order(pts, {"groups": []}) == pts
+
+
+# ---------------------------------------------------------------- Task 4: reprocess / stale / name correction
+def test_reprocess_also_builds_report(sj, nokey, maxlog):
+    store, jobs = sj
+    mk(store, summary=None)
+    jid = jobs.enqueue("ai", "m1", {"action": "reprocess", "correction": False, "slips": False, "adjudicate": False})
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    m = store.get("m1")
+    s = m["summary"]
+    assert s["reportIntro"] and s["reportPoints"]
+    assert m["reportMeta"]["via"] == "max" and m["reportMeta"]["stale"] is False
+    assert m["reportMeta"]["fp"] == ai._fingerprint(m["transcript"])
+    assert len(report_calls(maxlog)) == 1
+
+
+def test_reprocess_report_failure_is_only_a_warning(sj, nokey, maxlog, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_REPORT_EMPTY", "1")
+    store, jobs = sj
+    mk(store, summary=None)
+    jid = jobs.enqueue("ai", "m1", {"action": "reprocess", "correction": False, "slips": False, "adjudicate": False})
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    assert jobs.get(jid)["state"] == "done"
+    m = store.get("m1")
+    assert m["summary"]["mainPoints"] and "reportPoints" not in m["summary"] and "reportMeta" not in m
+    assert any(w.startswith("完整整理失敗，已略過") for w in m["warnings"])
+
+
+def test_reprocess_progress_stays_monotonic(sj, nokey, maxlog, monkeypatch):
+    monkeypatch.setattr(ai, "MAX_CHARS", 30)  # several report chunks -> inner progress reports
+    store, jobs = sj
+    mk(store, summary=None)
+    jid = jobs.enqueue("ai", "m1", {"action": "reprocess", "correction": False, "adjudicate": False})
+    seen = []
+    real = jobs.progress
+
+    def spy(j, stage, pct, msg=""):
+        seen.append((stage, pct, msg))
+        return real(j, stage, pct, msg)
+    monkeypatch.setattr(jobs, "progress", spy)
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    pcts = [p for _s, p, _m in seen]
+    assert any(s == "report" for s, _p, _m in seen)
+    assert pcts == sorted(pcts), seen
+
+
+def test_new_transcript_marks_report_stale(sj):
+    from server.jobs import apply_transcript_result
+    store, jobs = sj
+    jid = jobs.enqueue("transcribe", "m1", {})
+    mk(store, status="transcribing", jobId=jid,
+       reportMeta={"via": "api", "model": "x", "at": 1, "fp": "abc", "stale": False})
+    job = jobs.claim(["transcribe"], "gpu-worker")
+    assert apply_transcript_result(store, jobs, job, {"segments": TRANSCRIPT[:1], "durationSec": 5, "engine": "gpu"})
+    assert store.get("m1")["reportMeta"]["stale"] is True
+    # no reportMeta -> nothing invented
+    jid = jobs.enqueue("transcribe", "m2", {})
+    mk(store, "m2", status="transcribing", jobId=jid)
+    job = jobs.claim(["transcribe"], "gpu-worker")
+    assert apply_transcript_result(store, jobs, job, {"segments": TRANSCRIPT[:1], "durationSec": 5, "engine": "gpu"})
+    assert "reportMeta" not in store.get("m2")
+
+
+def test_restore_raw_marks_report_stale(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server.app import create_app
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("MEETINGS_STATIC", str(static))
+    app = create_app(tmp_path / "data", start_threads=False, claude_cmd=FAKE)
+    c = TestClient(app)
+    mk(app.state.store, transcriptRaw=copy.deepcopy(TRANSCRIPT[:2]),
+       reportMeta={"via": "api", "model": "x", "at": 1, "fp": "abc", "stale": False})
+    assert c.post("/api/meetings/m1/restore-raw").status_code == 200
+    assert app.state.store.get("m1")["reportMeta"]["stale"] is True
+
+
+def test_name_correction_replaces_in_report_items(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server import wordreview as W
+    from server.app import create_app
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("MEETINGS_STATIC", str(static))
+    app = create_app(tmp_path / "data", start_threads=False, claude_cmd=FAKE)
+    c = TestClient(app)
+    tr = [{"speaker": "說話者 1", "text": "Jefry 會負責報價", "t": 20.0}]
+    intro = [{"id": "aaaaaaaa", "text": "Jefry 負責報價", "src": [{"t": 20.0, "quote": "Jefry 會負責報價"}]}]
+    pts = [{"id": "bbbbbbbb", "text": "報價：Jefry 會回覆", "group": "分工", "src": [{"t": 20.0, "quote": "Jefry 會負責報價"}]}]
+    m = mk(app.state.store, transcript=tr, summary={"reportIntro": intro, "reportPoints": pts},
+           reportMeta={"via": "api", "model": "x", "at": 1, "fp": ai._fingerprint(tr), "stale": False})
+    W.apply_ai_cards(m, [{"span": "Jefry", "action": "replace", "suggestion": "Jeffrey", "reason": "r",
+                          "confidence": "high", "itemIds": [], "fromFlags": []}])
+    app.state.store.save(m)
+    cid = next(x["id"] for x in m["review"]["items"] if W.is_card(x))
+    r = c.post(f"/api/meetings/m1/review/{cid}", json={"action": "accept"})
+    assert r.status_code == 200, r.text
+    out = r.json()
+    assert out["transcript"][0]["text"] == "Jeffrey 會負責報價"
+    assert out["summary"]["reportIntro"][0]["text"] == "Jeffrey 負責報價"
+    assert out["summary"]["reportPoints"][0]["text"] == "報價：Jeffrey 會回覆"
+    assert out["summary"]["reportPoints"][0]["src"][0]["quote"] == "Jeffrey 會負責報價"
+    assert out["reportMeta"]["stale"] is False  # a name correction is not a new transcript
+
+
+def test_reprocess_report_failure_keeps_old_report_and_marks_stale(sj, nokey, maxlog, monkeypatch):
+    monkeypatch.setenv("FAKE_CLAUDE_REPORT_EMPTY", "1")
+    store, jobs = sj
+    old_pts = [{"id": "aaaaaaaa", "text": "舊子標題：舊說明", "group": "舊大標題", "src": []}]
+    mk(store, summary={**copy.deepcopy(SUMMARY), "reportPoints": old_pts},
+       reportMeta={"via": "api", "model": "x", "at": 1, "fp": "old", "stale": False})
+    jobs.enqueue("ai", "m1", {"action": "reprocess", "correction": False, "slips": False, "adjudicate": False})
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    m = store.get("m1")
+    assert m["summary"]["reportPoints"] == old_pts and m["reportMeta"]["stale"] is True

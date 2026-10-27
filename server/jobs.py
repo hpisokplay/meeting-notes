@@ -293,6 +293,8 @@ def apply_transcript_result(store: Store, jobs: JobQueue, job: dict, result: dic
                 # a new transcription is a new raw text: old raw / corrections no longer apply
                 m.pop("transcriptRaw", None)
                 m.pop("corrections", None)
+                if isinstance(m.get("reportMeta"), dict):
+                    m["reportMeta"]["stale"] = True  # the 完整整理 was built from the old transcript
                 if dur is not None:
                     m["durationSec"] = dur
                 if isinstance(m.get("review"), dict):

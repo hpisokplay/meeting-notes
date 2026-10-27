@@ -80,6 +80,7 @@ STEP_CORRECTION = ("correction", 3, "名詞校正中")
 STEP_MODE = ("mode", 15, "判斷講座／會議")
 STEP_SUMMARY = ("summary", 25, "整理摘要中")
 STEP_NOTES = ("notes", 50, "整理筆記中")
+STEP_REPORT = ("report", 60, "整理完整報告中")
 STEP_SLIPS = ("slips", 75, "檢查口誤中")
 STEP_VERIFY = ("verify", 90, "驗證中")
 STEP_ADJUDICATE = ("adjudicate", 93, "AI 審稿中")
@@ -1325,9 +1326,25 @@ def _summary(ctx: Ctx, payload):
     return apply
 
 
+def _reprocess_report(ctx: Ctx, lines: list[str], warnings: list[str]):
+    """The 完整整理 of a reprocess: built from the (corrected) `lines`, progress squeezed into
+    STEP_REPORT..STEP_SLIPS so the bar never goes back. A failure is only a warning (None)."""
+    lo, hi = STEP_REPORT[1], STEP_SLIPS[1] - 1
+    real_report, real_lines = ctx.report, ctx.lines
+
+    def squeezed(pct, msg, stage=None):
+        real_report(lo + max(0, min(pct, 100) - 30) * (hi - lo) // 70, msg, stage or STEP_REPORT[0])
+    ctx.step(STEP_REPORT)
+    ctx.report, ctx.lines = squeezed, lines
+    try:
+        return _optional(lambda: _build_report(ctx), "完整整理", warnings)
+    finally:
+        ctx.report, ctx.lines = real_report, real_lines
+
+
 def _reprocess(ctx: Ctx, payload):
-    """correction -> mode -> summary -> notes (if any) -> slips -> verify -> adjudicate (word-review
-    cards); one write at the end."""
+    """correction -> mode -> summary -> notes (if any) -> report -> slips -> verify -> adjudicate
+    (word-review cards); one write at the end."""
     m0 = ctx.m
     fp = _fingerprint(m0.get("transcript"))
     transcript = copy.deepcopy(m0.get("transcript") or [])
@@ -1359,6 +1376,9 @@ def _reprocess(ctx: Ctx, payload):
     if _has_notes(m0):
         ctx.step(STEP_NOTES)
         notes = _grounded_notes(ctx, lines)
+    built = _reprocess_report(ctx, lines, warnings)
+    if built:
+        summary = {**summary, "reportIntro": built["reportIntro"], "reportPoints": built["reportPoints"]}
     slips = None
     if payload.get("slips", True):
         ctx.step(STEP_SLIPS)
@@ -1391,7 +1411,18 @@ def _reprocess(ctx: Ctx, payload):
             m["corrections"] = corrections
         m["mode"] = mode
         _backup(m, "summary", None)
-        m["summary"] = summary
+        if not built and isinstance(m.get("summary"), dict):
+            # report step failed: keep the previous report (if any) rather than lose it
+            kept_report = {k: m["summary"][k] for k in ("reportIntro", "reportPoints")
+                           if isinstance(m["summary"].get(k), list)}
+        else:
+            kept_report = {}
+        m["summary"] = {**summary, **kept_report}
+        if built:
+            m["reportMeta"] = {"via": built["via"], "model": built["model"], "at": int(time.time() * 1000),
+                               "fp": _fingerprint(transcript), "stale": False}
+        elif isinstance(m.get("reportMeta"), dict) and m["reportMeta"].get("fp") != _fingerprint(transcript):
+            m["reportMeta"]["stale"] = True  # the kept report no longer matches this transcript
         if notes is not None:
             _backup(m, "notes", list(P.NOTES_KEYS))
             m["notes"] = {**notes, "generatedAt": int(time.time() * 1000)}
