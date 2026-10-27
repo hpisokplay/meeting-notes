@@ -420,3 +420,48 @@ def test_mode_route_sends_report_false(tmp_path, monkeypatch):
     r = c.post("/api/meetings/m1/restore-raw")
     assert r.status_code == 200, r.text
     assert app.state.jobs.get(r.json()["jobId"])["payload"].get("report", True) is not False
+
+
+def spy_preview(monkeypatch):
+    """Records the report lists of the preview meeting that verify (_reverify) and the AI
+    word-review (adjudicate_cards) see during a reprocess."""
+    seen = {"verify": [], "adjudicate": []}
+    real_rv, real_adj = ai._reverify, ai.adjudicate_cards
+
+    def rv(m, ctx, *a, **kw):
+        seen["verify"].append(copy.deepcopy((m.get("summary") or {}).get("reportPoints")))
+        return real_rv(m, ctx, *a, **kw)
+
+    def adj(ctx, pm, budget):
+        seen["adjudicate"].append(copy.deepcopy((pm.get("summary") or {}).get("reportPoints")))
+        return real_adj(ctx, pm, budget)
+    monkeypatch.setattr(ai, "_reverify", rv)
+    monkeypatch.setattr(ai, "adjudicate_cards", adj)
+    return seen
+
+
+def test_reprocess_report_reaches_verify_and_adjudicate(sj, maxlog, monkeypatch):
+    """The report is built before slips / verify / adjudicate, so the review preview includes it."""
+    store, jobs = sj
+    mk(store, summary=None)
+    seen = spy_preview(monkeypatch)
+    jid = run_payload(store, jobs, {"action": "reprocess", "correction": False, "slips": False})
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    new_pts = store.get("m1")["summary"]["reportPoints"]
+    assert new_pts
+    assert seen["verify"] and seen["verify"][0] == new_pts  # the first verify is the preview one
+    assert seen["adjudicate"] == [new_pts]
+
+
+def test_mode_switch_preview_keeps_old_report(sj, maxlog, monkeypatch):
+    """/mode skips the report step; the kept report is still part of the review preview."""
+    store, jobs = sj
+    mk(store, summary={**copy.deepcopy(SUMMARY), "reportIntro": OLD_INTRO, "reportPoints": OLD_PTS},
+       reportMeta=dict(OLD_META))
+    seen = spy_preview(monkeypatch)
+    jid = run_payload(store, jobs, {"action": "reprocess", "mode": "lecture", "correction": False, "slips": False,
+                                    "report": False})
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    assert report_calls(maxlog) == []
+    assert seen["verify"] and seen["verify"][0] == OLD_PTS
+    assert seen["adjudicate"] == [OLD_PTS]

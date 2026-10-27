@@ -94,7 +94,7 @@ def test_pipeline_after_transcription_lecture(sj, fake_env, monkeypatch, tmp_pat
 
     stages = [s[0] for s in seen if s[0] != "claude"]
     stages = [x for i, x in enumerate(stages) if not i or stages[i - 1] != x]  # the AI filter is a correction sub-step
-    assert stages == ["correction", "mode", "summary", "slips", "verify", "adjudicate", "report"]  # no notes yet
+    assert stages == ["correction", "mode", "summary", "report", "slips", "verify", "adjudicate"]  # no notes yet
     corr_msgs = [s[1] for s in seen if s[0] == "correction"]
     assert corr_msgs[0] == "名詞校正中（第 1/1 段）" and "AI 複核可能錯字中（1/1 批）" in corr_msgs
     msgs = {s[0]: s[1] for s in seen}
