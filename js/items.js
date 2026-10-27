@@ -42,7 +42,7 @@ export const LECTURE_SECTIONS = [
 ];
 export const summarySections = (m) => (meetingMode(m) === 'lecture' ? LECTURE_SECTIONS : MEETING_SECTIONS);
 // 所有可能存在於 summary 的條目欄位（專有名詞訂正時要全部套用）
-export const ALL_SUMMARY_KEYS = ['actionItems', 'mainPoints', 'keyPoints', 'qa', 'conclusions', 'advice', 'risks', 'cases'];
+export const ALL_SUMMARY_KEYS = ['actionItems', 'mainPoints', 'keyPoints', 'qa', 'conclusions', 'advice', 'risks', 'cases', 'reportIntro', 'reportPoints'];
 
 // 依 group 分組（保留第一次出現的順序）；回傳 [{group, items:[[item, 原索引]]}]。沒有任何 group 時回傳一組 group=''
 export function groupItems(arr) {
@@ -59,6 +59,30 @@ export function groupItems(arr) {
     by.get(g).push([x, i]);
   });
   return order.map((g) => ({ group: g, items: by.get(g) }));
+}
+
+// ---- 完整整理：summary.reportIntro（1 條）＋ summary.reportPoints（group = 大標題、text =「子標題：說明」）----
+// 與伺服器 Python 版 report_outline 同規則：第一個全形冒號切開；沒冒號 title=''；大標題依第一次出現順序
+export function hasReport(meeting) {
+  const s = meeting && meeting.summary;
+  return !!(s && Array.isArray(s.reportPoints) && s.reportPoints.length >= 1);
+}
+export function reportOutline(summary) {
+  const s = summary && typeof summary === 'object' ? summary : {};
+  const introArr = Array.isArray(s.reportIntro) ? s.reportIntro : [];
+  const intro = introArr.length ? itemText(introArr[0]) : '';
+  const points = Array.isArray(s.reportPoints) ? s.reportPoints : [];
+  const sections = points.length
+    ? groupItems(points).map((g) => ({
+        heading: g.group,
+        subs: g.items.map(([item]) => {
+          const full = itemText(item);
+          const i = full.indexOf('：');
+          return i < 0 ? { title: '', text: full, item } : { title: full.slice(0, i), text: full.slice(i + 1), item };
+        }),
+      }))
+    : [];
+  return { intro, sections };
 }
 
 // ---- SHA-1（同步、UTF-8）：舊字串條目的 id = sha1(text) 前 8 碼，與伺服器 items.normalize_item 一致 ----

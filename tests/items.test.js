@@ -16,6 +16,9 @@ import {
   itemFlatText,
   listItemIds,
   confirmOnly,
+  hasReport,
+  reportOutline,
+  ALL_SUMMARY_KEYS,
 } from '../js/items.js';
 import { meetingToHtmlBody, splitQA } from '../js/export.js';
 import { buildDocxBytes } from '../js/docx.js';
@@ -215,5 +218,42 @@ describe('待確認勾選清單（v107）', () => {
     expect(rows.length).toBe(1);
     expect(rows[0]).toMatchObject({ from: '王曉明', to: '王小明', count: 3, confidence: 'low' });
     expect(rows[0].cards.map((x) => x.id)).toEqual(['a', 'b']);
+  });
+});
+
+describe('完整整理 reportOutline／hasReport', () => {
+  const P = (group, text) => ({ id: 'x', text, src: [], group });
+  it('reportOutline splits title at first full-width colon', () => {
+    const o = reportOutline({ reportIntro: [{ text: '開場' }], reportPoints: [P('壹', '標題：說明：更多')] });
+    expect(o.intro).toBe('開場');
+    expect(o.sections[0].heading).toBe('壹');
+    expect(o.sections[0].subs[0].title).toBe('標題');
+    expect(o.sections[0].subs[0].text).toBe('說明：更多');
+    expect(o.sections[0].subs[0].item.group).toBe('壹');
+  });
+  it('reportOutline without colon gives empty title', () => {
+    const o = reportOutline({ reportPoints: ['沒有冒號 a:b'] });
+    expect(o.intro).toBe('');
+    expect(o.sections[0].subs[0]).toMatchObject({ title: '', text: '沒有冒號 a:b' });
+  });
+  it('reportOutline keeps group first-seen order', () => {
+    const o = reportOutline({ reportPoints: [P('B', 'a：1'), P('A', 'b：2'), P('B', 'c：3')] });
+    expect(o.sections.map((s) => s.heading)).toEqual(['B', 'A']);
+    expect(o.sections[0].subs.map((s) => s.title)).toEqual(['a', 'c']);
+  });
+  it('reportOutline tolerates null summary', () => {
+    expect(reportOutline(null)).toEqual({ intro: '', sections: [] });
+  });
+  it('hasReport false for legacy meeting', () => {
+    expect(hasReport({})).toBe(false);
+    expect(hasReport({ summary: null })).toBe(false);
+  });
+  it('hasReport false when only intro', () => {
+    expect(hasReport({ summary: { reportIntro: [{ text: 'x' }] } })).toBe(false);
+    expect(hasReport({ summary: { reportIntro: [{ text: 'x' }], reportPoints: [P('A', 'a：b')] } })).toBe(true);
+  });
+  it('ALL_SUMMARY_KEYS includes report keys', () => {
+    expect(ALL_SUMMARY_KEYS).toContain('reportIntro');
+    expect(ALL_SUMMARY_KEYS).toContain('reportPoints');
   });
 });
