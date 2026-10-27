@@ -3,7 +3,7 @@
 // - Word：產生 Word 可開啟的 .doc（HTML 格式），保留中文與排版、可再編輯。
 import { formatDate } from './format.js';
 import { buildDocxBytes, normalizeSections } from './docx.js';
-import { itemText, meetingMode, LECTURE_SECTIONS, groupItems } from './items.js';
+import { itemText, meetingMode, LECTURE_SECTIONS, groupItems, hasReport, reportOutline } from './items.js';
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
@@ -41,10 +41,10 @@ export function splitQA(item) {
   }
   return { q: s.replace(/^\s*問\s*[：:]\s*/, '').trim(), a: '' };
 }
-function qaOl(items) {
+function qaOl(items, olAttr = '') {
   if (!items || !items.length) return '<p class="none">無</p>';
   return (
-    '<ol>' +
+    `<ol${olAttr}>` +
     items
       .map((it) => {
         const { q, a } = splitQA(it);
@@ -73,6 +73,35 @@ export function safeFileName(title) {
   return (String(title || 'meeting').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'meeting').slice(0, 80);
 }
 
+// 完整整理版面：引言 → 編號大標題＋圓點子標題 → Action Items（i. ii.）→ Q&A（i. ii.）；空區塊整段省略
+function reportHtml(meeting, want) {
+  const s = meeting.summary || {};
+  const { intro, sections } = reportOutline(s);
+  let html = '';
+  const introT = String(intro || '').trim();
+  if (introT) html += `<p class="intro">${esc(introT)}</p>`;
+  let hn = 0;
+  for (const sec of sections) {
+    const h = String(sec.heading || '').trim();
+    if (h) html += `<h2 class="rp-h">${++hn}. ${esc(h)}</h2>`;
+    const lis = [];
+    for (const sub of sec.subs) {
+      const t = String(sub.title || '').trim();
+      const x = String(sub.text || '').trim();
+      if (!t && !x) continue;
+      lis.push(t ? `<li><strong>${esc(t)}：</strong>${esc(x)}</li>` : `<li>${esc(x)}</li>`);
+    }
+    if (lis.length) html += `<ul>${lis.join('')}</ul>`;
+  }
+  const actionItems = s.actionItems || [];
+  if (want.actionItems && actionItems.length) {
+    html += `<h2>✅ 待辦事項 Action Item</h2><ol type="i">${actionItems.map((i) => `<li>${esc(itemText(i))}</li>`).join('')}</ol>`;
+  }
+  const qa = s.qa || [];
+  if (want.qa && qa.length) html += `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(qa, ' type="i"')}`;
+  return html;
+}
+
 // 會議內容主體 HTML（PDF 用）。opts 可關閉個別段落，例如 { actionItems: false }
 export function meetingToHtmlBody(meeting, opts) {
   const want = normalizeSections(opts);
@@ -82,7 +111,9 @@ export function meetingToHtmlBody(meeting, opts) {
     .map((seg) => `<p class="seg"><strong style="color:${colors[seg.speaker] || '#111'}">${esc(seg.speaker)}：</strong>${esc(seg.text)}</p>`)
     .join('');
   let html = `<h1>${esc(meeting.title)}</h1><p class="date">${esc(formatDate(meeting.createdAt))}</p>`;
-  if (meetingMode(meeting) === 'lecture') {
+  if (hasReport(meeting)) {
+    html += reportHtml(meeting, want);
+  } else if (meetingMode(meeting) === 'lecture') {
     for (const sec of LECTURE_SECTIONS) {
       if (!want[sec.k]) continue;
       const body =
@@ -159,6 +190,7 @@ const STYLE = `
   .date{color:#666;margin:0 0 18px;}
   h2{font-size:16px;border-bottom:2px solid #0a84ff;padding-bottom:4px;margin:22px 0 8px;color:#0a6;}
   ul{margin:6px 0;padding-left:22px;} li{margin:5px 0;}
+  .intro{margin:0 0 10px;}
   p{margin:6px 0;} .seg{margin:4px 0;} .none{color:#999;}
   .nt-h{font-weight:700;margin:10px 0 2px;} .nt-why{color:#555;margin:2px 0 8px;}
   table{border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:14px;page-break-inside:avoid;}

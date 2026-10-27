@@ -209,3 +209,58 @@ describe('學習筆記匯出', () => {
     expect(() => meetingToHtmlBody(meeting, { notes: true })).not.toThrow();
   });
 });
+
+describe('完整整理 HTML', () => {
+  const rep = {
+    title: 'T',
+    createdAt: 1,
+    transcript: [{ speaker: 'A', text: 'hi' }],
+    summary: {
+      reportIntro: ['本次討論 <A&B>'],
+      reportPoints: [
+        { text: '趨勢：很強', group: '市場' },
+        { text: '無冒號內容', group: '市場' },
+        { text: '風險：要小心', group: '策略' },
+      ],
+      mainPoints: ['舊重點'],
+      actionItems: ['做事一', '做事二'],
+      qa: ['問：甲？答：乙'],
+    },
+  };
+  it('html: report order intro, headings, action items, qa', () => {
+    const h = meetingToHtmlBody(rep);
+    const idx = ['class="intro"', '<h2>1. 市場</h2>', '<h2>2. 策略</h2>', '待辦事項', '會議提問', '逐字稿'].map((k) => h.indexOf(k));
+    expect(idx.every((i) => i >= 0)).toBe(true);
+    expect([...idx].sort((a, b) => a - b)).toEqual(idx);
+    expect(h).toContain('<ol type="i"><li>做事一</li><li>做事二</li></ol>');
+    expect(h).toMatch(/<ol type="i"><li><div class="qa-q">/);
+  });
+  it('html: sub title bold', () => {
+    const h = meetingToHtmlBody(rep);
+    expect(h).toContain('<li><strong>趨勢：</strong>很強</li>');
+    expect(h).toContain('<li>無冒號內容</li>');
+  });
+  it('html: no 會議重點 with report', () => {
+    const h = meetingToHtmlBody(rep);
+    expect(h).not.toContain('會議重點');
+    expect(h).not.toContain('舊重點');
+  });
+  it('html: empty blocks omitted, toggles honoured', () => {
+    const h = meetingToHtmlBody({ ...rep, summary: { ...rep.summary, actionItems: [], qa: [] } });
+    expect(h).not.toContain('（無）');
+    expect(h).not.toContain('待辦事項');
+    const h2 = meetingToHtmlBody(rep, { actionItems: false, qa: false });
+    expect(h2).not.toContain('待辦事項');
+    expect(h2).not.toContain('會議提問');
+  });
+  it('html: legacy unchanged', () => {
+    const h = meetingToHtmlBody({ title: 'T', createdAt: 1, transcript: [], summary: { actionItems: ['x'], mainPoints: ['y'], qa: [] } });
+    expect(h).toContain('<h2>📌 會議重點 Main Point</h2><ol><li>y</li></ol>');
+    expect(h).not.toContain('type="i"');
+  });
+  it('html: escapes special chars', () => {
+    const h = meetingToHtmlBody(rep);
+    expect(h).toContain('本次討論 &lt;A&amp;B&gt;');
+    expect(h).not.toContain('<A&B>');
+  });
+});
