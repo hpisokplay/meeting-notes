@@ -225,8 +225,10 @@ function reportBody(meeting, want) {
   const body = [];
   const introT = String(intro || '').trim();
   if (introT) body.push(line(introT));
-  sections.forEach((sec, i) => {
-    body.push(para(run(`${i + 1}. ${String(sec.heading || '').trim()}`, { b: true, sz: 26 }), '<w:keepNext/>'));
+  let hn = 0;
+  sections.forEach((sec) => {
+    const h = String(sec.heading || '').trim();
+    if (h) body.push(para(run(`${++hn}. ${h}`, { b: true, sz: 26 }), '<w:keepNext/>'));
     for (const sub of sec.subs) {
       const t = String(sub.title || '').trim();
       const x = String(sub.text || '').trim();
@@ -247,7 +249,7 @@ function reportBody(meeting, want) {
       const { q, a } = splitQA(x);
       let runs = run(`${roman(i + 1)}.　`, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
       if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
-      body.push(para(runs, IND + '<w:keepLines/>'));
+      body.push(para(runs, '<w:keepLines/>' + IND));
     });
   }
   return body;

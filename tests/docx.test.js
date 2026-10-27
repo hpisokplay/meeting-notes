@@ -173,3 +173,23 @@ describe('完整整理的 Word 版面', () => {
 it('roman numerals', () => {
   expect([1, 4, 9, 12].map(roman)).toEqual(['i', 'iv', 'ix', 'xii']);
 });
+
+describe('完整整理：修正輪', () => {
+  const docXml = (m) => new TextDecoder().decode(buildDocxBytes(m));
+  const base = (points) => ({
+    title: 't',
+    createdAt: 1,
+    summary: { reportIntro: ['引言'], reportPoints: points, qa: ['問：甲 答：乙'] },
+  });
+  it('report: Q&A pPr puts keepLines before ind (schema order)', () => {
+    const x = docXml(base([{ text: 'a：b', group: 'G' }]));
+    expect(x).toContain('<w:pPr><w:keepLines/><w:ind');
+    expect(x).not.toContain('<w:ind w:left="720" w:hanging="360"/><w:keepLines/>');
+  });
+  it('report: no group -> no bare numbered heading, subs still bullets', () => {
+    const x = docXml(base([{ text: '小標：說明' }]));
+    expect(x).not.toMatch(/>1\. </);
+    expect(x).toContain('•　');
+    expect(x).toContain('說明');
+  });
+});
