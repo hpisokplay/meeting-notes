@@ -1635,7 +1635,7 @@ describe('播放與狀態的純函式', () => {
     expect(progressLabel({ status: 'transcribing', progress: {} })).toBe('轉錄中');
     // 重新整理的各步驟：stage 或伺服器訊息文字都認得
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'correction' } })).toBe('摘要中・名詞校正中（第 1/6 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'verify' } })).toBe('摘要中・驗證中（第 6/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'verify' } })).toBe('摘要中・驗證中（第 5/6 步）');
     expect(progressLabel({ status: 'summarizing', progress: { msg: '判斷講座／會議' } })).toBe('摘要中・判斷講座／會議（第 2/6 步）');
     // 「整理摘要」本身分不出是 reprocess 還是一般摘要 → 沒看過 reprocess 專屬步驟、沒標動作時維持舊標籤
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } })).toBe('摘要中');
@@ -1644,8 +1644,8 @@ describe('播放與狀態的純函式', () => {
     // 看過專屬步驟（seen）或伺服器標了 action=reprocess → 編號
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'claude', msg: '整理摘要中' } }, true)).toBe('摘要中・整理摘要中（第 3/6 步）');
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'notes', action: 'reprocess' } })).toBe('摘要中・整理筆記中（第 4/6 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { stage: 'report', action: 'reprocess' } })).toBe('摘要中・整理完整報告中（第 5/6 步）');
-    expect(progressLabel({ status: 'summarizing', progress: { msg: '整理完整報告中' } }, true)).toBe('摘要中・整理完整報告中（第 5/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { stage: 'report', action: 'reprocess' } })).toBe('摘要中・整理完整報告中（第 6/6 步）');
+    expect(progressLabel({ status: 'summarizing', progress: { msg: '整理完整報告中' } }, true)).toBe('摘要中・整理完整報告中（第 6/6 步）');
     // 單獨按「完整整理」（action=report）不編號
     expect(progressLabel({ status: 'summarizing', progress: { stage: 'report', action: 'report', msg: '整理完整報告中' } })).toBe('摘要中');
     // 伺服器標了別的動作 → 就算訊息像 reprocess 也不編號

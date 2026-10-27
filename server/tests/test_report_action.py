@@ -469,3 +469,109 @@ def test_reprocess_report_failure_keeps_old_report_and_marks_stale(sj, nokey, ma
     handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
     m = store.get("m1")
     assert m["summary"]["reportPoints"] == old_pts and m["reportMeta"]["stale"] is True
+
+
+# ---------------------------------------------------------------- final fix wave
+OLD_INTRO = [{"id": "iiiiiiii", "text": "舊引言", "src": []}]
+OLD_PTS = [{"id": "aaaaaaaa", "text": "舊子標題：舊說明", "group": "舊大標題", "src": []}]
+OLD_META = {"via": "api", "model": "x", "at": 1, "fp": ai._fingerprint(TRANSCRIPT), "stale": False}
+
+
+def run_payload(store, jobs, payload, mid="m1"):
+    jid = jobs.enqueue("ai", mid, payload)
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    return jid
+
+
+def test_summary_keeps_existing_report(sj, nokey, maxlog):
+    store, jobs = sj
+    mk(store, summary={**copy.deepcopy(SUMMARY), "reportIntro": OLD_INTRO, "reportPoints": OLD_PTS},
+       reportMeta=dict(OLD_META))
+    jid = run_payload(store, jobs, {"action": "summary"})
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    m = store.get("m1")
+    assert m["summary"]["reportIntro"] == OLD_INTRO and m["summary"]["reportPoints"] == OLD_PTS
+    assert m["summary"]["mainPoints"] != SUMMARY["mainPoints"]  # the summary itself was replaced
+    assert m["reportMeta"] == OLD_META
+
+
+def test_report_success_clears_old_report_warning(sj, nokey, maxlog):
+    store, jobs = sj
+    mk(store, warnings=["完整整理失敗，已略過：舊錯誤", "名詞校正失敗，已略過：x"])
+    jid = run_job(store, jobs)
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    assert store.get("m1")["warnings"] == ["名詞校正失敗，已略過：x"]
+    mk(store, "m2", warnings=["完整整理失敗，已略過：舊錯誤"])
+    run_job(store, jobs, "m2")
+    assert "warnings" not in store.get("m2")
+
+
+def test_reprocess_report_success_clears_old_report_warning(sj, nokey, maxlog):
+    store, jobs = sj
+    mk(store, warnings=["完整整理失敗，已略過：舊錯誤"])
+    jid = run_payload(store, jobs, {"action": "reprocess", "correction": False, "slips": False, "adjudicate": False})
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    m = store.get("m1")
+    assert m["summary"]["reportPoints"]
+    assert not any(w.startswith("完整整理失敗") for w in m.get("warnings") or [])
+
+
+def test_mode_switch_skips_report_and_keeps_old_one(sj, key, api, maxlog):
+    store, jobs = sj
+    mk(store, summary={**copy.deepcopy(SUMMARY), "reportIntro": OLD_INTRO, "reportPoints": OLD_PTS},
+       reportMeta=dict(OLD_META), warnings=["完整整理失敗，已略過：舊錯誤"])
+    jid = run_payload(store, jobs, {"action": "reprocess", "mode": "lecture", "correction": False, "slips": False,
+                                    "report": False})
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    m = store.get("m1")
+    assert m["mode"] == "lecture"
+    assert api.calls == [] and report_calls(maxlog) == []  # no REPORT call on either path
+    assert m["summary"]["reportIntro"] == OLD_INTRO and m["summary"]["reportPoints"] == OLD_PTS
+    assert m["reportMeta"] == OLD_META  # transcript unchanged -> still fresh
+    assert m["warnings"] == ["完整整理失敗，已略過：舊錯誤"]  # the step did not run: its note stays
+
+
+def test_mode_route_sends_report_false(tmp_path, monkeypatch):
+    from fastapi.testclient import TestClient
+    from server.app import create_app
+    static = tmp_path / "static"
+    static.mkdir()
+    (static / "index.html").write_text("x", encoding="utf-8")
+    monkeypatch.setenv("MEETINGS_STATIC", str(static))
+    app = create_app(tmp_path / "data", start_threads=False, claude_cmd=FAKE)
+    c = TestClient(app)
+    mk(app.state.store)
+    r = c.post("/api/meetings/m1/mode", json={"mode": "lecture"})
+    assert r.status_code == 200, r.text
+    assert app.state.jobs.get(r.json()["jobId"])["payload"]["report"] is False
+    # restore-raw still rebuilds the report
+    app.state.store.update("m1", lambda m: m.update(status="done", aiJobId=None, transcriptRaw=copy.deepcopy(TRANSCRIPT)))
+    r = c.post("/api/meetings/m1/restore-raw")
+    assert r.status_code == 200, r.text
+    assert app.state.jobs.get(r.json()["jobId"])["payload"].get("report", True) is not False
+
+
+def test_limit_retry_never_repeats_paid_report_call(sj, key, api, maxlog, monkeypatch):
+    """A Max limit error in a later reprocess step must not make the retry pay for the API report again."""
+    store, jobs = sj
+    mk(store)
+    monkeypatch.setattr(ai, "LIMIT_RETRY_S", -1)  # the retry is claimable right away
+    order = []
+    api.hook = lambda: order.append("api")
+    real_adj = ai.adjudicate_cards
+    state = {"n": 0}
+
+    def flaky(ctx, pm, budget):
+        order.append("adjudicate")
+        state["n"] += 1
+        if state["n"] == 1:
+            raise ai.ClaudeLimitError("用量上限")
+        return real_adj(ctx, pm, budget)
+    monkeypatch.setattr(ai, "adjudicate_cards", flaky)
+    jid = run_payload(store, jobs, {"action": "reprocess", "correction": False, "slips": False})
+    assert jobs.get(jid)["state"] == "queued" and jobs.get(jid)["retries"] == 1
+    handle_ai_job(store, jobs.claim(["ai"], "nas-ai"), FAKE, jobs)
+    assert jobs.get(jid)["state"] == "done", jobs.get(jid).get("error")
+    assert api.calls == [P.REPORT_PROMPT]  # paid API report call made once in total
+    assert order == ["adjudicate", "adjudicate", "api"]  # the report is the last Claude step
+    assert store.get("m1")["reportMeta"]["via"] == "api"

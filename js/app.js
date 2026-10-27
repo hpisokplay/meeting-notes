@@ -104,12 +104,12 @@ const REPROCESS_STAGE_TEXT = {
   mode: '判斷講座／會議',
   summary: '整理摘要中',
   notes: '整理筆記中',
-  report: '整理完整報告中',
   slips: '檢查講者口誤',
   verify: '驗證中',
+  report: '整理完整報告中',
 };
-// 順序同伺服器 _reprocess：summary → notes → report → slips → verify
-const REPROCESS_STEPS = ['correction', 'mode', 'summary', 'notes', 'report', 'verify'];
+// 順序同伺服器 _reprocess：summary → notes → slips → verify（含 AI 審稿）→ report（最後，避免重試時重複付費呼叫 API）
+const REPROCESS_STEPS = ['correction', 'mode', 'summary', 'notes', 'verify', 'report'];
 // 只有 reprocess 才會出現的步驟：看過其中之一，就能確定這是 reprocess 工作
 const REPROCESS_ONLY = ['correction', 'mode', 'slips', 'verify'];
 // 伺服器回報的進度文字（progress.msg）→ 步驟（stage 沒給時用文字判斷）
@@ -118,9 +118,9 @@ const REPROCESS_MSG = [
   ['判斷講座', 'mode'],
   ['整理摘要', 'summary'],
   ['整理筆記', 'notes'],
-  ['整理完整報告', 'report'],
   ['口誤', 'slips'],
   ['驗證', 'verify'],
+  ['整理完整報告', 'report'],
 ];
 // 這次進度屬於重新整理的哪一步（認不出回 ''）
 export function reprocessStage(m) {

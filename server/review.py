@@ -700,9 +700,11 @@ def build_review_router(store: Store, get_jobs) -> APIRouter:
         mode = body.get("mode")
         if mode not in MODES:
             raise HTTPException(400, "模式只能是講座或會議")
-        # transcript unchanged: no new correction / slip pass, only summary (+ notes) and verify
+        # transcript unchanged: no new correction / slip pass, only summary (+ notes) and verify; the
+        # 完整整理 does not depend on the mode, so it is kept (no billed report call)
         # meeting.mode changes only when the job's final write succeeds (a failed run keeps the old one)
-        return start_reprocess(store, get_jobs(), mid, {"mode": mode, "correction": False, "slips": False})
+        return start_reprocess(store, get_jobs(), mid,
+                               {"mode": mode, "correction": False, "slips": False, "report": False})
 
     @r.post("/meetings/{mid}/restore-raw")
     def restore_raw(mid: str):

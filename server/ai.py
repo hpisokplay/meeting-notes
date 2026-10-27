@@ -80,10 +80,12 @@ STEP_CORRECTION = ("correction", 3, "名詞校正中")
 STEP_MODE = ("mode", 15, "判斷講座／會議")
 STEP_SUMMARY = ("summary", 25, "整理摘要中")
 STEP_NOTES = ("notes", 50, "整理筆記中")
-STEP_REPORT = ("report", 60, "整理完整報告中")
 STEP_SLIPS = ("slips", 75, "檢查口誤中")
 STEP_VERIFY = ("verify", 90, "驗證中")
 STEP_ADJUDICATE = ("adjudicate", 93, "AI 審稿中")
+# last: a Max limit / transient error in an earlier step retries the job before the (billed) API
+# report call was made, so one reprocess never pays for the same report twice
+STEP_REPORT = ("report", 95, "整理完整報告中")
 STEP_DEEP = ("correction", 3, "加強校對中")
 STEP_DEEP_ADJUDICATE = ("adjudicate", 90, "AI 審稿中")
 ADJUDICATE_BUDGET = 150_000  # chars per adjudicate call (items + context); more -> several calls
@@ -1319,17 +1321,33 @@ def _summary(ctx: Ctx, payload):
     def apply(m):
         _backup(m, "summary", None)
         m["mode"] = mode
-        m["summary"] = summary
+        old = m.get("summary") if isinstance(m.get("summary"), dict) else {}
+        # 「摘要」 does not rebuild the 完整整理: keep it (reportMeta is left as it is)
+        kept = {k: old[k] for k in REPORT_KEYS if isinstance(old.get(k), list) and k not in summary}
+        m["summary"] = {**summary, **kept}
         m["translations"] = {}
         m["error"] = None  # any successful summary clears an old (e.g. failed-summary) error
         _reverify(m, ctx)
     return apply
 
 
+REPORT_KEYS = ("reportIntro", "reportPoints")
+REPORT_WARN = "完整整理失敗"  # prefix of the 「完整整理失敗，已略過：…」 warning
+
+
+def _drop_report_warning(m: dict) -> None:
+    """A successful 完整整理 removes an earlier 「完整整理失敗，已略過：…」 warning."""
+    ws = [w for w in m.get("warnings") or [] if not (isinstance(w, str) and w.startswith(REPORT_WARN))]
+    if ws:
+        m["warnings"] = ws
+    else:
+        m.pop("warnings", None)
+
+
 def _reprocess_report(ctx: Ctx, lines: list[str], warnings: list[str]):
     """The 完整整理 of a reprocess: built from the (corrected) `lines`, progress squeezed into
-    STEP_REPORT..STEP_SLIPS so the bar never goes back. A failure is only a warning (None)."""
-    lo, hi = STEP_REPORT[1], STEP_SLIPS[1] - 1
+    STEP_REPORT..99 so the bar never goes back. A failure is only a warning (None)."""
+    lo, hi = STEP_REPORT[1], 99
     real_report, real_lines = ctx.report, ctx.lines
 
     def squeezed(pct, msg, stage=None):
@@ -1343,8 +1361,9 @@ def _reprocess_report(ctx: Ctx, lines: list[str], warnings: list[str]):
 
 
 def _reprocess(ctx: Ctx, payload):
-    """correction -> mode -> summary -> notes (if any) -> report -> slips -> verify -> adjudicate
-    (word-review cards); one write at the end."""
+    """correction -> mode -> summary -> notes (if any) -> slips -> verify -> adjudicate (word-review
+    cards) -> report (last, see STEP_REPORT; skipped when payload "report" is False, e.g. /mode);
+    one write at the end."""
     m0 = ctx.m
     fp = _fingerprint(m0.get("transcript"))
     transcript = copy.deepcopy(m0.get("transcript") or [])
@@ -1352,6 +1371,7 @@ def _reprocess(ctx: Ctx, payload):
     warnings: list[str] = []
     ran_correction = bool(payload.get("correction", True))
     ran_slips = bool(payload.get("slips", True))
+    ran_report = bool(payload.get("report", True))
     unsure: set = set()
     if ran_correction:
         proposals = _optional(lambda: scan_corrections(ctx, transcript, STEP_CORRECTION[2], (3, 12)),
@@ -1376,9 +1396,6 @@ def _reprocess(ctx: Ctx, payload):
     if _has_notes(m0):
         ctx.step(STEP_NOTES)
         notes = _grounded_notes(ctx, lines)
-    built = _reprocess_report(ctx, lines, warnings)
-    if built:
-        summary = {**summary, "reportIntro": built["reportIntro"], "reportPoints": built["reportPoints"]}
     slips = None
     if payload.get("slips", True):
         ctx.step(STEP_SLIPS)
@@ -1400,6 +1417,9 @@ def _reprocess(ctx: Ctx, payload):
         cards = _optional(lambda: adjudicate_cards(ctx, pm, budget), "AI 審稿", warnings)
         if cards is not None:
             cards = _cap_unsure(cards, pm, unsure)
+    built = _reprocess_report(ctx, lines, warnings) if ran_report else None
+    if built:
+        summary = {**summary, "reportIntro": built["reportIntro"], "reportPoints": built["reportPoints"]}
 
     def apply(m):
         if _fingerprint(m.get("transcript")) != fp:
@@ -1412,8 +1432,8 @@ def _reprocess(ctx: Ctx, payload):
         m["mode"] = mode
         _backup(m, "summary", None)
         if not built and isinstance(m.get("summary"), dict):
-            # report step failed: keep the previous report (if any) rather than lose it
-            kept_report = {k: m["summary"][k] for k in ("reportIntro", "reportPoints")
+            # report step failed or did not run: keep the previous report (if any) rather than lose it
+            kept_report = {k: m["summary"][k] for k in REPORT_KEYS
                            if isinstance(m["summary"].get(k), list)}
         else:
             kept_report = {}
@@ -1430,7 +1450,8 @@ def _reprocess(ctx: Ctx, payload):
         m["error"] = None
         # a step that did not run this time (/mode, restore-raw) keeps its earlier failure note
         kept = [w for w in m.get("warnings") or [] if isinstance(w, str) and (
-            (not ran_correction and w.startswith("名詞校正")) or (not ran_slips and w.startswith("檢查口誤")))]
+            (not ran_correction and w.startswith("名詞校正")) or (not ran_slips and w.startswith("檢查口誤"))
+            or (not ran_report and w.startswith(REPORT_WARN)))]
         if kept + warnings:
             m["warnings"] = kept + warnings
         else:
@@ -1832,6 +1853,7 @@ def _report(ctx: Ctx, payload):
         # fp = the transcript the report was built from; changed meanwhile -> stale right away
         m["reportMeta"] = {"via": built["via"], "model": built["model"], "at": int(time.time() * 1000),
                            "fp": fp, "stale": _fingerprint(m.get("transcript")) != fp}
+        _drop_report_warning(m)
         _reverify(m, ctx)
     return apply
 

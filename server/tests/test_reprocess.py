@@ -94,7 +94,7 @@ def test_pipeline_after_transcription_lecture(sj, fake_env, monkeypatch, tmp_pat
 
     stages = [s[0] for s in seen if s[0] != "claude"]
     stages = [x for i, x in enumerate(stages) if not i or stages[i - 1] != x]  # the AI filter is a correction sub-step
-    assert stages == ["correction", "mode", "summary", "report", "slips", "verify", "adjudicate"]  # no notes yet
+    assert stages == ["correction", "mode", "summary", "slips", "verify", "adjudicate", "report"]  # no notes yet
     corr_msgs = [s[1] for s in seen if s[0] == "correction"]
     assert corr_msgs[0] == "名詞校正中（第 1/1 段）" and "AI 複核可能錯字中（1/1 批）" in corr_msgs
     msgs = {s[0]: s[1] for s in seen}
@@ -337,18 +337,18 @@ def test_mode_endpoint(app_client, tmp_path, monkeypatch):
     m = app.state.store.get("m1")
     assert m["mode"] == "meeting" and m["aiJobId"] == jid and m["status"] == "summarizing"
     assert app.state.jobs.get(jid)["payload"] == {"action": "reprocess", "mode": "lecture",
-                                                  "correction": False, "slips": False}
+                                                  "correction": False, "slips": False, "report": False}
     log = tmp_path / "log.jsonl"
     monkeypatch.setenv("FAKE_CLAUDE_LOG", str(log))
     handle_ai_job(app.state.store, app.state.jobs.claim(["ai"], "nas-ai"), FAKE, app.state.jobs)
     m = app.state.store.get("m1")
     assert m["mode"] == "lecture"
-    assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa", "reportIntro", "reportPoints"}
+    assert set(m["summary"]) == {"conclusions", "advice", "risks", "cases", "mainPoints", "qa"}
     schemas = [c_[0] for c_ in log_calls(log)]
-    # no correction / slips / mode: the summary, the 完整整理 report, then the word-review adjudicate
-    # (+ one re-ask of the flags the fake left unanswered)
-    assert len(schemas) == 4 and "conclusions" in schemas[0]["properties"]
-    assert all("span" in x["properties"]["items"]["items"]["properties"] for x in schemas[2:])
+    # no correction / slips / mode / 完整整理 report (it does not depend on the mode): the summary,
+    # then the word-review adjudicate (+ one re-ask of the flags the fake left unanswered)
+    assert len(schemas) == 3 and "conclusions" in schemas[0]["properties"]
+    assert all("span" in x["properties"]["items"]["items"]["properties"] for x in schemas[1:])
     assert any(r["kind"] == "slip" for r in m["review"]["items"])  # existing slip list kept
 
 
