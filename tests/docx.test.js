@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { buildDocxBytes, zipStore } from '../js/docx.js';
+import { buildDocxBytes, zipStore, roman } from '../js/docx.js';
 
 const meeting = {
   title: '分戶帳教育訓練',
@@ -92,4 +92,84 @@ describe('學習筆記與表格', () => {
     const cells = (s.match(/<w:tc>/g) || []).length;
     expect(cells).toBe(6); // 3 欄標題 + 3 欄資料（缺的補空）
   });
+});
+
+describe('完整整理的 Word 版面', () => {
+  const docXml = (m, o) => new TextDecoder().decode(buildDocxBytes(m, o));
+  const rep = (over = {}) => ({
+    title: '週會',
+    createdAt: new Date('2026-07-18T10:00:00').getTime(),
+    transcript: [{ speaker: '甲', text: '你好' }],
+    summary: {
+      reportIntro: ['引言段落'],
+      reportPoints: [
+        { text: '重點一：說明一', group: '第一大項' },
+        { text: '沒有冒號的整段', group: '第一大項' },
+        { text: '重點三：說明三', group: '第二大項' },
+      ],
+      actionItems: ['甲：做A', '乙：做B'],
+      mainPoints: ['舊重點'],
+      qa: ['問：為何？ 答：因為'],
+      ...over,
+    },
+  });
+
+  it('report: intro comes right after the date', () => {
+    const x = docXml(rep());
+    expect(x.indexOf('引言段落')).toBeGreaterThan(x.indexOf('週會'));
+    expect(x.indexOf('引言段落')).toBeLessThan(x.indexOf('第一大項'));
+  });
+  it('report: headings numbered and bold', () => {
+    const x = docXml(rep());
+    expect(x).toContain('<w:b/><w:sz w:val="26"/><w:szCs w:val="26"/></w:rPr><w:t xml:space="preserve">1. 第一大項</w:t>');
+    expect(x).toContain('2. 第二大項');
+  });
+  it('report: sub title bold followed by colon', () => {
+    const x = docXml(rep());
+    expect(x).toMatch(/<w:b\/>[^]*?<w:t xml:space="preserve">重點一<\/w:t><\/w:r><w:r>[^]*?<w:t xml:space="preserve">：說明一<\/w:t>/);
+    expect(x).toContain('沒有冒號的整段');
+  });
+  it('report: action items use roman numerals', () => {
+    const x = docXml(rep());
+    expect(x).toContain('i.　');
+    expect(x).toContain('ii.　');
+  });
+  it('report: no 會議重點 heading when report exists', () => {
+    const x = docXml(rep());
+    expect(x).not.toContain('會議重點');
+    expect(x).not.toContain('舊重點');
+  });
+  it('report: empty action items omits the block', () => {
+    const x = docXml(rep({ actionItems: [], qa: [] }));
+    expect(x).not.toContain('待辦事項');
+    expect(x).not.toContain('會議提問');
+    expect(x).not.toContain('（無）');
+  });
+  it('report: escapes & < > in headings', () => {
+    const x = docXml(rep({ reportPoints: [{ text: 'A&B：<x>', group: 'R&D <組>' }] }));
+    expect(x).toContain('R&amp;D &lt;組&gt;');
+    expect(x).toContain('A&amp;B');
+  });
+  it('report: lecture meeting without actionItems prints no 待辦 block', () => {
+    const m = rep({ actionItems: undefined, qa: [] });
+    m.summary.mode = 'lecture';
+    const x = docXml(m);
+    expect(x).not.toContain('待辦事項');
+    expect(x).toContain('1. 第一大項');
+  });
+  it('report: honours toggles and keeps transcript', () => {
+    const x = docXml(rep(), { actionItems: false, qa: false });
+    expect(x).not.toContain('待辦事項');
+    expect(x).toContain('逐字稿');
+    expect(docXml(rep(), { transcript: false })).not.toContain('逐字稿');
+  });
+  it('legacy meeting output unchanged', () => {
+    const x = docXml(meeting);
+    expect(x).toContain('📌 會議重點 Main Point');
+    expect(x).toContain('1. 重點A');
+  });
+});
+
+it('roman numerals', () => {
+  expect([1, 4, 9, 12].map(roman)).toEqual(['i', 'iv', 'ix', 'xii']);
 });

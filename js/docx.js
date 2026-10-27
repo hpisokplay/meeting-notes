@@ -1,7 +1,7 @@
 // 產生「真正的」.docx（Office Open XML）：docx 本質是一個 zip，內含幾個 XML。
 // 這裡用純 JS 自建最小可用的 docx（store 無壓縮 zip + 直接格式化的段落），
 // 不需任何外部套件，Word / Pages / iOS / WeChat 都能開啟。
-import { itemText, meetingMode, LECTURE_SECTIONS, groupItems } from './items.js';
+import { itemText, meetingMode, LECTURE_SECTIONS, groupItems, hasReport, reportOutline } from './items.js';
 
 const enc = new TextEncoder();
 
@@ -209,6 +209,50 @@ function notesBody(n) {
   return body;
 }
 
+// 羅馬數字小寫（i. ii. iii.）
+export function roman(n) {
+  const t = [[1000, 'm'], [900, 'cm'], [500, 'd'], [400, 'cd'], [100, 'c'], [90, 'xc'], [50, 'l'], [40, 'xl'], [10, 'x'], [9, 'ix'], [5, 'v'], [4, 'iv'], [1, 'i']];
+  let out = '';
+  for (const [v, r] of t) while (n >= v) { out += r; n -= v; }
+  return out;
+}
+
+// 完整整理版面：引言 → 編號大標題＋圓點子標題 → Action Items → Q&A
+const IND = '<w:ind w:left="720" w:hanging="360"/>';
+function reportBody(meeting, want) {
+  const s = meeting.summary || {};
+  const { intro, sections } = reportOutline(s);
+  const body = [];
+  const introT = String(intro || '').trim();
+  if (introT) body.push(line(introT));
+  sections.forEach((sec, i) => {
+    body.push(para(run(`${i + 1}. ${String(sec.heading || '').trim()}`, { b: true, sz: 26 }), '<w:keepNext/>'));
+    for (const sub of sec.subs) {
+      const t = String(sub.title || '').trim();
+      const x = String(sub.text || '').trim();
+      if (!t && !x) continue;
+      const runs = run('•　') + (t ? run(t, { b: true }) + run('：' + x) : run(x));
+      body.push(para(runs, IND));
+    }
+  });
+  const actionItems = s.actionItems || [];
+  if (want.actionItems && actionItems.length) {
+    body.push(heading('✅ 待辦事項 Action Item'));
+    actionItems.forEach((x, i) => body.push(para(run(`${roman(i + 1)}.　${itemText(x)}`), IND)));
+  }
+  const qa = s.qa || [];
+  if (want.qa && qa.length) {
+    body.push(heading('❓ 會議提問 Q&A'));
+    qa.forEach((x, i) => {
+      const { q, a } = splitQA(x);
+      let runs = run(`${roman(i + 1)}.　`, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
+      if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
+      body.push(para(runs, IND + '<w:keepLines/>'));
+    });
+  }
+  return body;
+}
+
 function documentXml(meeting, opts) {
   const want = normalizeSections(opts);
   const s = meeting.summary || {};
@@ -233,7 +277,9 @@ function documentXml(meeting, opts) {
       body.push(para(runs, '<w:keepLines/>'));
     });
   };
-  if (meetingMode(meeting) === 'lecture') {
+  if (hasReport(meeting)) {
+    body.push(...reportBody(meeting, want));
+  } else if (meetingMode(meeting) === 'lecture') {
     // 講座模式：核心結論／講者建議／風險提醒／案例／重點（依主題分組）／Q&A
     for (const sec of LECTURE_SECTIONS) {
       if (!want[sec.k]) continue;
