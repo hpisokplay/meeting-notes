@@ -919,3 +919,73 @@ def verify_candidates_user_message(cands: list[dict], glossary) -> str:
         b += [f"  {x}" for x in c.get("contexts") or []] or ["  （逐字稿找不到出現位置）"]
         blocks.append("\n".join(b))
     return f"【詞庫】\n{'、'.join(terms) or '（無）'}\n\n【候選】\n" + "\n\n".join(blocks)
+
+
+# =====================================================================================
+# 完整整理（2026-10-27 spec）：引言 ＋ 大標題 ＋ 子標題。
+# report.normalize_report() flattens the points into Items (group = heading, text = "標題：說明").
+# =====================================================================================
+REPORT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "intro": ITEM_SCHEMA,
+        "points": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"heading": {"type": "string"}, "title": {"type": "string"},
+                               "text": {"type": "string"}, "src": SRC_SCHEMA},
+                "required": ["heading", "title", "text", "src"],
+            },
+        },
+    },
+    "required": ["intro", "points"],
+}
+REPORT_PROMPT = (
+    "你是嚴謹的會議記錄員，這份完整整理要交給董事長閱讀，不能有任何一句沒有依據。"
+    "以下是一場錄音的逐字稿（每行格式「[時:分:秒] 說話者: 內容」）。請整理成「引言」加「大標題與子標題」兩部分：\n"
+    "\n"
+    "■ intro（引言）：2～4 句，說明誰參與、談什麼、有哪幾個主要方向。"
+    '格式 {"text":"…","group":"","src":[{"t":秒數,"quote":"逐字稿原句"}]}，引言裡的每個事實也要有 src。\n'
+    "\n"
+    "■ points（內容）：依錄音實際談的主題切成大標題，每一條子標題是"
+    '{"heading":"大標題","title":"子標題","text":"說明","src":[{"t":秒數,"quote":"逐字稿原句"}]}。\n'
+    "  - 大標題 2～6 個，每個大標題底下 2～6 個子標題；同一個大標題的 heading 用「完全相同」的文字，"
+    "同一大標題的子標題連續寫在一起。不套固定範本，大標題依這場錄音的實際主題命名，依討論先後排列。\n"
+    "  - title 是 4～14 字的名詞短語（例：「生意與訂單」），不寫成句子，不含冒號。\n"
+    "  - text 是說明：保留數字、日期、條件、但書、誰說的；不要在 text 前面重複 title。\n"
+    "  - 同一個論點只寫一條；不同議題分開寫。決議、結論要寫出是誰的意見、是否已拍板。\n"
+    "  - 不要寫待辦事項與問答：它們由另外的區塊整理，這裡不重複。\n"
+    "  - 不要自己加粗體或任何標記符號。\n"
+    "\n"
+    + GROUNDING_RULES
+    + '\n只輸出 JSON {"intro":{…},"points":[…]}。' + LANG_RULE + IN_USER
+)
+
+# 分段整理後的合併：模型只回「怎麼排、怎麼分組」，文字由程式依序號取回原文，不讓模型改寫。
+REPORT_MERGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "groups": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {"heading": {"type": "string"},
+                               "items": {"type": "array", "items": {"type": "integer"}}},
+                "required": ["heading", "items"],
+            },
+        },
+    },
+    "required": ["groups"],
+}
+REPORT_MERGE_PROMPT = (
+    "你是會議記錄的編輯。使用者訊息是同一場錄音分段整理出來的子標題草稿，每條前面有序號，"
+    "格式「[序號] 〔大標題〕子標題：說明」。各段各自取的大標題可能主題相同卻名字不同，順序也只依各段內部排列。\n"
+    "請只做兩件事：(1) 把主題相同的大標題合併成同一個名字（沿用草稿裡最貼切的那一個，不另創新詞，名字不超過 14 字）；"
+    "(2) 決定大標題的先後順序，與每個大標題底下子標題的先後順序（依討論先後）。\n"
+    "硬規則：\n"
+    "- 只輸出序號，不輸出、不改寫任何子標題或說明的文字；你不可以寫新的內容。\n"
+    "- 每個序號必須出現且只出現一次，不可遺漏、不可重複、不可捏造不存在的序號。\n"
+    "- 大標題整體 2～6 個。\n"
+    '只輸出 JSON {"groups":[{"heading":"大標題","items":[序號,…]},…]}。' + LANG_RULE
+)
