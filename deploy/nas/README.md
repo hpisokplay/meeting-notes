@@ -18,6 +18,23 @@ sudo sh /volume1/docker/meetings/install.sh
 
 它會建資料夾、產生 `worker.key`、建置並啟動容器、設定 `tailscale serve`（9443；8443 已給 XS 系統），最後印出狀態。
 
+## 完整整理的 API 金鑰（選用）
+
+「完整整理」是詳情頁的一個按鈕，AI 會把整場會議整理成一份完整報告。只有這一步會用 Claude API；其他 AI 處理（摘要、逐字稿整理等）仍走你的 Claude Max 訂閱。
+
+放金鑰的方法（請自己在 NAS 上做，**不要把金鑰貼到對話或 git**）：
+
+```
+touch /volume1/docker/meetings/anthropic.key      # 先建好空檔
+chmod 600 /volume1/docker/meetings/anthropic.key
+vi /volume1/docker/meetings/anthropic.key          # 貼上金鑰，只放一行
+```
+
+- 這個檔案必須在 `docker compose up` 之前就存在。若不存在，docker 會自己建出一個同名資料夾，容器就讀不到金鑰；程式不會當機，但會當成沒有金鑰。
+- 沒有金鑰或檔案是空的：不會報錯，自動改用 Max 訂閱產生，畫面標示「由 Max 產生」。
+- 費用：每場會議呼叫一次 Opus；會議越長越貴；「重新處理」也會再呼叫一次。
+- 想關閉：把檔案清空（`: > /volume1/docker/meetings/anthropic.key`），再重啟容器。
+
 ## 更新程式
 在專案根目錄（Git Bash）執行：
 

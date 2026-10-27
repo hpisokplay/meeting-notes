@@ -33,7 +33,7 @@ import {
   REPORT_SECTIONS,
 } from './items.js';
 
-const APP_VERSION = 'v114';
+const APP_VERSION = 'v115';
 export const DEEP_CORRECT_CONFIRM = '會逐段重新掃描整份逐字稿的錯字（約 3–5 分鐘），只新增待確認項目，不會改動已確認的內容。確定？';
 
 const view = document.getElementById('view');
