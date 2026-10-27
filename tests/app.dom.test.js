@@ -605,7 +605,7 @@ describe('app（整合，假 NAS）', () => {
       { id: 'r2222222', group: '上線規劃', text: '沒有冒號的說明', src: [] },
       { id: 'r3333333', group: '測試分工', text: '測試：說話者3 明天開始', src: [{ t: 700, quote: '我明天開始測試' }] },
     ];
-    m.reportMeta = { via: 'api', model: 'claude-opus-5-5', at: 1, fp: 'x', ...extra };
+    m.reportMeta = { at: 1, fp: 'x', ...extra };
     return id;
   };
 
@@ -656,11 +656,14 @@ describe('app（整合，假 NAS）', () => {
     expect(document.querySelector('.seg[data-seg="0"]').classList.contains('flash')).toBe(true);
   });
 
-  it('detail shows via label', async () => {
-    await go('#/m/' + withReport('rep-api'));
-    expect(document.querySelector('.sec-head[data-sec="rp"]').textContent).toContain('由 API 產生');
-    await go('#/m/' + withReport('rep-max', { via: 'max' }));
-    expect(document.querySelector('.sec-head[data-sec="rp"]').textContent).toContain('由 Max 產生');
+  it('detail shows no source label (old meetings may still carry reportMeta.via)', async () => {
+    await go('#/m/' + withReport('rep-plain'));
+    const head = () => document.querySelector('.sec-head[data-sec="rp"]');
+    expect(head().textContent).toContain('📄 完整整理');
+    expect(head().textContent).not.toMatch(/由 (API|Max) 產生/);
+    await go('#/m/' + withReport('rep-old', { via: 'api', model: 'x' }));
+    expect(head().textContent).not.toMatch(/由 (API|Max) 產生/);
+    expect(document.querySelector('.rp-via')).toBeNull();
   });
 
   it('detail shows stale hint', async () => {

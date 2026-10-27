@@ -33,7 +33,7 @@ import {
   REPORT_SECTIONS,
 } from './items.js';
 
-const APP_VERSION = 'v115';
+const APP_VERSION = 'v116';
 export const DEEP_CORRECT_CONFIRM = '會逐段重新掃描整份逐字稿的錯字（約 3–5 分鐘），只新增待確認項目，不會改動已確認的內容。確定？';
 
 const view = document.getElementById('view');
@@ -1985,8 +1985,6 @@ async function renderDetail(id, preloaded) {
       const [RI, RP] = REPORT_SECTIONS;
       const ol = reportOutline(s);
       const meta = m.reportMeta || {};
-      const via = meta.via === 'api' ? '由 API 產生' : meta.via === 'max' ? '由 Max 產生' : '';
-      const title = `${esc(RP.label)}${via ? ` <span class="rp-via">${esc(via)}</span>` : ''}`;
       const delIntro = editSec === RI.code;
       const delPts = editSec === RP.code;
       const introItem = reportIntro[0];
@@ -2011,7 +2009,7 @@ async function renderDetail(id, preloaded) {
           return (head ? `<div class="rp-h">${esc(head)}</div>` : '') + (subs ? `<ul class="list rp-list${delPts ? ' editing' : ''}">${subs}</ul>` : '');
         })
         .join('');
-      return `${secHead(RP.code, title, RP.code, 'margin-top:0')}
+      return `${secHead(RP.code, esc(RP.label), RP.code, 'margin-top:0')}
         <div class="sec-body" data-secbody="${RP.code}"${coll[RP.code] ? ' hidden' : ''}>
           ${meta.stale ? '<div class="hint rp-stale">⚠️ 逐字稿已更換，請重按完整整理</div>' : ''}
           ${showRiHead ? secHead(RI.code, esc(RI.label), RI.code) : ''}
