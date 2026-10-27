@@ -21,7 +21,9 @@ from typing import Callable
 
 from fastapi import APIRouter, Body, HTTPException
 
+from . import anthropic_api as A
 from . import prompts as P
+from . import report as RP
 from . import review as R
 from . import wordreview as W
 from .items import ensure_ids, item_text, normalize_item, normalize_src
@@ -66,11 +68,11 @@ ABORT_CHECK_S = 1.0              # poll interval while claude runs
 HEARTBEAT_S = 30.0               # job heartbeat while claude runs (requeue_stale is 10 min)
 
 ACTIONS = {"summary", "enhance", "notes", "notes_enhance", "ask", "terms", "translate", "reprocess", "deep_correct",
-           "filter_pending", "recheck_names"}
+           "filter_pending", "recheck_names", "report"}
 # status "summarizing" + aiJobId (409 while one runs); they report their own steps
 PIPELINE_ACTIONS = ("reprocess", "deep_correct", "filter_pending", "recheck_names")
 LABELS = {"summary": "摘要", "notes": "學習筆記", "ask": "回答問題", "terms": "挑專有名詞",
-          "translate": "翻譯"}
+          "translate": "翻譯", "report": "完整整理"}
 DEFAULT_MODEL = "opus"
 MAX_SRC = 3
 # reprocess progress: (stage, pct, msg) — the frontend shows these sub-steps
@@ -544,10 +546,12 @@ def _dedupe(xs):
 class Ctx:
     """What an action needs: the meeting, a Claude caller and a progress reporter."""
 
-    def __init__(self, meeting: dict, call, report, model: str = DEFAULT_MODEL, glossary=None):
+    def __init__(self, meeting: dict, call, report, model: str = DEFAULT_MODEL, glossary=None, api_call=None):
         self.m = meeting
+        self.model = model
         self.budget = HAIKU_MAX_CHARS if "haiku" in (model or "").lower() else MAX_CHARS
-        self.call = call  # call(system, user, schema) -> dict
+        self.call = call  # call(system, user, schema) -> dict  (Claude Max via `claude -p`)
+        self.api_call = api_call  # same signature via the Claude API (完整整理 only); None = API off
         self.report = report  # report(pct, msg, stage=None)
         self.lines = transcript_lines(meeting.get("transcript"))
         self.glossary = list(glossary or [])
@@ -1659,9 +1663,152 @@ def _translate(ctx: Ctx, payload):
     return apply
 
 
+# ---------------------------------------------------------------- 完整整理 (report)
+REPORT_EMPTY_MSG = "完整整理沒有產生內容"
+
+
+def _report_drafts(points: list[dict]) -> str:
+    """REPORT_MERGE_PROMPT input: one 「[序號] 〔大標題〕子標題：說明」 line per draft, numbered from 1."""
+    return "\n".join(f"[{i}] 〔{p.get('group') or RP.OTHER_HEADING}〕" + re.sub(r"\s+", " ", item_text(p))
+                     for i, p in enumerate(points, 1))
+
+
+def _apply_report_order(points: list[dict], raw) -> list[dict]:
+    """Reorder / regroup `points` by the merge call's 1-based indices. Only headings and order come
+    from the model; every text and src is the original. Duplicate / unknown / non-int indices are
+    ignored; indices the model left out keep their own heading and follow in their original order."""
+    groups = raw.get("groups") if isinstance(raw, dict) else None
+    if not isinstance(groups, list):
+        return points
+    n, used = len(points), set()
+    order: list[str] = []
+    by: dict[str, list[dict]] = {}
+
+    def put(g: str, it: dict) -> None:
+        if g not in by:
+            order.append(g)
+            by[g] = []
+        by[g].append({**it, "group": g})
+    for grp in groups:
+        if not isinstance(grp, dict):
+            continue
+        heading = _s(grp.get("heading"))
+        for i in _a(grp.get("items")):
+            if isinstance(i, bool) or not isinstance(i, int) or not 1 <= i <= n or i in used:
+                continue
+            used.add(i)
+            put(heading or points[i - 1].get("group") or RP.OTHER_HEADING, points[i - 1])
+    for i, it in enumerate(points, 1):
+        if i not in used:
+            put(it.get("group") or RP.OTHER_HEADING, it)
+    return [x for g in order for x in by[g]]
+
+
+def _generate_report(ctx: Ctx, call) -> dict:
+    """REPORT_PROMPT per chunk through `call` (API or Max), merged by program; with several chunks a
+    REPORT_MERGE call regroups / reorders by index. -> {"reportIntro": [Item], "reportPoints": [Item]}"""
+    chunks = chunk_lines(ctx.lines, ctx.budget)
+    parts = []
+    for i, text in enumerate(chunks):
+        if len(chunks) > 1:
+            ctx.report(30 + 50 * i // len(chunks), f"完整整理中（第 {i + 1}/{len(chunks)} 段）")
+        parts.append(RP.normalize_report(call(P.REPORT_PROMPT, text, P.REPORT_SCHEMA)))
+    out = RP.merge_reports(parts)
+    if len(chunks) > 1 and len(out["reportPoints"]) > 1:
+        ctx.report(85, "完整整理合併段落中")
+        order = call(P.REPORT_MERGE_PROMPT, _report_drafts(out["reportPoints"]), P.REPORT_MERGE_SCHEMA)
+        out["reportPoints"] = _apply_report_order(out["reportPoints"], order)
+    return out
+
+
+def _safe_reason(e: BaseException) -> str:
+    """Why the API path failed, for log / error text. ApiError / ClaudeError messages are our own
+    (never the key or request text); anything else only by its class name."""
+    if isinstance(e, (A.ApiError, ClaudeError)):
+        return str(e) or type(e).__name__
+    return type(e).__name__
+
+
+def _build_report(ctx: Ctx) -> dict:
+    """One whole 完整整理 on ONE path: the API when enabled; any API failure (except a cancel) reruns
+    everything on Max. -> {"reportIntro", "reportPoints", "via": "api"|"max", "model"}.
+    Raises ClaudeError(REPORT_EMPTY_MSG) when nothing came out; limit / transient errors of the Max
+    path propagate (job retry); when both paths fail the message names both reasons."""
+    api_err = None
+    if ctx.api_call is not None:
+        try:
+            out = _generate_report(ctx, ctx.api_call)
+            if not out["reportPoints"]:
+                raise ClaudeError(REPORT_EMPTY_MSG)
+            return {**out, "via": "api", "model": A.REPORT_API_MODEL}
+        except ClaudeAborted:
+            raise
+        except Exception as e:  # noqa: BLE001 — any API trouble: rerun the whole report on Max
+            api_err = _safe_reason(e)
+            log.warning("report %s: API path failed (%s); rerunning on Max", ctx.m.get("id"), api_err)
+            ctx.report(30, "API 失敗，改用 Max 完整整理中…")
+    try:
+        out = _generate_report(ctx, ctx.call)
+        if not out["reportPoints"]:
+            raise ClaudeError(REPORT_EMPTY_MSG)
+    except (ClaudeAborted, ClaudeLimitError, ClaudeTransientError):
+        raise
+    except ClaudeError as e:
+        if api_err is None:
+            raise
+        raise ClaudeError(f"完整整理失敗：API（{api_err}）；Max（{e}）") from None
+    return {**out, "via": "max", "model": ctx.model}
+
+
+def _report(ctx: Ctx, payload):
+    """完整整理: intro + headings / sub-headings into summary.reportIntro / reportPoints (+ reportMeta).
+    Missing actionItems / qa are first filled by the grounded summary on Max (never the API)."""
+    m0 = ctx.m
+    fp = _fingerprint(m0.get("transcript"))
+    old = m0.get("summary") if isinstance(m0.get("summary"), dict) else {}
+    mode = m0.get("mode") if m0.get("mode") in R.MODES else None
+
+    def lacks(md) -> list[str]:
+        keys = ("qa",) if md == "lecture" else ("actionItems", "qa")
+        return [k for k in keys if not isinstance(old.get(k), list)]
+    fill, set_mode = None, False
+    if lacks(mode):
+        if mode is None:
+            ctx.step(STEP_MODE)
+            mode = _detect_mode(ctx, ctx.lines)
+        if lacks(mode):
+            ctx.step(STEP_SUMMARY)
+            fill = _grounded_summary(ctx, mode, ctx.lines, (25, 30))
+            # nothing usable before: the summary is now wholly grounded (as after 「摘要」)
+            set_mode = not any(_a(old.get(k)) for k in fill)
+    ctx.report(30, "完整整理中")
+    built = _build_report(ctx)
+    ctx.step(STEP_VERIFY)
+
+    def apply(m):
+        _backup(m, "summary", ("reportIntro", "reportPoints"))
+        s = m["summary"] if isinstance(m.get("summary"), dict) else {}
+        if fill:
+            for k, v in fill.items():
+                if not isinstance(s.get(k), list):
+                    s[k] = v
+            if set_mode:
+                m["mode"] = mode
+            m["translations"] = {}
+        s["reportIntro"] = built["reportIntro"]
+        s["reportPoints"] = built["reportPoints"]
+        m["summary"] = s
+        # fp = the transcript the report was built from; changed meanwhile -> stale right away
+        m["reportMeta"] = {"via": built["via"], "model": built["model"], "at": int(time.time() * 1000),
+                           "fp": fp, "stale": _fingerprint(m.get("transcript")) != fp}
+        _reverify(m, ctx)
+    return apply
+
+
 HANDLERS = {"summary": _summary, "enhance": _enhance, "notes": _notes, "notes_enhance": _notes_enhance,
             "ask": _ask, "terms": _terms, "translate": _translate, "reprocess": _reprocess,
-            "deep_correct": _deep_correct, "filter_pending": _filter_pending, "recheck_names": _recheck_names}
+            "deep_correct": _deep_correct, "filter_pending": _filter_pending, "recheck_names": _recheck_names,
+            "report": _report}
 
 
 # ---------------------------------------------------------------- job handling
@@ -1753,6 +1900,30 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
             raise ClaudeAborted("已取消")
         return run_claude(system, user, schema, model, cmd, abort=abort)
 
+    def api_call(system, user, schema):
+        """Claude API (完整整理 only). Runs in a helper thread so the job keeps its heartbeat and a
+        cancel is noticed; a cancel wins over whatever the call returned or raised."""
+        if abort():
+            raise ClaudeAborted("已取消")
+        box: dict = {}
+
+        def run():
+            try:
+                box["r"] = A.call_api(system, user, schema)
+            except BaseException as e:  # noqa: BLE001 — handed over to the job thread
+                box["e"] = e
+        t = threading.Thread(target=run, name=f"report-api-{jid}", daemon=True)
+        t.start()
+        while t.is_alive():
+            t.join(ABORT_CHECK_S)
+            if t.is_alive() and abort():
+                raise ClaudeAborted("已取消")  # the abandoned call ends at its own timeout
+        if abort():
+            raise ClaudeAborted("已取消")
+        if "e" in box:
+            raise box["e"]
+        return box["r"]
+
     try:
         if m is None:
             raise ClaudeError("找不到這場會議")
@@ -1761,7 +1932,8 @@ def handle_ai_job(store: Store, job: dict, cmd: list[str], jobs=None, *, model: 
             raise ClaudeError(f"未知的 AI 動作：{action}")
         if action not in PIPELINE_ACTIONS:  # reprocess / deep_correct report their own sub-steps
             report(0, f"Claude {LABELS.get(action, '處理')}中…" if action in LABELS else "Claude 處理中…")
-        apply = handler(Ctx(m, call, report, model, glossary), payload)
+        api = api_call if A.api_enabled() else None  # key file missing / empty: Max only
+        apply = handler(Ctx(m, call, report, model, glossary, api_call=api), payload)
         if abort():
             raise ClaudeAborted("已取消")
 

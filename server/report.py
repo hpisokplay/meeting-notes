@@ -6,7 +6,10 @@ group = heading, text = "title：text".
 """
 from __future__ import annotations
 
-from items import ensure_ids, item_text, normalize_src
+try:  # imported as server.report (app / ai.py) or as top-level `report` (tests run from server/)
+    from .items import ensure_ids, item_text, normalize_src
+except ImportError:
+    from items import ensure_ids, item_text, normalize_src
 
 # Same value as ai.MAX_SRC; defined locally so this pure module never imports ai.py (cycle).
 MAX_SRC = 3

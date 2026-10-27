@@ -16,6 +16,9 @@ SUMMARY_MEETING / SUMMARY_LECTURE / enhance-with-src / NOTES-with-src return Ite
 the first "[HH:MM:SS] 說話者: 內容" line of stdin; CORRECTION returns env FAKE_CLAUDE_CORRECTIONS
 (JSON list, default []); VERIFY_CANDIDATES answers env FAKE_CLAUDE_VERIFY (see verify_items); SLIPS returns env FAKE_CLAUDE_SLIPS (JSON list, default []); ADJUDICATE returns
 env FAKE_CLAUDE_ADJUDICATE (see adjudicate_items); FAKE_CLAUDE_ADJUDICATE_FAIL=1 fails that call only.
+REPORT_PROMPT returns report_answer(stdin) (intro + 2 headings x 1 sub, src = first line; FAKE_CLAUDE_REPORT_EMPTY=1
+-> no points); REPORT_MERGE_PROMPT returns env FAKE_CLAUDE_REPORT_MERGE (JSON) or one group with every
+「[n]」 index of stdin in reverse order.
 FAKE_CLAUDE_LOG=<path> appends {"argv": [...], "stdin": "..."} as one JSON line per call.
 """
 import json
@@ -93,6 +96,22 @@ def verify_items(stdin):
     return out
 
 
+def report_answer(stdin, src):
+    """REPORT_PROMPT: texts carry the chunk's first quote so chunks give different sub-headings."""
+    q = src[0]["quote"] if src else "無"
+    points = [] if os.environ.get("FAKE_CLAUDE_REPORT_EMPTY") else [
+        {"heading": "大標題甲", "title": "子標題一", "text": f"說明一（{q}）", "src": src},
+        {"heading": "大標題乙", "title": "子標題二", "text": f"說明二（{q}）", "src": src}]
+    return {"intro": {"text": f"引言（{q}）", "group": "", "src": src}, "points": points}
+
+
+def report_merge_answer(stdin):
+    if os.environ.get("FAKE_CLAUDE_REPORT_MERGE"):
+        return json.loads(os.environ["FAKE_CLAUDE_REPORT_MERGE"])
+    idx = [int(x) for x in re.findall(r"^\[(\d+)\]", stdin, re.M)]
+    return {"groups": [{"heading": "合併後大標題", "items": idx[::-1]}]}
+
+
 def is_obj_list(schema, key):
     p = (schema.get("properties") or {}).get(key) or {}
     return (p.get("items") or {}).get("type") == "object"
@@ -126,6 +145,10 @@ def auto(schema, system, stdin):
                 "qa": ["問：新問題？ 答：新答案。"]}
     if props == {"answer"}:
         return {"answer": "會議中沒有提到"}
+    if props == {"intro", "points"}:
+        return report_answer(stdin, src)
+    if props == {"groups"} and "heading" in (schema["properties"]["groups"]["items"].get("properties") or {}):
+        return report_merge_answer(stdin)
     if props == {"groups"}:
         return {"groups": [{"terms": ["台積店", "台積殿"], "best": "台積電"}]}
     if props == {"items"}:
