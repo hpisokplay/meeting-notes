@@ -708,6 +708,23 @@ describe('app（整合，假 NAS）', () => {
     expect(nas.meetings['rep-edit'].summary.reportIntro).toEqual([]);
   });
 
+  it('完整整理：引言有舊版時只能換版、不能合併', async () => {
+    const id = withReport('rep-alt');
+    nas.meetings[id].alt = {
+      'summary:reportIntro': [{ id: 'r9999999', text: '舊版引言', src: [] }],
+      'summary:reportPoints': [{ id: 'r8888888', group: '舊', text: '舊：說明', src: [] }],
+    };
+    await go('#/m/' + id);
+    await editOn();
+    const view = document.getElementById('view');
+    expect(view.querySelector('[data-swap="ri"]')).toBeTruthy();
+    expect(view.querySelector('[data-mergev="ri"]')).toBeNull();
+    expect(view.querySelector('[data-mergev="rp"]')).toBeTruthy(); // 子標題仍可合併
+    view.querySelector('[data-swap="ri"]').click();
+    await tick(120);
+    expect(nas.meetings[id].summary.reportIntro.map((x) => x.text)).toEqual(['舊版引言']);
+  });
+
   it('處理中的會議：清單有狀態徽章，進度頁顯示階段與備援轉錄器', async () => {
     nas.meetings.q1 = {
       id: 'q1',

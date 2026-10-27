@@ -1956,6 +1956,8 @@ async function renderDetail(id, preloaded) {
       'nt-f': ['notes', 'figures'], 'nt-q': ['notes', 'quiz'],
       ri: ['summary', 'reportIntro'], rp: ['summary', 'reportPoints'],
     };
+    // 引言只顯示第一條：合併出第二條會看不到也刪不掉 → 只給換版
+    const NO_MERGE = new Set(['ri']);
     const secHead = (k, title, copyKey, extra) => {
       const src = SEC_SRC[k];
       // 只有原文檢視可以編輯／切換版本（譯本是衍生資料，改了會被下次翻譯蓋掉）
@@ -1964,7 +1966,7 @@ async function renderDetail(id, preloaded) {
       const inEdit = editable && editSec === k;
       // 換版／合併／編輯／複製只在「編輯模式」出現；平常只留摺疊箭頭，畫面乾淨
       const tools = detailUi.edit
-        ? (hasAlt ? `<button class="copy" data-swap="${k}">↩ 換版</button><button class="copy" data-mergev="${k}">⊕ 合併</button>` : '') +
+        ? (hasAlt ? `<button class="copy" data-swap="${k}">↩ 換版</button>${NO_MERGE.has(k) ? '' : `<button class="copy" data-mergev="${k}">⊕ 合併</button>`}` : '') +
           (editable ? `<button class="copy${inEdit ? ' on' : ''}" data-edit="${k}">${inEdit ? '完成' : '✏️ 編輯'}</button>` : '') +
           `<button class="copy" data-copy="${copyKey}">複製</button>`
         : '';
