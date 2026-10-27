@@ -31,7 +31,8 @@ def normalize_report(raw) -> dict:
     for p in raw.get("points") if isinstance(raw.get("points"), list) else []:
         if not isinstance(p, dict):
             continue
-        text, title = _s(p.get("text")), _s(p.get("title"))
+        # a 「：」 inside the title would make the later first-colon split cut the title short
+        text, title = _s(p.get("text")), _s(p.get("title")).replace("：", "・")
         if not text:
             continue
         pts.append({"text": f"{title}：{text}" if title else text,

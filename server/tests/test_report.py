@@ -81,3 +81,10 @@ def test_prompts_defined():
     assert item["required"] == ["heading", "title", "text", "src"]
     assert p.REPORT_MERGE_SCHEMA["type"] == "object"
     assert "不" in p.REPORT_MERGE_PROMPT
+
+
+def test_normalize_title_colon_becomes_dot():
+    out = normalize_report(_raw([_pt(title="訂單：第一季", text="說明：細節")]))
+    t = out["reportPoints"][0]["text"]
+    assert t == "訂單・第一季：說明：細節"
+    assert t.split("：", 1) == ["訂單・第一季", "說明：細節"]
