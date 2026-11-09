@@ -8,10 +8,10 @@ TIMEOUT_S = 5
 
 def url_from_config(cfg):
     """Optional "comfyui" key in config.json: absent = default URL; "" or false disables."""
-    if "comfyui" not in cfg:
+    v = cfg.get("comfyui", True)
+    if v is True:
         return DEFAULT_URL
-    v = cfg["comfyui"]
-    return v.rstrip("/") if isinstance(v, str) and v.strip() else ""
+    return v.strip().rstrip("/") if isinstance(v, str) else ""
 
 
 def free_comfyui(base_url, urlopen=urllib.request.urlopen):
@@ -22,7 +22,11 @@ def free_comfyui(base_url, urlopen=urllib.request.urlopen):
     try:
         with urlopen(base + "/queue", timeout=TIMEOUT_S) as r:
             q = json.loads(r.read().decode("utf-8"))
-        if q.get("queue_running") or q.get("queue_pending"):
+        # free only when the answer positively shows BOTH queues empty
+        run, pend = (q.get("queue_running"), q.get("queue_pending")) if isinstance(q, dict) else (None, None)
+        if not isinstance(run, list) or not isinstance(pend, list):
+            return "unreachable"
+        if run or pend:
             return "busy"
         req = urllib.request.Request(
             base + "/free", method="POST", headers={"Content-Type": "application/json"},

@@ -56,6 +56,16 @@ def test_busy_sends_no_post(q):
     assert all(m == "GET" for m, _, _ in sent)
 
 
+@pytest.mark.parametrize("q", [{}, {"queue_running": []}, {"queue_pending": []}, [],
+                               {"queue_running": None, "queue_pending": None},
+                               {"queue_running": [], "queue_pending": None},
+                               {"error": "x"}])
+def test_unclear_queue_answer_never_frees(q):
+    sent = []
+    assert comfy.free_comfyui("http://x", fake_urlopen(q, sent)) == "unreachable"
+    assert all(m == "GET" for m, _, _ in sent)
+
+
 def test_unreachable_never_raises():
     def boom(*a, **k):
         raise ConnectionRefusedError()
@@ -75,6 +85,11 @@ def test_url_from_config():
     assert comfy.url_from_config({"comfyui": ""}) == ""
     assert comfy.url_from_config({"comfyui": False}) == ""
     assert comfy.url_from_config({"comfyui": "http://h:1/"}) == "http://h:1"
+    assert comfy.url_from_config({"comfyui": "  http://h:1/ 
+"}) == "http://h:1"
+    assert comfy.url_from_config({"comfyui": "   "}) == ""
+    assert comfy.url_from_config({"comfyui": None}) == ""
+    assert comfy.url_from_config({"comfyui": True}) == "http://127.0.0.1:8188"
 
 
 # ---------------------------------------------------------------- gate
