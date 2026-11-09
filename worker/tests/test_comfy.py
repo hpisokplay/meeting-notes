@@ -85,8 +85,7 @@ def test_url_from_config():
     assert comfy.url_from_config({"comfyui": ""}) == ""
     assert comfy.url_from_config({"comfyui": False}) == ""
     assert comfy.url_from_config({"comfyui": "http://h:1/"}) == "http://h:1"
-    assert comfy.url_from_config({"comfyui": "  http://h:1/ 
-"}) == "http://h:1"
+    assert comfy.url_from_config({"comfyui": "  http://h:1/ \n"}) == "http://h:1"
     assert comfy.url_from_config({"comfyui": "   "}) == ""
     assert comfy.url_from_config({"comfyui": None}) == ""
     assert comfy.url_from_config({"comfyui": True}) == "http://127.0.0.1:8188"
