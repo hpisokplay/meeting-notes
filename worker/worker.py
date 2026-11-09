@@ -10,6 +10,8 @@ import time
 import traceback
 from pathlib import Path
 
+import comfy
+
 # %USERPROFILE%\MeetingWorker, not %LOCALAPPDATA%: writes to LOCALAPPDATA from an MSIX-packaged
 # parent (e.g. the Claude desktop app) are virtualized into Packages\...\LocalCache.
 BASE = Path.home() / "MeetingWorker"
@@ -18,15 +20,21 @@ KEEPALIVE_S = 60  # re-post the last progress this often while a stage is silent
 RESULT_BACKOFF = (15, 45, 90, 150)  # waits between the 5 result POST attempts (~5 min in total)
 log = logging.getLogger("worker")
 
-# The 8 GB card is shared with other programs (ComfyUI keeps its models in VRAM after generating):
-# wait for memory instead of failing, degrade after a while, give up only after a long time.
+# The 16 GB card (RTX 5070 Ti) is shared with other programs (ComfyUI keeps its models in VRAM after
+# generating, ~10 GB): first ask an idle ComfyUI to free it, else wait instead of failing, degrade
+# after a while, give up only after a long time. The *_VRAM_MB values are absolute needs of the
+# models, not shares of the card size.
 WHISPER_VRAM_MB = 4500          # large-v3 float16 + batch 8 working memory
 WHISPER_LOWMEM_VRAM_MB = 3000   # int8_float16, batch 4/2
 PYANNOTE_VRAM_MB = 1500
 VRAM_RETRY_S = 60
 VRAM_DEGRADE_S = 30 * 60        # whisper -> int8_float16; pyannote -> CPU
 VRAM_GIVEUP_S = 90 * 60
+VRAM_FREE_COOLDOWN_S = 120      # ask ComfyUI to free memory at most this often
+VRAM_FREE_SETTLE_S = 8          # after "freed", give the driver this long before re-checking
+COMFY_URL = comfy.DEFAULT_URL   # main() overrides from config.json "comfyui" ("" / false = off)
 MSG_WAIT = "等待顯示卡空出記憶體（被其他程式占用，例如 ComfyUI）"
+MSG_FREEING = "請 ComfyUI 釋放顯示卡記憶體…"
 MSG_LOWMEM = "顯示卡記憶體不足，改用省記憶體模式（較慢）"
 MSG_DIAR_CPU = "分辨說話者改用 CPU（較慢）"
 MSG_GIVEUP = "顯示卡記憶體一直不足（可能被其他程式占用），請關閉 ComfyUI 等程式後按「重新轉錄」"
@@ -236,8 +244,10 @@ class VramGate:
     """Waiting for GPU memory. sleep/clock are injectable; the default sleep returns early when
     the keepalive got a 409, so a cancel aborts the wait promptly."""
 
-    def __init__(self, api, sleep=None, clock=None):
+    def __init__(self, api, sleep=None, clock=None, free_comfy=None):
         self.api = api
+        self.free_comfy = free_comfy or (lambda: comfy.free_comfyui(COMFY_URL))
+        self._last_free = None
         self.sleep = sleep or api.cancelled.wait
         self.clock = clock or time.monotonic
         self.t0 = self.clock()
@@ -245,7 +255,30 @@ class VramGate:
     def elapsed(self):
         return self.clock() - self.t0
 
+    def _try_free_comfy(self):
+        """True if an idle ComfyUI released its memory (rate-limited by VRAM_FREE_COOLDOWN_S)."""
+        now = self.clock()
+        if self._last_free is not None and now - self._last_free < VRAM_FREE_COOLDOWN_S:
+            return False
+        self._last_free = now
+        outcome = self.free_comfy()
+        log.info("ComfyUI free-memory request: %s", outcome)
+        return outcome == "freed"
+
     def wait(self, why=""):
+        """Make room (ask ComfyUI) or wait; the caller re-checks free memory afterwards."""
+        if self._try_free_comfy():
+            log.warning("GPU memory: %s; ComfyUI freed memory, re-checking in %d s", why, VRAM_FREE_SETTLE_S)
+            self.api.progress("wait", 0, MSG_FREEING)
+            self.sleep(VRAM_FREE_SETTLE_S)
+        else:
+            self._wait_retry(why)
+            return
+        self.api.check()
+        self.api.beat()
+        self.api.check()
+
+    def _wait_retry(self, why):
         log.warning("GPU memory: %s; waiting %d s (%.0f s so far)", why, VRAM_RETRY_S, self.elapsed())
         self.api.progress("wait", 0, MSG_WAIT)
         self.sleep(VRAM_RETRY_S)
@@ -501,6 +534,8 @@ def main():
     try:
         import requests
         cfg = json.loads((BASE / "config.json").read_text(encoding="utf-8"))
+        global COMFY_URL
+        COMFY_URL = comfy.url_from_config(cfg)
         w = Worker(cfg, requests.Session())
         poll = cfg.get("poll", 10)
         log.info("worker started, server %s", cfg["server"])
