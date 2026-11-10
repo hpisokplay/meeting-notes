@@ -13,6 +13,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -149,20 +150,24 @@ def run_claude(system: str, user: str, schema: dict, model: str, cmd: list[str],
             "--no-session-persistence", "--max-turns", "3",
             "--json-schema", json.dumps(schema, ensure_ascii=False), "--system-prompt", system]
     kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
+    # stdin comes from a temp file, not a pipe: a communicate(input=..., timeout=...) that times out
+    # stops writing (the retry neither sends the rest nor closes stdin), so a child that starts
+    # reading late never saw end-of-input and sat there until the 30-minute timeout. The NAS pipe
+    # holds only 8 KB and a cold `claude` needs more than ABORT_CHECK_S before it reads.
     try:
-        proc = subprocess.Popen(args, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env=child_env(), **kw)
+        with tempfile.TemporaryFile() as fin:
+            fin.write(user.encode("utf-8"))
+            fin.seek(0)
+            proc = subprocess.Popen(args, stdin=fin, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, env=child_env(), **kw)
     except OSError as e:
         raise ClaudeError(f"無法啟動 Claude：{e}")
     deadline = time.monotonic() + timeout
-    data_in = user.encode("utf-8")
-    first = True
     while True:
         try:
-            out, err = proc.communicate(input=data_in if first else None, timeout=ABORT_CHECK_S)
+            out, err = proc.communicate(timeout=ABORT_CHECK_S)
             break
         except subprocess.TimeoutExpired:
-            first = False
             if abort is not None and abort():
                 _kill_tree(proc)
                 _drain(proc)
